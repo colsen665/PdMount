@@ -1,0 +1,56 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+pdmount-backend = { path = "crates/pdmount-backend" }
+pdmount-core = { path = "crates/pdmount-core" }
+
+anyhow = "1.0"
+async-trait = "0.1"
+bytes = "1.11"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+futures = "0.3"
+keyring = { version = "3.6", features = ["linux-native", "sync-secret-service"] }
+nix = { version = "0.30", features = ["fs", "user"] }
+parking_lot = "0.12"
+proton-drive-sdk = "0.4"
+rand = "0.10"
+reqwest = { version = "0.13", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha1 = "0.11"
+tempfile = "3"
+thiserror = "2.0"
+tokio = { version = "1.51", features = ["full"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "warn"
+
+# The community SDK is used through a patched fork (decisions D002, D022).
+# Patches and their status: docs/sdk-patches.md.
+[patch.crates-io]
+proton-drive-sdk = { git = "https://github.com/colsen665/proton-sdk-rs2", rev = "8c7ff8b6dc1a262779a6f2aee593a296744fc338" }
+proton-sdk-rs2 = { git = "https://github.com/colsen665/proton-sdk-rs2", rev = "8c7ff8b6dc1a262779a6f2aee593a296744fc338" }
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"

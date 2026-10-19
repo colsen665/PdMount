@@ -1,0 +1,187 @@
+# SDK fork patches
+
+PdMount depends on `proton-drive-sdk` 0.4 and `proton-sdk-rs2` 0.4 through a fork pinned in the workspace `Cargo.toml`:
+
+```toml
+[patch.crates-io]
+proton-drive-sdk = { git = "file://<local bare repo>", rev = "<pinned sha on pdmount>" }
+proton-sdk-rs2   = { git = "file://<local bare repo>", rev = "<pinned sha on pdmount>" }
+```
+
+## Fork repository
+
+Decision D022.
+
+| Item | Value |
+|---|---|
+| Location | `<fork>` (local bare repo) |
+| Remote `upstream` | `https://github.com/tirbofish/proton-sdk-rs2` (fetch: `git --git-dir=… fetch upstream`) |
+| Base | tag `base/0.4.0` = `409ca119` = upstream `main` = the commit of the published 0.4.0 crates (`.cargo_vcs_info.json`) |
+| Integration branch | `pdmount` (bare-repo HEAD). PdMount pins a commit on it with `rev = …` |
+| Patch branches | one per patch, created from `base/0.4.0`, named as in the tracking table below; merged into `pdmount` when tested |
+| Crates in the repo | `crates/proton-drive-sdk`, `crates/proton-sdk-rs2` (and `crates/pdcli`, unused) |
+
+Working on a patch:
+
+```sh
+git clone <fork> <working copy>   # working copy
+cd <working copy>
+git switch -c fix/block-pagination base/0.4.0
+# … edit, test with cargo test -p proton-drive-sdk …
+git push origin fix/block-pagination
+git switch pdmount && git merge --no-ff fix/block-pagination && git push origin pdmount
+```
+
+**Rebasing onto a new upstream release:**
+1. `git fetch upstream`.
+2. Rebase each unmerged patch branch onto the new upstream tag.
+3. Rebuild `pdmount` from the new base plus those branches.
+4. Tag the new base as `base/<version>`.
+
+**Open:**
+- Upstream submission is deferred (D023, TODO.md Q8). Local CI reads the fork through `file://`.
+
+Rules:
+
+- One patch is one self-contained, upstream-ready branch, rebased on upstream `main`, each with its own tests. Submitting
+  upstream is deferred (D023).
+- The fork carries only unmerged patches. When upstream merges a patch, the next fork rebase drops it.
+- PdMount code depends on the `Backend` trait (DESIGN.md §3), never on fork-only API outside `pdmount-backend/src/proton/`.
+  If a patch is rejected upstream, an adapter there replaces it.
+
+Path prefixes: `sdk/` = `proton-drive-sdk-0.4.0/src/`, `rs2/` = `proton-sdk-rs2-0.4.0/src/`, `cs/` = `<official SDK checkout>/`
+(the official Proton Drive SDK, used as the behaviour reference).
+
+## Required by milestone
+
+| Milestone | Patches |
+|---|---|
+| M0/M1 (read-only mount) | P1, P2, P4, P8 (P3 recommended) |
+| M2 (writes) | P5, P6, P10 |
+| M3 (multi-device, robustness) | P9, P11, P12 |
+| M4 (performance) | P7 |
+
+## Patches
+
+### P1 — Paginate the revision block list
+- **Where:** `sdk/node/revision.rs:225-249` (`create_download_state`), constants at `sdk/node/download.rs:18-19`
+  (`MIN_BLOCK_INDEX = 1`, `DEFAULT_BLOCK_PAGE_SIZE = 10`).
+- **Problem:** `get_revision(.., Some(MIN_BLOCK_INDEX), Some(DEFAULT_BLOCK_PAGE_SIZE), ..)` is called once. Only the first
+  10 blocks (10 × 4 MiB = 40 MiB) are downloaded, so larger files come back truncated, in both `download_to_stream` and `download_range`.
+- **Fix:** keep requesting with `from_block_index = last + 1` until a page has fewer than `page_size` blocks, as
+  `cs/client/cs/src/Proton.Drive.Sdk/Nodes/Download/RevisionReader.cs` (`GetBlocksAsync`) and the JS `apiService.ts` do.
+- **Test:** a fake API serving 25 blocks; checksum of a downloaded 100 MiB file.
+
+### P2 — Verify block digests and the manifest signature
+- **Where:** `sdk/node/download.rs:547-561` (`download_block_at`), `sdk/api/block.rs:33-50` (`BlockDto.hash_digest`).
+- **Problem:** the downloaded block's SHA-256 is computed and discarded. `CompletedDownloadManifestVerificationException`
+  is defined but never raised.
+- **Fix:** compare each block's digest with `BlockDto.hash_digest`, and verify the manifest signature over the concatenated hashes as
+  `RevisionReader.cs:341-357` does. Raise typed integrity errors.
+
+### P3 — Public reusable block map
+- **Where:** `sdk/node/file/download.rs:173-212` (`download_range` rebuilds the download state on every call).
+- **Problem:** FUSE reads need random block access without one or two API round trips per `read()`.
+- **Fix:** public `BlockMap { content_key, blocks: Vec<{index, url, token, hash, plain_size}> }` with
+  `fetch(revision) -> BlockMap`, `refresh_urls(&mut self)` (on a 404 / expired target, `sdk/error.rs:38-40`) and
+  `download_block(&BlockMap, idx) -> Bytes`.
+
+### P4 — Decrypt the active revision XAttr during node decode
+- **Where:** `sdk/node/mod.rs:1366-1418`.
+- **Problem:**
+  - `claimed_size` is set from `storage_quota_consumption` (encrypted storage size), not from the plaintext size.
+  - `claimed_modification_time` is set from the revision `creation_time`.
+  - `claimed_digests.sha1` and `additional_claimed_metadata` are `None`. The XAttr field on the revision DTO (`sdk/api/revision.rs:33`) is
+    available but unused.
+  - Every consumer that uses these values for `st_size`/`st_mtime` shows wrong attributes, including pdcli (`pdcli/fs.rs:371-372`).
+- **Fix:** decrypt the active revision XAttr with the node key and fill `Common.Size`, `Common.ModificationTime`,
+  `Common.Digests.SHA1`, `Common.BlockSizes` and the flattened additional metadata (`sdk/api/attr.rs:53-56`). The same logic
+  already exists for the explicit revision path (`sdk/client.rs:788-810`).
+- **Acceptance:** PdMount scenario R1 in `fresh`/`second` mode. `rsync -ani` (quick check on size and mtime) prints nothing.
+
+### P5 — Folder modification time
+- **Where:** `sdk/node/folder.rs:35` (`_last_modification_time` ignored), `:106` (`extended_attributes: None`);
+  DTO at `sdk/api/folder.rs:41`, `:65`.
+- **Fix:** encrypt `{Common:{ModificationTime}}` as the folder XAttr on create, and decode the folder XAttr on read.
+- **Note:** no folder XAttr update API is known. Directory mtimes that change after creation stay local-only (DESIGN.md §8).
+
+### P6 — Upload returns the new revision id
+- **Where:** `sdk/node/file/upload.rs:129-134`, `:185-222`.
+- **Problem:** `upload_from_stream` returns only `NodeUid`, although `draft.uid` (the revision) is known.
+- **Fix:** return `(NodeUid, RevisionUid)`, or a struct. PdMount needs the revision id for echo suppression and conflict
+  detection.
+
+### P7 — Configurable per-client transfer semaphore
+- **Where:** `sdk/node/transfer.rs:19` (`file_semaphore: Arc::new(Semaphore::new(1))`).
+- **Problem:** one whole-file transfer at a time per client, in each direction.
+- **Fix:** add a client option `max_concurrent_files` (default 1 for compatibility). PdMount uses 4 uploads plus its own read
+  scheduler.
+
+### P8 — Typed API errors
+- **Where:** `sdk/api/file.rs:163-185` and sibling API modules, `sdk/api/mod.rs:226-236`.
+- **Problem:** errors become `anyhow` strings (`"API error {code}: {msg}"`, `"HTTP {status}: {body}"`).
+- **Fix:** `ApiError { http_status, code: Option<i64>, message, retry_after: Option<Duration> }` that can be
+  downcast from `anyhow::Error`. Codes are listed in `cs/client/js/src/internal/apiService/errorCodes.ts:17-41`.
+
+### P9 — Surface token refresh failures; configurable base URL
+- **Where:** `rs2/auth.rs:194-197` (`Err(_) => (current_access, current_refresh)`), `rs2/auth.rs:105`/`:138`
+  (`subscribe_refresh_token_expired` never fires), `rs2/session.rs:511` (hard-coded `https://drive-api.proton.me`).
+- **Fix:** return the refresh error and fire `refresh_token_expired` on invalid-grant responses. Use the configured base URL.
+
+### P10 — Public move with rename
+- **Where:** `sdk/client.rs:1016-1017` (`move_nodes` passes `None` for the new name); implementation at
+  `sdk/node/operations.rs:342` (`move_single(.., Option<name>)`).
+- **Fix:** `ProtonDriveClient::move_node(uid, new_parent, new_name: Option<String>)`, so a cross-directory `rename(2)` is
+  one remote call.
+
+### P11 — Typed revision-conflict error
+- **Where:** `sdk/node/draft.rs:175-190` (new-revision draft sends `CurrentRevisionID`).
+- **Fix:** map the server's rejection of a stale `CurrentRevisionID` to `RevisionConflict { current_revision }`. The same is needed
+  for rename/move rejections on `OriginalHash` (`sdk/api/links.rs:562`, `:638`).
+- **Open question (verify in M3):** which server error codes are returned, and whether these preconditions are enforced at draft creation, at commit, or both.
+
+### P12 — Retry for idempotent metadata requests
+- **Problem:** only block transfers retry (`sdk/node/download.rs:154-175`, `sdk/api/storage.rs:9`). Metadata GETs fail on the
+  first 429 or 5xx.
+- **Fix:** bounded retry with exponential backoff and jitter on 408/425/429/5xx for GET requests, honouring `Retry-After`.
+
+## Upstream tracking
+
+| Patch | Fork branch | Commit | Based on | Upstream | State |
+|---|---|---|---|---|---|
+| P1 | `fix/block-pagination` | `312d9d0` | `base/0.4.0` | deferred (D023) | merged into `pdmount` |
+| P2 | `fix/block-verification` | `f8513ca` | `base/0.4.0` | deferred (D023) | merged into `pdmount` |
+| P3 | `feat/block-map` | `9ef1094` | P1 + P2 merged | deferred (D023) | merged into `pdmount` |
+| P4 | `fix/revision-xattr-decode` | `2aa1e1f` | `base/0.4.0` | deferred (D023) | merged into `pdmount` |
+| P5 | `feat/folder-mtime` | `4036915` | `base/0.4.0` | deferred (D023) | merged into `pdmount` |
+| P6 | `feat/upload-revision-uid` | `3a6186a` | `base/0.4.0` | deferred (D023) | merged into `pdmount` |
+| P7 | `feat/transfer-concurrency` | `e157e1d` | `base/0.4.0` | deferred (D023) | merged into `pdmount` |
+| P8 | `feat/typed-api-error` | `28d124f` | `base/0.4.0` | deferred (D023) | merged into `pdmount` |
+| P9 | `fix/token-refresh-errors` | `6b794ac` | `base/0.4.0` | deferred (D023) | merged into `pdmount` |
+| P10 | `feat/move-with-rename` | `c7bf10b` | `base/0.4.0` | deferred (D023) | merged into `pdmount` |
+| P11 | `feat/revision-conflict-error` | `1e777f3` | P8 | deferred (D023) | merged into `pdmount` |
+| P12 | `feat/metadata-retry` | `59fca73` | P8 | deferred (D023) | merged into `pdmount` |
+
+Integration: `pdmount` = `base/0.4.0` + all branches above, merged with `--no-ff`. It also contains `9176b0f`, a test-only fix
+setting the new `FolderNode` field (from P5) in a test helper added by P10. Checks on 2026-10-19: 236 SDK tests pass (baseline
+150), pdcli builds and its tests pass, and `cargo fmt --check` passes. All tests are offline; none ran against the live API.
+
+## Behaviour changes (for review)
+
+These changes differ from 0.4.0 and can affect existing callers such as pdcli:
+
+| Patch | Change |
+|---|---|
+| P2 | A full download (`download_to_stream`) of a revision whose manifest signature is missing or cannot be verified now fails with `CompletedDownloadManifestVerificationException` after the content has been written, as in the C# SDK. A block hash mismatch fails with `DataIntegrityException` and is not retried; the JS SDK retries these. The uploader now orders thumbnail digests by type in the signed manifest, as C# does. |
+| P8 | Errors keep the `"API error {code}: {message}"` / `"HTTP {status}: …"` wording. `ApiResponse::to_result` changed from `"API error: code X, message: Some(..)"` to `"API error X: …"`. Endpoints that ignored the HTTP status now return `ApiError` instead of a JSON parse error. |
+| P9 | A failed token refresh returns `Err(TokenRefreshError)` instead of `Ok(old tokens)`. `refresh_token_expired` fires on Proton code 10013. `tokens_refreshed` no longer fires after a failure. |
+| P11 | New-file drafts send `ClientUID`. With `override_existing_draft_by_other_client = true`, another client's draft that never got a committed revision is deleted and the create retried. Failures are `NodeWithSameNameExistsError` / `RevisionDraftConflictError`. |
+| P12 | Drive API requests are retried: 429 for all methods; 5xx and timeouts for idempotent methods only; connection failures. Circuit breakers fail fast for 60 s after 50 consecutive 429s or 10 consecutive 5xx. |
+
+## Known gaps after M0.2
+
+- **P3:** `download_range` builds a `BlockMap` on every call. PdMount keeps its own map per revision instead (DESIGN.md §6.1).
+- **P4:** `Media` is not copied into `additional_claimed_metadata`. Anonymous revisions are not signature-checked. Legacy block-size ordering (JS sorts revisions from before 2025) is not applied.
+- **P9:** `DefaultAuthenticationApiClient` still hard-codes `https://drive-api.proton.me/` for the auth endpoints. The Drive API clients still do not refresh on a 401; the PdMount backend adapter does that (DESIGN.md §12.3).
+- **P10:** no name validation on rename or move (the C# SDK has `ValidateNodeName`). PdMount validates names itself (DESIGN.md §8.8).
+- The legacy, unused `node::download::BlockDownloader` has no hash check.
