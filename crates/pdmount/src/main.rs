@@ -1,8 +1,10 @@
-//! `pdmount` command-line interface (DESIGN.md §14). M0 provides `login`,
-//! `logout`, `status` and `doctor`; the mount commands follow in M1.
+//! `pdmount` command-line interface (DESIGN.md §14).
 
+mod control;
 mod credentials;
+mod daemon;
 mod doctor;
+mod mounts;
 mod session;
 mod status;
 
@@ -19,6 +21,14 @@ struct Cli {
     #[arg(long, global = true, default_value = Profile::DEFAULT)]
     profile: Profile,
 
+    /// Store secrets in 0600 files when the keyring is unavailable (D029).
+    #[arg(long, global = true, conflicts_with = "force_file_secrets")]
+    allow_file_secrets: bool,
+
+    /// Store secrets in 0600 files only; never use the keyring (D029).
+    #[arg(long, global = true)]
+    force_file_secrets: bool,
+
     /// More log output (-v info, -vv debug); RUST_LOG overrides it.
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -33,8 +43,16 @@ enum Command {
     Login(BrowserArgs),
     /// End the session and remove stored secrets.
     Logout,
-    /// Show session, account, storage and device.
+    /// Show session, account, storage, device and mount.
     Status,
+    /// Mount My Files (read-only in this version) and run in the background.
+    Mount(MountArgs),
+    /// Unmount.
+    Unmount(UnmountArgs),
+    /// Show the daemon's counters.
+    Stats,
+    /// Delete the local state and block cache; the login is kept.
+    Reset(ResetArgs),
     /// Check FUSE, keyring, login, disk space and clock.
     Doctor,
 }
@@ -47,6 +65,34 @@ struct BrowserArgs {
     /// Only print the sign-in link.
     #[arg(long)]
     no_browser: bool,
+}
+
+#[derive(Debug, Args)]
+struct MountArgs {
+    /// Stay in the foreground (used by the background launcher and services).
+    #[arg(long)]
+    foreground: bool,
+    /// Mountpoint; default: `mountpoint` from the config (~/ProtonDrive).
+    mountpoint: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct UnmountArgs {
+    /// Wait for pending uploads first (the default; nothing is pending in a read-only mount).
+    #[arg(long, conflicts_with = "force")]
+    wait: bool,
+    /// Detach the mount even if it is busy or the daemon hangs, and stop the daemon.
+    #[arg(long)]
+    force: bool,
+    /// Mountpoint; default: `mountpoint` from the config.
+    mountpoint: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct ResetArgs {
+    /// Required: the login and device identity are kept.
+    #[arg(long, required = true)]
+    keep_login: bool,
 }
 
 impl BrowserArgs {
@@ -76,6 +122,8 @@ fn init_logging(verbose: u8) {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        // The daemon's stderr is its log file: no color codes there.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .init();
 }
 
@@ -86,7 +134,12 @@ fn home_dir() -> anyhow::Result<std::path::PathBuf> {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
-    let paths = ProfilePaths::for_current_user(cli.profile)?;
+    credentials::set_mode(match (cli.allow_file_secrets, cli.force_file_secrets) {
+        (_, true) => credentials::SecretsMode::ForceFile,
+        (true, _) => credentials::SecretsMode::AllowFile,
+        _ => credentials::SecretsMode::Keyring,
+    });
+    let paths = ProfilePaths::for_current_user(cli.profile.clone())?;
     match cli.command {
         Command::Login(browser) => {
             let config = Config::load(&paths.config_file())?;
@@ -123,6 +176,25 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             } else {
                 ExitCode::from(1)
             })
+        }
+        Command::Mount(args) => {
+            let config = Config::load(&paths.config_file())?;
+            let mountpoint = daemon::mountpoint(&config, &home_dir()?, args.mountpoint);
+            if args.foreground {
+                daemon::run_foreground(&paths, &config, &mountpoint).await
+            } else {
+                daemon::mount_background(&paths, &mountpoint, cli.verbose).await
+            }
+        }
+        Command::Unmount(args) => {
+            let config = Config::load(&paths.config_file())?;
+            let mountpoint = daemon::mountpoint(&config, &home_dir()?, args.mountpoint);
+            daemon::unmount(&paths, &mountpoint, args.force).await
+        }
+        Command::Stats => daemon::stats(&paths).await,
+        Command::Reset(_) => {
+            let config = Config::load(&paths.config_file())?;
+            daemon::reset(&paths, &config.mountpoint(&home_dir()?)).await
         }
         Command::Doctor => {
             let checks = doctor::run(&paths).await;

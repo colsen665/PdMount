@@ -161,16 +161,38 @@ impl ProfilePaths {
         self.cache_dir.join("sdk-entities.db")
     }
 
+    /// SQLite store of the filesystem state (§13.2).
+    pub fn state_db(&self) -> PathBuf {
+        self.data_dir.join("state.db")
+    }
+
+    /// Encrypted block cache (§6.2).
+    pub fn blocks_dir(&self) -> PathBuf {
+        self.cache_dir.join("blocks")
+    }
+
+    /// Staging files of dirty inodes (§7.1).
+    pub fn staging_dir(&self) -> PathBuf {
+        self.data_dir.join("staging")
+    }
+
     /// `~/.local/state/pdmount/<profile>.log`
     pub fn log_file(&self) -> PathBuf {
         self.named(&self.state_dir, ".log")
     }
 
-    /// `$XDG_RUNTIME_DIR/pdmount/<profile>.sock`
-    pub fn control_socket(&self) -> Option<PathBuf> {
-        self.runtime_dir
-            .as_ref()
-            .map(|dir| self.named(dir, ".sock"))
+    /// `$XDG_RUNTIME_DIR/pdmount/<profile>.sock`, or `control.sock` in the
+    /// profile's data directory when the session has no runtime directory.
+    pub fn control_socket(&self) -> PathBuf {
+        match &self.runtime_dir {
+            Some(dir) => self.named(dir, ".sock"),
+            None => self.data_dir.join("control.sock"),
+        }
+    }
+
+    /// Process id of the running daemon, next to the control socket.
+    pub fn pid_file(&self) -> PathBuf {
+        self.control_socket().with_extension("pid")
     }
 }
 
@@ -237,19 +259,23 @@ mod tests {
         );
         assert_eq!(
             paths.control_socket(),
-            Some(PathBuf::from("/run/user/1000/pdmount/work.sock"))
+            PathBuf::from("/run/user/1000/pdmount/work.sock")
+        );
+        assert_eq!(
+            paths.pid_file(),
+            PathBuf::from("/run/user/1000/pdmount/work.pid")
         );
     }
 
     #[test]
-    fn control_socket_is_absent_without_a_runtime_dir() {
+    fn control_socket_falls_back_to_the_data_dir() {
         let base = BaseDirs {
             runtime: None,
             ..base()
         };
         assert_eq!(
             ProfilePaths::new(Profile::default(), &base).control_socket(),
-            None
+            PathBuf::from("/home/u/.local/share/pdmount/default/control.sock")
         );
     }
 }

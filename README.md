@@ -6,7 +6,7 @@ A FUSE filesystem for Linux that mounts Proton Drive "My Files" read-write. It i
 
 > This is a third-party application, not officially supported by Proton.
 
-**Status:** design phase. No code yet.
+**Status:** see [TODO.md](TODO.md).
 
 | Document | Content |
 |---|---|

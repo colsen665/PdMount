@@ -2,7 +2,7 @@
 //! mounting and signing in. Any failed check makes the command exit 1;
 //! warnings do not.
 
-use crate::credentials::{self, Credentials};
+use crate::credentials::{self, Credentials, KeyringState, SecretsMode};
 use pdmount_core::units::ByteSize;
 use pdmount_core::{Config, ProfilePaths};
 use std::fmt;
@@ -160,19 +160,57 @@ fn check_config(paths: &ProfilePaths) -> Check {
     }
 }
 
-fn check_keyring() -> Check {
-    match credentials::keyring_available() {
-        Ok(()) => Check::new("keyring", Level::Ok, "Secret Service is reachable"),
-        Err(error) => Check::new(
+/// Reads the keyring's lock state without prompting; `None` in force mode.
+fn check_keyring(mode: SecretsMode) -> (Check, Option<KeyringState>) {
+    if mode == SecretsMode::ForceFile {
+        return (
+            Check::new("keyring", Level::Ok, format!("not used: {mode}")),
+            None,
+        );
+    }
+    let state = credentials::keyring_state();
+    (classify_keyring(mode, &state), Some(state))
+}
+
+fn classify_keyring(mode: SecretsMode, state: &KeyringState) -> Check {
+    match state {
+        KeyringState::Unlocked => Check::new(
+            "keyring",
+            Level::Ok,
+            format!("Secret Service reachable, default collection unlocked; secrets: {mode}"),
+        ),
+        KeyringState::Locked => Check::new(
             "keyring",
             Level::Warn,
-            format!("unavailable ({error}); secrets fall back to mode-0600 files"),
+            "the default collection is locked; the next command that reads secrets opens an \
+             unlock dialog",
+        ),
+        KeyringState::Unavailable(reason) if mode == SecretsMode::Keyring => Check::new(
+            "keyring",
+            Level::Fail,
+            format!(
+                "unavailable ({reason}); pass --allow-file-secrets (files when the keyring is \
+                 unavailable) or --force-file-secrets (files only)"
+            ),
+        ),
+        KeyringState::Unavailable(reason) => Check::new(
+            "keyring",
+            Level::Warn,
+            format!("unavailable ({reason}); secrets go to mode-0600 files"),
         ),
     }
 }
 
-fn check_login(paths: &ProfilePaths) -> Check {
-    match Credentials::new(paths).load() {
+fn check_login(paths: &ProfilePaths, keyring: Option<&KeyringState>) -> Check {
+    // Reading a locked keyring would open an unlock dialog.
+    if keyring == Some(&KeyringState::Locked) && !paths.credentials_file().exists() {
+        return Check::new(
+            "login",
+            Level::Warn,
+            "unknown: the keyring is locked (not read, to avoid an unlock dialog)",
+        );
+    }
+    match Credentials::new(paths).read_only().load() {
         Ok(Some((_, storage))) => Check::new(
             "login",
             Level::Ok,
@@ -284,14 +322,15 @@ fn version_check() -> Check {
 }
 
 pub async fn run(paths: &ProfilePaths) -> Vec<Check> {
+    let (keyring, state) = check_keyring(credentials::mode());
     vec![
         version_check(),
         check_fuse_device(Path::new("/dev/fuse")),
         check_fusermount(),
         check_fuse_conf(Path::new("/etc/fuse.conf")),
         check_config(paths),
-        check_keyring(),
-        check_login(paths),
+        keyring,
+        check_login(paths, state.as_ref()),
         check_free_space("data space", &paths.data_dir),
         check_free_space("cache space", &paths.cache_dir),
         check_clock().await,
@@ -301,6 +340,23 @@ pub async fn run(paths: &ProfilePaths) -> Vec<Check> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unavailable_keyring_fails_only_without_a_flag() {
+        let unavailable = KeyringState::Unavailable("no session bus".into());
+        let level = |mode, state: &KeyringState| classify_keyring(mode, state).level;
+        assert_eq!(level(SecretsMode::Keyring, &unavailable), Level::Fail);
+        assert_eq!(level(SecretsMode::AllowFile, &unavailable), Level::Warn);
+        assert_eq!(
+            level(SecretsMode::Keyring, &KeyringState::Locked),
+            Level::Warn
+        );
+        assert_eq!(
+            level(SecretsMode::Keyring, &KeyringState::Unlocked),
+            Level::Ok
+        );
+        assert_eq!(check_keyring(SecretsMode::ForceFile).0.level, Level::Ok);
+    }
 
     #[test]
     fn fuse_conf_option_must_be_uncommented() {

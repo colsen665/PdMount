@@ -90,7 +90,7 @@ All of these are fixed in the fork (`docs/sdk-patches.md`) and are hidden behind
 - Gentoo, libfuse/fusermount3 (setuid), `/home` on btrfs, so `FICLONE` reflinks are available.
 - `/etc/fuse.conf` has `user_allow_other` commented out. fuser rejects `AutoUnmount` without `allow_other`/`allow_root`
   (`fuser/session.rs:163-171`), so the design must not depend on it (§14.4).
-- pjdfstest and fsx are not installed (the local CI script builds them).
+- pjdfstest and fsx are not installed; agents build them from source outside the repo (TODO.md M2.9).
 
 ### 2.4 Official SDK constraints (`cs/README.md`)
 
@@ -110,6 +110,8 @@ PdMount/
 ├── Cargo.toml                 workspace; [patch.crates-io] → SDK fork at a pinned rev
 ├── crates/
 │   ├── pdmount-core/          no fuser dependency; all logic; unit + property tests
+│   │   ├── engine.rs          M1: hot/slow operations for the FUSE adapter, prefetch, revalidation
+│   │   ├── singleflight.rs    M1: shared in-flight work (listings, block maps, blocks)
 │   │   ├── vfs/               inode table, dentries, handles, dir locks, attrs, name rules
 │   │   ├── access/            access rules, effective-mode resolution (§11)
 │   │   ├── store/             SQLite schema, migrations, single writer, group commit
@@ -123,9 +125,9 @@ PdMount/
 │   │   ├── metrics/           histograms, counters, hot-path network guard
 │   │   └── errors.rs          CoreError → errno
 │   ├── pdmount-backend/
-│   │   ├── lib.rs             trait Backend, RemoteNode, RevisionInfo, BlockMap, BackendError
-│   │   ├── proton/            SDK adapter: 401 refresh+retry, metadata retry, error classification
-│   │   └── fake/              in-memory Proton model: multi-client, events, faults, persistable
+│   │   ├── lib.rs             trait Backend, RemoteNode, BlockInfo, BackendError
+│   │   ├── proton.rs          SDK adapter: block-map memo, error classification (401 retry: M3)
+│   │   └── fake.rs            in-memory Proton model: clones share a drive, events, faults, latency
 │   ├── pdmount-fuse/          fuser::Filesystem impl → core; catch_unwind; reply dispatch
 │   └── pdmount/               binary: CLI, daemon, control socket, auth, service unit
 ├── tests/
@@ -148,22 +150,23 @@ The core talks only to this trait, implemented by `proton::ProtonBackend` (SDK a
 ```rust
 #[async_trait]
 pub trait Backend: Send + Sync + 'static {
+    async fn account(&self) -> Result<AccountInfo>;                              // username, root (cached)
     async fn root(&self) -> Result<RemoteNode>;                                  // My Files root
     async fn list_children(&self, folder: &LinkId) -> Result<Vec<RemoteNode>>;  // paginated inside
     async fn get_nodes(&self, ids: &[LinkId]) -> Result<Vec<Option<RemoteNode>>>;
-    async fn block_map(&self, file: &LinkId, rev: &RevisionId) -> Result<BlockMap>;
-    async fn fetch_block(&self, map: &BlockMap, idx: u32) -> Result<Bytes>;     // verified plaintext
+    async fn blocks(&self, file: &LinkId, rev: &RevisionId) -> Result<Vec<BlockInfo>>; // {index, plain_size?}
+    async fn fetch_block(&self, file: &LinkId, rev: &RevisionId, idx: u32) -> Result<Bytes>; // verified plaintext
     async fn upload_new(&self, parent: &LinkId, name: &str, src: UploadSource, meta: FileMeta)
         -> Result<(LinkId, RevisionId)>;
     async fn upload_revision(&self, file: &LinkId, base: &RevisionId, src: UploadSource, meta: FileMeta)
         -> Result<RevisionId>;                                                    // Err(RevisionConflict)
     async fn create_folder(&self, parent: &LinkId, name: &str, mtime: SystemTime) -> Result<LinkId>;
-    async fn rename(&self, node: &LinkId, new_parent: Option<&LinkId>, new_name: &str, expect: &NameHash)
+    async fn rename(&self, node: &LinkId, new_parent: Option<&LinkId>, new_name: &str, expect: Option<&NameHash>)
         -> Result<()>;
     async fn trash(&self, nodes: &[LinkId]) -> Result<Vec<Result<()>>>;
     async fn latest_event_id(&self) -> Result<EventId>;
     async fn poll_events(&self, since: &EventId) -> Result<EventPage>;          // {next, more, refresh, events}
-    async fn storage_info(&self) -> Result<(u64, u64)>;                           // used, max
+    async fn storage_info(&self) -> Result<StorageInfo>;                          // used, max
 }
 ```
 
@@ -172,7 +175,7 @@ pub trait Backend: Send + Sync + 'static {
 | Field | Meaning |
 |---|---|
 | `link_id`, `parent_link_id`, `name`, `kind` | Identity, location, and type |
-| `active_rev` | Current revision id |
+| `active_revision` | Current revision id |
 | `size` | Plaintext size, from P4 |
 | `mtime` | Modification time |
 | `mode` | From the `pdmount.mode` XAttr, if present |
@@ -180,8 +183,12 @@ pub trait Backend: Send + Sync + 'static {
 | `name_hash` | Name hash, used as `OriginalHash` |
 | `trashed` | Whether the node is in the trash |
 
-`BackendError` is a typed enum: `NotFound`, `AlreadyExists`, `PermissionDenied`, `Quota`, `FileTooLarge`, `TooManyChildren`,
-`RevisionConflict{current}`, `NameConflict`, `RateLimited{retry_after}`, `Transient`, `Unauthorized`, `Integrity`, `Offline`.
+`BackendError` is a typed enum: `NotFound`, `AlreadyExists`, `PermissionDenied`, `QuotaExceeded`, `FileTooLarge`, `TooManyChildren`,
+`NestingTooDeep`, `RevisionConflict{current}`, `NameConflict`, `RateLimited{retry_after}`, `Transient`, `Unauthorized`, `Integrity`,
+`Offline`, `Unsupported`, `Other`.
+
+The SDK's `BlockMap` (content key, URLs, tokens, hashes) stays inside the Proton adapter, memoized per revision for 10 minutes with
+one fetch per revision at a time. The core sees only `BlockInfo` and asks for blocks by index.
 
 ### 3.3 Component diagram
 
@@ -249,8 +256,9 @@ When a deadline expires, the request replies EIO and logs it. The background fet
 
 ### 4.3 State and locking
 
-- **Inode table** (RAM, authoritative for FUSE): sharded `HashMap<Ino, Arc<RwLock<InodeState>>>`, plus per-directory
-  `BTreeMap<Name, Ino>` child maps.
+- **Inode table** (RAM, authoritative for FUSE): `HashMap<Ino, Node>` plus per-directory `BTreeMap<Name, Ino>` child maps.
+  M1 keeps the whole table under one `RwLock`, held for microseconds and never across `.await`. It is loaded completely
+  from the store at mount. Sharding is an M4 option if profiling shows contention.
 - **Directory namespace mutex** per directory, held for microseconds. Rename locks both parents in ino order. No lock is held
   across `.await` or while calling the Notifier.
 - **SQLite** (WAL): one writer task owns the write connection. Mutations are sent as batches, with group commit every ≤5 ms.
@@ -286,6 +294,9 @@ main
 - After a directory has been listed once, every lookup (including negative), getattr, readdir, readdirplus, and statfs is
   answered from RAM. The SQLite store persists the tree, so a remount serves the last known state immediately and catches up in
   the background.
+- **Startup revalidation (D025):** after mounting, every listed directory is listed again in the background (4 at a time,
+  root first). Differences are applied like a listing and reach the kernel through the invalidation queue (§9.5). Until the
+  event engine exists (M3), this is how remote changes made while unmounted become visible.
 - **Network guard:** handlers marked hot run inside a `HotPath` scope. Any `Backend` call within that scope increments
   `hot_path_network_calls` and, in debug builds, panics. Tests assert the counter is 0.
 
@@ -304,6 +315,10 @@ main
 | Small-file prefetch | Files ≤ 256 KiB in a just-listed directory are fetched into the block cache | 16 MiB per directory |
 | Sequential readahead | A per-handle detector prefetches the next 2–4 blocks (8–16 MiB) | readahead permits |
 | Pins (`pdmount pin <path>`) | Every file under the path is downloaded and kept, and new revisions are fetched on UpdateContent | Reported separately from the cache cap |
+
+Speculative API work (listing prefetch, small-file prefetch, startup revalidation) is paced (D027): one request at a time,
+at most two starts per second, and none while a foreground listing or read is in flight. Proton rate-limits bursts with
+HTTP 429, and the SDK's retry back-off exceeds the 20 s metadata deadline, so unpaced prefetch turns into EIO for users.
 
 ### 5.4 Kernel caching
 
@@ -389,7 +404,7 @@ These are measured in the daemon from request receipt to reply, on SSD, warm pro
 | Layer | Key | Content | Limit | Eviction |
 |---|---|---|---|---|
 | RAM LRU | `(link, rev, idx)` | decrypted plaintext blocks | 256 MiB | LRU |
-| Disk | `(link, rev, idx)` → `cache/blocks/xx/<blake3(key)>` | XChaCha20-Poly1305 encrypted (key in keyring, AAD = key) | `cache.max_bytes` (10 GiB), 90 %/80 % watermarks | LRU by `last_access` (batched updates) |
+| Disk | `(link, rev, idx)` → `cache/blocks/xx/<blake3(key)>` | nonce ‖ XChaCha20-Poly1305 (key = `blake3::derive_key("pdmount block cache v1", cache master key)`, AAD = block key) | `cache.max_bytes` (10 GiB), 90 %/80 % watermarks | LRU by `last_access` (batched updates every 60 s) |
 
 Revisions are immutable, so cache entries never need invalidation, only eviction.
 
@@ -853,10 +868,10 @@ Config rules are imported at mount time. From then on the database is authoritat
 - Login uses `ProtonAPISession::begin_via_web(app_version, options, on_sign_in)` (`rs2/session.rs:244`). It polls every 5 s for up to 10 minutes.
 - At login, PdMount prints: *"PdMount is a third-party application, not officially supported by Proton."*
 - Credentials are stored with `to_stored_credentials_with_latest_tokens()` (`rs2/session.rs:223`) in the OS keyring (service
-  `pdmount`, entries `<profile>:session` and `<profile>:cache-key`), falling back to 0600 files (`pdcli/credentials.rs` pattern).
-  Every keyring call has a 20 s timeout. A locked collection can wait forever for an unlock prompt; after a timeout, the
-  rest of the process uses the files (D024).
-- `pdmount logout` revokes the session where possible and deletes the stored credentials and cache key.
+  `pdmount`, entries `<profile>:session` and `<profile>:cache-key`). Files are used only with a flag (§12.4, D029).
+- If the new session cannot be stored, `login` ends it on the server and fails.
+- `pdmount logout` revokes the session where possible and deletes the stored credentials and cache key. It reports keyring
+  entries it could not delete and exits non-zero.
 
 ### 12.2 Presenting the sign-in link (RQ5)
 
@@ -903,6 +918,29 @@ Waiting for sign-in… done. Logged in as <account>.
   (`sdk/cache/encrypted.rs:57`, `sdk/cache/sqlite.rs:52`), with a random 32-byte key in the keyring. The secret cache must persist,
   or keys cannot be decrypted after a resume.
 - The disk block cache is encrypted per block (§6.2).
+- **Secret storage modes (D029).** Two mutually exclusive global flags select the mode:
+
+  | Mode | Flag | Secrets go to |
+  |---|---|---|
+  | keyring | none | the keyring only. An unavailable keyring fails the command, naming the cause and both flags |
+  | allow-file | `--allow-file-secrets` | the keyring; 0600 files (§13.1) only when the keyring is unavailable |
+  | force-file | `--force-file-secrets` | 0600 files only; the keyring is never called |
+
+  - **Keyring answers:** found, missing, or unavailable. Unavailable covers no Secret Service, a dismissed prompt
+    (Cancel), a timeout and any other error. Only "missing" counts as no entry.
+  - **Waiting:** a locked collection waits for its unlock prompt; `dbus-secret-service` waits up to a year. Each keyring
+    call runs on a helper thread and is abandoned after 120 s (`PDMOUNT_KEYRING_TIMEOUT_SECS` overrides it for tests). After 2 s, a note on stderr says that an unlock dialog may
+    be open, possibly behind other windows. Once the keyring is unavailable, the process does not call it again, except
+    for the daemon's last token save at shutdown.
+  - **Reads:** a secrets file, if present, is the newest copy, because every successful keyring write deletes it. It is
+    read first, in every mode. Outside force mode it is then moved into the keyring and deleted, unless another daemon of
+    the profile is running (the pid file, §13.1), in which case it is left in place.
+  - **Cache key:** creating a new cache key deletes the SDK caches and the block cache, which the old key encrypted.
+    The SDK secret cache goes with them, so in force mode the session and the cache key must both be in files.
+  - **Daemon:** `mount` reads the stored session in the foreground process before it starts the daemon, so an unlock
+    dialog appears while the user waits at the terminal. The daemon gets the same flag. It stores tokens only when they
+    have changed (§12.3).
+  - **Tests:** tests use force mode, except the keyring tests (`scripts/repro/keyring-d024.sh`).
 - Staging is plaintext with mode 0700 (§17).
 - The SDK logs the account passphrase at debug level (`rs2/secret.rs:63`, `:67`). PdMount filters `proton_sdk_rs2::secret` to
   WARN in every log configuration.
@@ -928,17 +966,19 @@ Waiting for sign-in… done. Logged in as <account>.
 | `~/.local/share/pdmount/<profile>/localonly/` | content of ignored files |
 | `~/.cache/pdmount/<profile>/blocks/` | encrypted block cache |
 | `~/.local/share/pdmount/<profile>/sdk-secrets.db` | SDK secret cache (encrypted). Losing it forces a new login, so it is not in the cache directory |
-| `~/.local/share/pdmount/<profile>/credentials.json`, `cache.key` | session and cache-key fallback when the keyring is unavailable (0600) |
-| `~/.local/share/pdmount/<profile>/device-id` | device identity (§10.2); moves into `state.db` `meta` in M1 |
+| `~/.local/share/pdmount/<profile>/credentials.json`, `cache.key` | session and cache key in the file modes of §12.4 (0600) |
+| `~/.local/share/pdmount/<profile>/device-id` | device identity (§10.2). Stays a file so `reset --keep-login` keeps it |
 | `~/.cache/pdmount/<profile>/sdk-entities.db` | SDK entity cache (encrypted, rebuildable) |
-| `$XDG_RUNTIME_DIR/pdmount/<profile>.sock` | control socket (0600) |
+| `$XDG_RUNTIME_DIR/pdmount/<profile>.sock` | control socket (0600); `~/.local/share/pdmount/<profile>/control.sock` when the session has no runtime directory |
+| `<control socket>.pid` | process id of the mount daemon, for `unmount --force` |
 | `$XDG_STATE_HOME/pdmount/<profile>.log` | log (rotated) |
 
 ### 13.2 Schema
 
 ```sql
 meta(key TEXT PRIMARY KEY, value BLOB)
-  -- schema_version, device_id, root_link, access_version, ino_counter, quota_used, quota_max
+  -- root_link, ino_reserved (inode numbers up to it are handed out; reserved 1024 at a time, durably),
+  -- access_version, quota_used, quota_max. The schema version is `PRAGMA user_version`.
 
 inodes(ino INTEGER PRIMARY KEY, kind INTEGER, parent_ino INTEGER NULL, name TEXT NULL,
        link_id TEXT UNIQUE NULL, mode INTEGER, mtime_ns INTEGER, ctime_ns INTEGER, atime_ns INTEGER,
@@ -991,7 +1031,8 @@ access_rules(id INTEGER PRIMARY KEY, ino INTEGER UNIQUE, link_id TEXT NULL, path
 ### 14.1 Argument convention
 
 Options come first, then verb or mode arguments, then **the path last**, with at most one positional path. `--profile <name>` is a global option
-placed before the subcommand (`pdmount --profile work status`).
+placed before the subcommand (`pdmount --profile work status`). The global options `--allow-file-secrets` and
+`--force-file-secrets` (mutually exclusive) select the secret storage mode (§12.4).
 
 ### 14.2 Commands
 
@@ -999,8 +1040,8 @@ placed before the subcommand (`pdmount --profile work status`).
 |---|---|
 | `login [--browser\|--no-browser]` | Web sign-in (§12.2) |
 | `logout` | Remove the session and keys |
-| `mount [--foreground] [--browser\|--no-browser] [--no-login] [-o ro] [<mountpoint>]` | Start the daemon and mount (mountpoint overrides config) |
-| `unmount [--wait\|--force] [<mountpoint>]` | `--wait`: drain the queue first. `--force`: `fusermount3 -uz`, then abort the connection |
+| `mount [--foreground] [--browser\|--no-browser] [--no-login] [-o ro] [<mountpoint>]` | Start the daemon and mount (mountpoint overrides config). M1: `--foreground` only; the mount is always read-only |
+| `unmount [--wait\|--force] [<mountpoint>]` | `--wait`: drain the queue first (M1: nothing to drain). `--force`: see §14.4 |
 | `status` | Online/offline/needs_login, queue depth, oldest pending, parked items, conflicts, cache use, sign-in link if pending |
 | `sync [<path>]` | Remote barrier: wait until everything under `<path>` is uploaded |
 | `access set ro\|rw <path>` / `access unset <path>` / `access list [<path>]` / `access effective <path>` | §11.5 |
@@ -1010,7 +1051,7 @@ placed before the subcommand (`pdmount --profile work status`).
 | `cache stats` / `cache gc [--target <bytes>]` / `cache wipe [<path>]` | Block cache maintenance (pinned and dirty-base blocks are never wiped) |
 | `stats` | Latency histograms and counters (§5.8) |
 | `reset --keep-login` | Rebuild local state (refused while the queue is non-empty) |
-| `doctor` | Check `/dev/fuse`, fusermount3, `/etc/fuse.conf`, keyring, clock skew, disk space, SDK and crypto version |
+| `doctor` | Check `/dev/fuse`, fusermount3, `/etc/fuse.conf`, keyring (reachable, default collection locked or not, read without prompting; the effective secret storage mode), clock skew, disk space, SDK and crypto version |
 | `service install\|uninstall` | systemd user unit |
 
 ### 14.3 Control socket
@@ -1029,8 +1070,25 @@ JSON-lines request/response over a Unix socket at `$XDG_RUNTIME_DIR/pdmount/<pro
   4. Unmount.
 
   Pending work persists and resumes at the next mount.
-- After `kill -9`: `pdmount unmount --force` runs `fusermount3 -uz`. As a last resort it writes to
-  `/sys/fs/fuse/connections/<id>/abort`. A reboot is never required (exit criterion of M1).
+- **Starting:** `pdmount mount` re-executes itself as `pdmount mount --foreground` in its own process group, with stdout and
+  stderr appended to the log file (D026), and returns once the control socket answers `ping` (90 s limit). It refuses to
+  start while the profile's daemon answers or while the mountpoint is a mount (a dead pdmount mount is reported as stale).
+- **Unmounting:** `pdmount unmount` asks the daemon, which runs `fusermount3 -u`. A busy mount stays mounted and the error is
+  reported. On SIGTERM/SIGINT the daemon unmounts lazily if needed. Refreshed session tokens are saved every 60 s and at exit.
+- After `kill -9`: `pdmount unmount --force`:
+  1. Runs `fusermount3 -uz`.
+  2. Stops a still-running daemon (pid file, checked against `/proc/<pid>/cmdline`): SIGTERM, then SIGKILL after 10 s.
+     Its exit closes `/dev/fuse` and so ends the connection.
+  3. If `/sys/fs/fuse/connections/<minor>` still exists, writes to its `abort`. That file is root-owned on most systems; the
+     command then prints the root command instead.
+
+  The connection id is the minor device number from `/proc/self/mountinfo`, which never touches the dead mount. A reboot is
+  never required (exit criterion of M1).
+- **Copies of the mount in other mount namespaces:** a sandbox that starts while mounted (Flatpak's bubblewrap, `unshare -m`)
+  copies the mount. An unmount in the daemon's namespace does not end the FUSE connection then, and the session threads
+  keep running. The daemon therefore treats "gone from its own mount table" as unmounted. It waits at most 10 s for the
+  session, then exits; closing `/dev/fuse` ends the connection. The copies then report ENOTCONN until their sandbox exits.
+  `unmount` returns only after the daemon process is gone (pid file), and `mount` refuses to start while it still runs.
 
 ---
 
@@ -1043,9 +1101,9 @@ JSON-lines request/response over a Unix socket at `$XDG_RUNTIME_DIR/pdmount/<pro
 | Unit | Name validation, conflict naming, ignore matcher, errno mapping, block offset math (with and without `BlockSizes`), access resolution |
 | Fake backend | Proton model: name uniqueness (2500), `CurrentRevisionID` and `OriginalHash` preconditions, trash, quota, an event log with `more`/`refresh`, several client handles with independent cursors (one plays the "official app"). Fault injection: latency and bandwidth profiles, 401/429/5xx, offline windows, partial batch failures, crash points. Persistable to a directory, so two daemons can share one fake (`--backend fake:<dir>`, test builds only) |
 | Property (proptest) | Random sequences of create, write, truncate, rename (all flags, over existing, swaps), unlink while open, mkdir, rmdir, setattr, access set/unset, crash/restart, and concurrent mutations from a second fake client. Invariants listed below |
-| Mounted, CI | Local CI script (`scripts/ci.sh`) on the dev machine with fuse3, over the fake backend; hosted CI deferred (D023). pjdfstest subset (open incl. O_EXCL, rename, unlink, mkdir, rmdir, truncate, chmod, utimensat; link/symlink/mknod expected EPERM). fsx with mmap (30 min per PR, 6 h nightly). Every scenario below |
-| Real account | Two profiles on one machine, each with its own login. Datasets kept modest to respect rate limits. Manual or nightly |
-| Soak | 24 h: rsync cron, git commit loop, second-client edits, network flaps (`ip link set down`), forced token expiry. Pass: zero EIO outside injected outages, zero parked jobs, stable RSS |
+| Mounted, CI | Local CI script (`scripts/ci.sh`) on the dev machine with fuse3, over the fake backend; hosted CI deferred (D023). pjdfstest subset (open incl. O_EXCL, rename, unlink, mkdir, rmdir, truncate, chmod, utimensat; link/symlink/mknod expected EPERM). fsx with mmap (6 h for the M2 exit check). Every scenario below. fsx, pjdfstest and soak never run against the real account (D030) |
+| Real account | Two profiles on one machine, each with its own login. Scenario scripts only, under `pdmount-test/` (D028), one run at a time, stopping at the first HTTP 429; datasets kept modest (D030). Manual; long runs only with the user's approval |
+| Soak | Over the fake backend (D030). 24 h: rsync cron, git commit loop, second-client edits, network flaps (`ip link set down`), forced token expiry. Pass: zero EIO outside injected outages, zero parked jobs, stable RSS |
 
 **Property test invariants:**
 - After every step, the local view matches a POSIX model.
@@ -1148,8 +1206,8 @@ Exit criteria are functional tests. A milestone is done when its listed tests pa
 |---|---|---|
 | **M0 Foundations** | Workspace; SDK fork with P1, P2, P4, P8; `Backend` trait and fake; local CI script that builds `gopenpgp-sys` (Go ≥ 1.22, clang, protoc); `login`/`logout`/`status`/`doctor` | `pdmount login` opens the browser **and** `login --no-browser` prints the link; both complete sign-in. `status` shows the account and quota. Fake-backend unit tests pass. `doctor` passes on the Gentoo machine |
 | **M1 Read-only mount** | Inode table, store, listing, block cache (P3), readahead and prefetch, notify queue, `catch_unwind`, deadlines, unmount tooling; writes return EROFS | **R6** and **G6 read side** (clone, fsck) on data uploaded by the official client, in `live` and `fresh` modes. This confirms API size, mtime, and content. sha256 of 5 MB / 41 MB / 2 GB files equals the web download. `hot_path_network_calls == 0`. `kill -9` → `unmount --force` → remount without a reboot |
-| **M2 Writes, single device, access control** | Staging, journal, §7–§8, `fsync=local`, `.pdignore`, quota errors, metadata revisions, P5, P6, P10; access rules (§11) | **R1–R7, G1–G7, N1, A1–A6** pass in `live`, `remount`, `crash`, `fresh` on the fake (CI) and in `live`, `remount`, `fresh` on the real account. pjdfstest subset green, fsx 6 h clean, journal property tests at 10k cases |
-| **M3 Multi-device and sync robustness** | Event engine, refresh, remote rename/move, echo suppression, the full conflict engine, offline mode, auth refresh and `needs_login`, P9, P11, P12; verify server precondition behaviour (§10.4) | **M1–M7** and every R/G/A scenario in `second` mode on two real profiles. Zero data loss. Remote changes visible within 30 s. 24 h soak passes |
+| **M2 Writes, single device, access control** | Staging, journal, §7–§8, `fsync=local`, `.pdignore`, quota errors, metadata revisions, P5, P6, P10; access rules (§11) | **R1–R7, G1–G7, N1, A1–A6** pass in `live`, `remount`, `crash`, `fresh` on the fake (CI) and in `live`, `remount`, `fresh` on the real account. pjdfstest subset green and fsx 6 h clean, both on the fake (D030); journal property tests at 10k cases |
+| **M3 Multi-device and sync robustness** | Event engine, refresh, remote rename/move, echo suppression, the full conflict engine, offline mode, auth refresh and `needs_login`, P9, P11, P12; verify server precondition behaviour (§10.4) | **M1–M7** and every R/G/A scenario in `second` mode on two real profiles. Zero data loss. Remote changes visible within 30 s. 24 h soak on the fake passes (D030) |
 | **M4 Performance and operations** | SLO instrumentation, benchmarks, P7 parallel uploads, pins, writeback-cache experiment, `cache gc`, queue tooling, systemd unit, documentation | §5.7 SLOs met. Over the fake backend with an 80 ms RTT / 20 MB/s profile: `git status` on warm git.git ≤ 2× local btrfs; untar of 5k small files ≤ 3× local (time to acknowledgement); cached sequential read ≥ 500 MB/s; `cache gc` holds the cap ±5 % |
 | **M5 Upstream and crypto migration** | Upstream patches; track Proton's new crypto model; rebase the fork | Fork diff reduced to unmerged patches; migration plan documented; full matrix re-run |
 

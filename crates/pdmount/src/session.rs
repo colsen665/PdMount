@@ -3,10 +3,13 @@
 
 use crate::credentials::{self, Credentials, Storage};
 use anyhow::Context;
-use pdmount_core::ProfilePaths;
+use pdmount_backend::proton::ProtonBackend;
 use pdmount_core::config::BrowserMode;
+use pdmount_core::device::{self, DeviceIdentity};
+use pdmount_core::{Config, ProfilePaths};
 use proton_drive_sdk::cache::encrypted::EncryptedCacheRepository;
 use proton_drive_sdk::cache::sqlite::SqliteCacheRepository;
+use proton_drive_sdk::client::ProtonDriveClient;
 use proton_drive_sdk::proton_sdk_rs2::cache::CacheRepository;
 use proton_drive_sdk::proton_sdk_rs2::client::ProtonClientOptions;
 use proton_drive_sdk::proton_sdk_rs2::session::ProtonAPISession;
@@ -136,7 +139,17 @@ pub async fn login(paths: &ProfilePaths, browser: BrowserMode) -> anyhow::Result
     })
     .await
     .context("sign-in did not complete")?;
-    let storage = persist(&credentials, &session).await?;
+    let storage = match persist(&credentials, &session).await {
+        Ok(storage) => storage,
+        Err(error) => {
+            // A session that cannot be stored would stay open on the server.
+            let mut session = session;
+            if let Err(end) = session.end_from_session().await {
+                tracing::warn!(error = %format!("{end:#}"), "could not end the unstored session on the server");
+            }
+            return Err(error.context("cannot store the session; it was ended again"));
+        }
+    };
     Ok(LoggedIn { session, storage })
 }
 
@@ -149,11 +162,65 @@ async fn persist(
     credentials: &Credentials<'_, credentials::OsKeyring>,
     session: &ProtonAPISession,
 ) -> anyhow::Result<Storage> {
-    let stored = session
+    credentials.save(&current_credentials(session).await?)
+}
+
+async fn current_credentials(
+    session: &ProtonAPISession,
+) -> anyhow::Result<proton_drive_sdk::proton_sdk_rs2::ser::StoredCredentials> {
+    session
         .to_stored_credentials_with_latest_tokens()
         .await
-        .context("cannot read session tokens")?;
-    credentials.save(&stored)
+        .context("cannot read session tokens")
+}
+
+/// Stores the session's tokens when they have changed (they rotate when
+/// refreshed), so an unchanged session never opens a keyring dialog.
+pub struct TokenSaver {
+    saved: Option<String>,
+}
+
+impl TokenSaver {
+    /// For a session whose current tokens were just stored.
+    pub async fn new(session: &ProtonAPISession) -> Self {
+        let saved = match current_credentials(session).await {
+            Ok(stored) => serde_json::to_string(&stored).ok(),
+            Err(_) => None,
+        };
+        Self { saved }
+    }
+
+    pub async fn save(
+        &mut self,
+        paths: &ProfilePaths,
+        session: &ProtonAPISession,
+    ) -> anyhow::Result<()> {
+        let stored = current_credentials(session).await?;
+        let json = serde_json::to_string(&stored)?;
+        if self.saved.as_ref() == Some(&json) {
+            return Ok(());
+        }
+        Credentials::new(paths).save(&stored)?;
+        self.saved = Some(json);
+        Ok(())
+    }
+}
+
+/// This device's identity (§10.2).
+pub fn device_identity(paths: &ProfilePaths, config: &Config) -> anyhow::Result<DeviceIdentity> {
+    Ok(DeviceIdentity {
+        id: device::load_or_create_device_id(&paths.device_id_file())?,
+        name: device::device_name(config.device.name.as_deref()),
+    })
+}
+
+/// Drive client and backend of a signed-in session.
+pub async fn proton_backend(
+    logged_in: &LoggedIn,
+    device: &DeviceIdentity,
+) -> anyhow::Result<ProtonBackend> {
+    let client = ProtonDriveClient::new(&logged_in.session, Some(device.client_uid()))?;
+    Ok(ProtonBackend::new(client, logged_in.session.username.clone()).await?)
 }
 
 /// Outcome of resuming the stored session.
@@ -196,7 +263,7 @@ fn is_session_rejected(error: &anyhow::Error) -> bool {
 pub async fn logout(paths: &ProfilePaths) -> anyhow::Result<LogoutOutcome> {
     let credentials = Credentials::new(paths);
     let Some((stored, _)) = credentials.load()? else {
-        remove_local_state(paths, &credentials);
+        remove_local_state(paths, &credentials)?;
         return Ok(LogoutOutcome::WasNotLoggedIn);
     };
     let options = client_options(paths, &credentials)?;
@@ -208,7 +275,8 @@ pub async fn logout(paths: &ProfilePaths) -> anyhow::Result<LogoutOutcome> {
             false
         }
     };
-    remove_local_state(paths, &credentials);
+    remove_local_state(paths, &credentials)
+        .context("logged out, but secrets may remain in the keyring")?;
     Ok(LogoutOutcome::LoggedOut { revoked })
 }
 
@@ -217,8 +285,12 @@ pub enum LogoutOutcome {
     LoggedOut { revoked: bool },
 }
 
-fn remove_local_state(paths: &ProfilePaths, credentials: &Credentials<'_, credentials::OsKeyring>) {
-    credentials.remove();
+/// Fails if a keyring entry may remain; the files are removed regardless.
+fn remove_local_state(
+    paths: &ProfilePaths,
+    credentials: &Credentials<'_, credentials::OsKeyring>,
+) -> anyhow::Result<()> {
+    let removed = credentials.remove();
     for cache in [paths.sdk_secret_cache(), paths.sdk_entity_cache()] {
         for suffix in ["", "-wal", "-shm"] {
             let mut path = cache.clone().into_os_string();
@@ -226,6 +298,7 @@ fn remove_local_state(paths: &ProfilePaths, credentials: &Credentials<'_, creden
             let _ = std::fs::remove_file(path);
         }
     }
+    Ok(removed?)
 }
 
 #[cfg(test)]

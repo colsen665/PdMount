@@ -12,8 +12,7 @@ It exists because the user verified that the write sync in pdcli's mount breaks 
 
 ## Status
 
-The design phase is complete and implementation has not started. Status, the next action, open questions and handoff notes are in
-**`TODO.md`**.
+Status, the next action, open questions and handoff notes are in **`TODO.md`**.
 
 ## Session start
 
@@ -57,9 +56,8 @@ The design phase is complete and implementation has not started. Status, the nex
 - **Conventions (accepted):**
   - CLI: path last (D009).
   - Milestone exit criteria are in DESIGN.md §16, built from the rsync/git scenarios in §15.3 (D005).
-- **Working assumptions (proposed, pending user review; follow them unless the user decides otherwise):**
   - Denied writes return EROFS (D019).
-  - Everything else in D011–D020.
+  - Secrets go to files only with `--allow-file-secrets` or `--force-file-secrets` (D029).
 - **Secrets:** never print the contents of `~/.config/pdcli`, keyrings, tokens or session files.
 
 ## Source citations
@@ -83,6 +81,7 @@ scratchpad directory that depends on the exact versions and run `cargo fetch`. T
 - **No GitHub use** (repos, forks, PRs, issues, Actions) until the user says otherwise (D023).
 - SDK fork: `<fork>` (local bare repo, D022). See docs/sdk-patches.md, "Fork repository".
 - Commit or push only when the user asks.
+- Author: the repository's local git config (`user.name=Claus`, `user.email=colsen665@proton.me`), set for the sandbox user.
 - Commit message trailer: `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
 ## Environment (verified 2026-10-19)
@@ -91,25 +90,38 @@ scratchpad directory that depends on the exact versions and run `cargo fetch`. T
 |---|---|
 | System | Gentoo |
 | `/home` | btrfs (FICLONE reflinks available) |
-| `/etc/fuse.conf` | no `user_allow_other`, so no AutoUnmount (proposal D020) |
+| `/etc/fuse.conf` | no `user_allow_other`, so no AutoUnmount (D020) |
 | Toolchain | stable Rust (cargo), Go, clang, protoc, pkg-config, fusermount3 |
 | Tools | git, rsync; pjdfstest and fsx built from source (locations: see "Local paths") |
-| Agent user | a sandbox user: no session bus or display, so no keyring (0600 file fallback, D024) and no browser |
+| Agent user | a sandbox user: no session bus or display, so no keyring (run commands with `--force-file-secrets`, D029) and no browser |
 
 ## Commands
 
 - `scripts/ci.sh`: local CI (fmt, clippy `-D warnings`, tests, release build). Run it before every commit.
   `scripts/ci.sh --quick` skips the release build.
 - `cargo test --workspace` / `cargo test -p pdmount-backend fake`: tests only.
-- `cargo run -p pdmount -- doctor | status | login [--browser|--no-browser] | logout`, with `--profile <name>` to select a profile.
-- The scenario scripts (`tests/scenarios/<name>.sh`, `VERIFY_MODE=live|remount|crash|fresh|second`) are created in M1/M2.
+- `cargo run -p pdmount -- doctor | status | login [--browser|--no-browser] | logout`, with `--profile <name>` to select a profile
+  and, as the sandbox user, `--force-file-secrets` (D029).
+- `pdmount mount [--foreground] [<mnt>] | unmount [--force] [<mnt>] | stats | reset --keep-login` (M1: read-only). The daemon
+  logs to `~/.local/state/pdmount/<profile>.log`.
+- `scripts/repro/keyring-d024.sh [case ...]`: keyring tests (D024 hang, D029 modes) against gnome-keyring in a private D-Bus
+  session (about 2 min). Not part of `scripts/ci.sh`.
+- `scripts/testdata/make-m1-dataset.sh <dir>`: the deterministic M1 dataset (upload it with the official client).
+- Scenario scripts: `VERIFY_MODE=live|fresh tests/scenarios/<name>.sh` (`r6`, `g6_read`, `sha`, `kill9`), against the real
+  account; `remount|crash|second` follow in M2/M3.
+- Mounted fake-backend tests (`crates/pdmount-fuse/tests/`) need `/dev/fuse` and `fusermount3`; they skip otherwise.
 
 Workspace layout:
-- `crates/pdmount-core`: config, paths, device identity; the engine from M1.
+- `crates/pdmount-core`: config, paths, device identity, store, inode tree, block cache, engine.
 - `crates/pdmount-backend`: `Backend` trait, `fake`, `proton` adapter.
-- `crates/pdmount`: the CLI binary.
+- `crates/pdmount-fuse`: the fuser `Filesystem` over the engine; `mount()`.
+- `crates/pdmount`: the CLI binary, daemon and control socket.
 
 Never run `login` against the user's account without being asked; it creates a real session.
+Real-account tests (profile `default`, account `<test account>`) may create, change and delete only under
+`My Files/pdmount-test/`. Everything else, `pdmount-m1/` in particular, is read-only for agents (D028).
+fsx, pjdfstest and soak runs use the fake backend only. Real-account scenarios run one at a time and stop at the first
+HTTP 429. Ask the user before any long-running test against the real account (D030).
 Commands that write to the keyring (`login`, `logout`) or open a browser can open desktop dialogs. Tell the user before
 running them, or run them as the sandbox user once it exists.
 For smoke tests, use a throwaway `--profile` and run `logout` afterwards.

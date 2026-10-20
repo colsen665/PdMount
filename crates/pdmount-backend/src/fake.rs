@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 use sha1::Digest;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// Operations of the [`Backend`] trait, for fault injection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +104,7 @@ struct State {
     event_page_size: usize,
     refresh_pending: bool,
     faults: VecDeque<(FakeOp, BackendError)>,
+    latency: Duration,
 }
 
 impl State {
@@ -231,6 +232,7 @@ impl FakeBackend {
                 event_page_size: 50,
                 refresh_pending: false,
                 faults: VecDeque::new(),
+                latency: Duration::ZERO,
             })),
         }
     }
@@ -252,6 +254,18 @@ impl FakeBackend {
     pub fn set_block_size(&self, block_size: usize) {
         assert!(block_size > 0, "block size must be positive");
         self.state.lock().block_size = block_size;
+    }
+
+    /// Delays every read call (root, listings, blocks) by `latency`.
+    pub fn set_latency(&self, latency: Duration) {
+        self.state.lock().latency = latency;
+    }
+
+    async fn delay(&self) {
+        let latency = self.state.lock().latency;
+        if !latency.is_zero() {
+            tokio::time::sleep(latency).await;
+        }
     }
 
     pub fn set_event_page_size(&self, page_size: usize) {
@@ -307,10 +321,12 @@ impl Backend for FakeBackend {
     }
 
     async fn root(&self) -> Result<RemoteNode> {
+        self.delay().await;
         self.with_state(FakeOp::Root, |s| Ok(s.nodes[&s.root].to_remote()))
     }
 
     async fn list_children(&self, folder: &LinkId) -> Result<Vec<RemoteNode>> {
+        self.delay().await;
         self.with_state(FakeOp::ListChildren, |s| {
             s.folder(folder)?;
             let mut children: Vec<_> = s
@@ -325,6 +341,7 @@ impl Backend for FakeBackend {
     }
 
     async fn get_nodes(&self, ids: &[LinkId]) -> Result<Vec<Option<RemoteNode>>> {
+        self.delay().await;
         self.with_state(FakeOp::GetNodes, |s| {
             Ok(ids
                 .iter()
@@ -334,6 +351,7 @@ impl Backend for FakeBackend {
     }
 
     async fn blocks(&self, file: &LinkId, revision: &RevisionId) -> Result<Vec<BlockInfo>> {
+        self.delay().await;
         self.with_state(FakeOp::Blocks, |s| {
             let node = s.nodes.get(file).ok_or(BackendError::NotFound)?;
             let rev = node
@@ -354,6 +372,7 @@ impl Backend for FakeBackend {
     }
 
     async fn fetch_block(&self, file: &LinkId, revision: &RevisionId, index: u32) -> Result<Bytes> {
+        self.delay().await;
         self.with_state(FakeOp::FetchBlock, |s| {
             let node = s.nodes.get(file).ok_or(BackendError::NotFound)?;
             let rev = node

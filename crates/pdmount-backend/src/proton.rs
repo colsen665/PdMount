@@ -1,7 +1,7 @@
 //! [`Backend`] on top of the community Proton Drive SDK (patched fork,
 //! docs/sdk-patches.md).
 //!
-//! M0 implements the read side (account, listing, node lookup, blocks,
+//! The read side is implemented (account, listing, node lookup, blocks,
 //! events, quota). Uploads and namespace changes return
 //! [`BackendError::Unsupported`] until M2.
 
@@ -34,15 +34,20 @@ pub const MODE_METADATA_KEY: &str = "pdmount.mode";
 
 /// Block URLs expire; maps older than this are fetched again.
 const BLOCK_MAP_TTL: Duration = Duration::from_secs(600);
+/// Memoized block maps kept before idle ones are dropped.
+const BLOCK_MAP_LIMIT: usize = 256;
 
 type BlockMapKey = (LinkId, RevisionId);
+/// One slot per revision. Its async lock makes concurrent misses wait for a
+/// single fetch: a large file's map takes one API call per 10 blocks.
+type BlockMapSlot = Arc<tokio::sync::Mutex<Option<(Instant, Arc<BlockMap>)>>>;
 
 pub struct ProtonBackend {
     client: ProtonDriveClient,
     username: String,
     volume: VolumeId,
     root: LinkId,
-    block_maps: Mutex<HashMap<BlockMapKey, (Instant, Arc<BlockMap>)>>,
+    block_maps: Mutex<HashMap<BlockMapKey, BlockMapSlot>>,
 }
 
 impl ProtonBackend {
@@ -74,11 +79,19 @@ impl ProtonBackend {
     }
 
     async fn block_map(&self, file: &LinkId, revision: &RevisionId) -> Result<Arc<BlockMap>> {
-        let key = (file.clone(), revision.clone());
-        if let Some((fetched, map)) = self.block_maps.lock().get(&key)
+        let slot = {
+            let mut maps = self.block_maps.lock();
+            if maps.len() >= BLOCK_MAP_LIMIT {
+                // Drop slots nobody is using; their maps are refetched on demand.
+                maps.retain(|_, slot| Arc::strong_count(slot) > 1);
+            }
+            Arc::clone(maps.entry((file.clone(), revision.clone())).or_default())
+        };
+        let mut cached = slot.lock().await;
+        if let Some((fetched, map)) = cached.as_ref()
             && fetched.elapsed() < BLOCK_MAP_TTL
         {
-            return Ok(map.clone());
+            return Ok(Arc::clone(map));
         }
         let map = Arc::new(
             self.client
@@ -86,9 +99,7 @@ impl ProtonBackend {
                 .await
                 .map_err(map_error)?,
         );
-        self.block_maps
-            .lock()
-            .insert(key, (Instant::now(), map.clone()));
+        *cached = Some((Instant::now(), Arc::clone(&map)));
         Ok(map)
     }
 }

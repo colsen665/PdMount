@@ -39,20 +39,26 @@ Rules for this log:
 | D008 | Per-path ro/rw access control, changeable and listable at runtime | accepted | user | 2026-10-19 |
 | D009 | CLI convention: path is the last argument | accepted | user | 2026-10-19 |
 | D010 | Web auth both opens the browser and prints the link | accepted | user | 2026-10-19 |
-| D011 | Access rules bound to the node, not the path string | proposed | claude | 2026-10-19 |
-| D012 | fsync default `local` (durable locally, upload later) | proposed | claude | 2026-10-19 |
-| D013 | Directory mtime local-only until a folder update API exists | proposed | claude | 2026-10-19 |
-| D014 | Sync fuser trait with tokio dispatch, not the async trait | proposed | claude | 2026-10-19 |
-| D015 | Conflict policy: keep both, first committer keeps the name | proposed | claude | 2026-10-19 |
-| D016 | Identical content (SHA-1) is never a conflict | proposed | claude | 2026-10-19 |
-| D017 | Kernel writeback cache off in v1 | proposed | claude | 2026-10-19 |
-| D018 | `.pdignore` default empty; ignored means local-only | proposed | claude | 2026-10-19 |
-| D019 | Denied writes return EROFS | proposed | claude | 2026-10-19 |
-| D020 | No AutoUnmount without `user_allow_other` | proposed | claude | 2026-10-19 |
+| D011 | Access rules bound to the node, not the path string | accepted | claude | 2026-10-19 |
+| D012 | fsync default `local` (durable locally, upload later) | accepted | claude | 2026-10-19 |
+| D013 | Directory mtime local-only until a folder update API exists | accepted | claude | 2026-10-19 |
+| D014 | Sync fuser trait with tokio dispatch, not the async trait | accepted | claude | 2026-10-19 |
+| D015 | Conflict policy: keep both, first committer keeps the name | accepted | claude | 2026-10-19 |
+| D016 | Identical content (SHA-1) is never a conflict | accepted | claude | 2026-10-19 |
+| D017 | Kernel writeback cache off in v1 | accepted | claude | 2026-10-19 |
+| D018 | `.pdignore` default empty; ignored means local-only | accepted | claude | 2026-10-19 |
+| D019 | Denied writes return EROFS | accepted | claude | 2026-10-19 |
+| D020 | No AutoUnmount without `user_allow_other` | accepted | claude | 2026-10-19 |
 | D021 | Handoff docs: AGENTS.md (CLAUDE.md refers to it), TODO.md, this log | accepted | user | 2026-10-19 |
 | D022 | SDK fork hosted in a local bare repo | accepted | user | 2026-10-19 |
 | D023 | GitHub use postponed until further notice | accepted | user | 2026-10-19 |
-| D024 | Keyring calls time out after 20 s and fall back to 0600 files | proposed | claude | 2026-10-19 |
+| D024 | Keyring calls time out after 20 s and fall back to 0600 files | superseded by D029 | claude | 2026-10-19 |
+| D025 | Startup revalidation of listed directories until the event engine exists | accepted | claude | 2026-10-19 |
+| D026 | The mount daemon re-executes itself instead of forking | accepted | claude | 2026-10-19 |
+| D027 | Speculative API work is paced and yields to user requests | accepted | claude | 2026-10-19 |
+| D028 | Real-account tests write only under `pdmount-test/` | accepted | user | 2026-10-19 |
+| D029 | Secrets in files only with `--allow-file-secrets` or `--force-file-secrets` | accepted | user | 2026-10-20 |
+| D030 | Stress and conformance tests only on the fake; a load budget for real-account runs | accepted | user | 2026-10-20 |
 
 ---
 
@@ -165,7 +171,7 @@ Rules for this log:
 - **Refs:** DESIGN.md §12.2.
 
 ## D011 — Access rules bound to the node, not the path string
-- **Status:** proposed
+- **Status:** accepted
 - **Decided by:** claude
 - **Date:** 2026-10-19
 - **Context:** D008 does not say what happens to a rule when its entry is renamed, moved or deleted.
@@ -173,10 +179,10 @@ Rules for this log:
   When the node is deleted, the rule becomes `orphaned` and is never applied to a new entry with the same name.
 - **Alternatives:** Path-string rules: they survive delete and recreate, but a remote rename silently unprotects the subtree.
 - **Consequences:** `list` shows both the current path and the path recorded when the rule was set.
-- **Refs:** DESIGN.md §11.1.
+- **Refs:** DESIGN.md §11.1. Accepted by user 2026-10-20.
 
 ## D012 — fsync default `local`
-- **Status:** proposed
+- **Status:** accepted
 - **Decided by:** claude
 - **Date:** 2026-10-19
 - **Context:** git fsyncs refs and packs on every commit. Blocking each fsync on an upload would cost several network RTTs per commit.
@@ -184,20 +190,20 @@ Rules for this log:
   `pdmount sync <path>` is an explicit barrier that waits until everything under the path is uploaded.
 - **Alternatives:** Always remote: correct "on server" semantics, but too slow for git.
 - **Consequences:** A successful fsync does not mean the data is on the server.
-- **Refs:** DESIGN.md §5.6.
+- **Refs:** DESIGN.md §5.6. Accepted by user 2026-10-20.
 
 ## D013 — Directory mtime local-only until a folder update API exists
-- **Status:** proposed
+- **Status:** accepted
 - **Decided by:** claude
 - **Date:** 2026-10-19
 - **Context:** The folder XAttr can be set at creation (P5). No update API is known.
 - **Decision:** Directory mtime and mode are stored locally. Only the creation-time mtime is sent remotely.
 - **Alternatives:** Re-create folders to change their mtime: destructive and expensive.
 - **Consequences:** Scenario R1 uses `--omit-dir-times` in `fresh` and `second` modes.
-- **Refs:** DESIGN.md §8.6; TODO.md Q2.
+- **Refs:** DESIGN.md §8.6; TODO.md Q2. Accepted by user 2026-10-20.
 
 ## D014 — Sync fuser trait with tokio dispatch
-- **Status:** proposed
+- **Status:** accepted
 - **Decided by:** claude
 - **Date:** 2026-10-19
 - **Context:** fuser 0.18's `AsyncFilesystem` covers only lookup, getattr, read and readdir (`fuser/experimental.rs:220-257`).
@@ -205,10 +211,10 @@ Rules for this log:
   `catch_unwind`.
 - **Alternatives:** The async trait: it cannot carry a read-write filesystem.
 - **Consequences:** Deadlines are mandatory, because FUSE_INTERRUPT is unsupported.
-- **Refs:** DESIGN.md §4.
+- **Refs:** DESIGN.md §4. Accepted by user 2026-10-20.
 
 ## D015 — Conflict policy: keep both, first committer keeps the name
-- **Status:** proposed
+- **Status:** accepted
 - **Decided by:** claude
 - **Date:** 2026-10-19
 - **Context:** D007 requires zero data loss.
@@ -216,50 +222,50 @@ Rules for this log:
   A remote delete combined with a local edit resurrects the file. A local delete combined with a remote edit does not trash the file.
 - **Alternatives:** Last writer wins: loses data. Three-way merge: not generally possible for binary files.
 - **Consequences:** Conflict copies need user attention (`conflicts` CLI, notifications).
-- **Refs:** DESIGN.md §10.5–§10.8.
+- **Refs:** DESIGN.md §10.5–§10.8. Accepted by user 2026-10-20.
 
 ## D016 — Identical content (SHA-1) is never a conflict
-- **Status:** proposed
+- **Status:** accepted
 - **Decided by:** claude
 - **Date:** 2026-10-19
 - **Context:** git objects and packs are content-addressed, and rsync re-runs write identical bytes.
 - **Decision:** If a snapshot's SHA-1 equals the remote active revision's SHA-1, adopt the remote revision and skip the upload.
 - **Alternatives:** Always create conflict copies: noisy, and it breaks `.git`.
 - **Consequences:** Needs the decrypted SHA-1 from P4.
-- **Refs:** DESIGN.md §10.3.
+- **Refs:** DESIGN.md §10.3. Accepted by user 2026-10-20.
 
 ## D017 — Kernel writeback cache off in v1
-- **Status:** proposed
+- **Status:** accepted
 - **Decided by:** claude
 - **Date:** 2026-10-19
 - **Context:** With writeback cache the kernel owns mtime and size and holds dirty pages.
 - **Decision:** Off in v1. M4 runs an experiment behind `kernel.writeback_cache`, and it becomes the default only if the full scenario suite passes.
 - **Alternatives:** On from the start: risks `rsync -t` and invalidation correctness.
 - **Consequences:** More write requests reach the daemon; acceptable because throughput is limited by uploads.
-- **Refs:** DESIGN.md §5.4.1.
+- **Refs:** DESIGN.md §5.4.1. Accepted by user 2026-10-20.
 
 ## D018 — `.pdignore` default empty; ignored means local-only
-- **Status:** proposed
+- **Status:** accepted
 - **Decided by:** claude
 - **Date:** 2026-10-19
 - **Context:** pdcli's default list includes `.git/` and `*.tmp`, and its ignore handling trashes originals when files are saved atomically.
 - **Decision:** The default list is empty. Ignored files persist locally and are never uploaded. A rule only blocks creating new remote nodes.
 - **Alternatives:** Ship a default list: it breaks git.
 - **Consequences:** Users opt in to ignore rules.
-- **Refs:** DESIGN.md §7.7.
+- **Refs:** DESIGN.md §7.7. Accepted by user 2026-10-20.
 
 ## D019 — Denied writes return EROFS
-- **Status:** proposed
+- **Status:** accepted
 - **Decided by:** claude
 - **Date:** 2026-10-19
 - **Context:** D008 needs an error code for writes in a `ro` subtree.
 - **Decision:** EROFS for all denied writes. Write bits are cleared in the reported mode.
 - **Alternatives:** EACCES/EPERM: these read as permission problems, which misleads users.
 - **Consequences:** rsync and git report "Read-only file system".
-- **Refs:** DESIGN.md §11.2.
+- **Refs:** DESIGN.md §11.2. Accepted by user 2026-10-20.
 
 ## D020 — No AutoUnmount without `user_allow_other`
-- **Status:** proposed
+- **Status:** accepted
 - **Decided by:** claude
 - **Date:** 2026-10-19
 - **Context:** fuser refuses AutoUnmount without `allow_other`/`allow_root` (`fuser/session.rs:163-171`), and this machine's
@@ -267,7 +273,7 @@ Rules for this log:
 - **Decision:** Don't depend on AutoUnmount. Use systemd `ExecStopPost=fusermount3 -uz` and `unmount --force` instead. `doctor` explains the fuse.conf option.
 - **Alternatives:** Require the user to edit `/etc/fuse.conf`.
 - **Consequences:** After `kill -9`, the mount must be cleaned up explicitly (tested in M1).
-- **Refs:** DESIGN.md §14.4.
+- **Refs:** DESIGN.md §14.4. Accepted by user 2026-10-20.
 
 ## D021 — Handoff docs: AGENTS.md, TODO.md, this log
 - **Status:** accepted
@@ -314,7 +320,7 @@ Rules for this log:
 - **Refs:** docs/sdk-patches.md; TODO.md M0.7, Q8; DESIGN.md §15.1.
 
 ## D024 — Keyring calls time out after 20 s and fall back to 0600 files
-- **Status:** proposed
+- **Status:** superseded by D029
 - **Decided by:** claude
 - **Date:** 2026-10-19
 - **Context:** During the M0 sign-in smoke test, `set_password` on the Secret Service never returned (probably a locked
@@ -330,3 +336,133 @@ Rules for this log:
 - **Refs:** DESIGN.md §12.1; crates/pdmount/src/credentials.rs. Cause confirmed by the user (2026-10-19): the keyring opened an
   unlock dialog while the terminal window was out of focus, and it went unnoticed. The user is setting up a sandbox user for
   agent work.
+  Reproduced 2026-10-20 as the sandbox user with `scripts/repro/keyring-d024.sh`, against gnome-keyring in a private D-Bus session:
+  - Locked collection, with a prompter that never answers (the unnoticed dialog): the bare `keyring` call
+    (`dbus-secret-service` 4.1.0 waits up to a year for `Prompt.Completed`) was still blocked when killed after 90 s.
+    PdMount fell back to the 0600 file after 20 s and logged the warning.
+  - A later process with the keyring unlocked moved the session from the file into the keyring.
+  - Locked, with no display (the real `gcr-prompter` cannot start): the prompt is dismissed at once and the fallback is
+    immediate, so there is no hang. The hang needs a session where a dialog can appear.
+  - `doctor` reports a locked keyring as OK, because its probe reads an entry that does not exist and so needs no unlock.
+
+## D025 — Startup revalidation of listed directories until the event engine exists
+- **Status:** accepted
+- **Decided by:** claude
+- **Date:** 2026-10-19
+- **Context:** M1 serves the stored tree immediately after a remount (§5.1), but the event engine that keeps it current is
+  M3. Without a catch-up step, files changed by other clients while unmounted would stay invisible, and stale sizes would
+  break rsync's quick check.
+- **Decision:** After mounting, list every listed directory again in the background (4 at a time, root first), apply the
+  differences like any listing and send the resulting kernel invalidations (§9.5). The event cursor is still recorded on
+  the first mount (§9.1), so M3 can start polling from it.
+- **Alternatives:** Do nothing until M3: stale views after every remount. Poll by re-listing periodically: costs one
+  request per listed directory per interval, the problem events solve.
+- **Consequences:** One listing request per listed directory per mount; changes made while mounted appear only after the
+  next mount until M3. M3's `refresh` handling (§9.4) reuses the same code path.
+- **Refs:** DESIGN.md §5.1, §9.4; crates/pdmount-core/src/engine.rs (`revalidate`). Accepted by user 2026-10-20.
+
+## D026 — The mount daemon re-executes itself instead of forking
+- **Status:** accepted
+- **Decided by:** claude
+- **Date:** 2026-10-19
+- **Context:** `pdmount mount` must return while the filesystem keeps running (§14.2). A classic `fork` + `setsid` daemon
+  needs unsafe code, which the workspace denies, and forking a process that already started threads (tokio) is unsound.
+- **Decision:** `pdmount mount` starts `pdmount mount --foreground` with `Command::process_group(0)`, stdin from
+  `/dev/null` and output appended to the log file, then waits until the child's control socket answers `ping`. The
+  foreground mode is also what a systemd unit runs.
+- **Alternatives:** `fork`/`setsid` via `nix`: unsafe, and unsound after threads exist. Always foreground: unusable
+  from an interactive shell without `&` and `nohup`.
+- **Consequences:** The daemon is not a session leader; it ignores SIGHUP. Start-up errors are shown by reading the new
+  part of the log file.
+- **Refs:** DESIGN.md §14.4; crates/pdmount/src/daemon.rs. Accepted by user 2026-10-20.
+
+## D027 — Speculative API work is paced and yields to user requests
+- **Status:** accepted
+- **Decided by:** claude
+- **Date:** 2026-10-19
+- **Context:** In the first real-account run of M1, a `find` over 60 freshly mounted folders started listing and
+  small-file prefetch for each folder (§5.3) at a concurrency of 4. Proton answered HTTP 429. The SDK retries with back-off
+  longer than the 20 s metadata deadline, so four user-visible `opendir` calls returned EIO.
+- **Decision:** All speculative API work goes through one gate: listing prefetch, small-file prefetch and startup
+  revalidation (D025). It runs one request at a time, at most one start every 500 ms, and only while no foreground request
+  is in flight (a listing or read that a FUSE request waits on). Readahead is not gated: it downloads from storage with
+  a block map that is already known.
+- **Alternatives:** Disable prefetch: loses §5.3's benefit for small files. A token bucket shared with foreground work:
+  foreground would still queue behind background bursts.
+- **Consequences:**
+  - Prefetch finishes later. A folder of 1000 small files takes about 8 minutes to prefetch.
+  - Revalidation of N listed folders takes about N/2 seconds.
+  - Foreground requests are not paced at all. A cold `rsync` of 1000 small files still costs about 2 API calls per file
+    (6 minutes in the M1 run). Q7 tracks the rate limits.
+- **Refs:** DESIGN.md §5.3; crates/pdmount-core/src/gate.rs; TODO.md Q7. Accepted by user 2026-10-20.
+
+## D028 — Real-account tests write only under `pdmount-test/`
+- **Status:** accepted
+- **Decided by:** user
+- **Date:** 2026-10-19
+- **Context:** From M2 on, scenario scripts write to the real account (`<test account>`, profile `default`). The account
+  holds the M1 dataset `pdmount-m1/`, which later milestones keep reading.
+- **Decision:** Agents and scripts create, change and delete only under `My Files/pdmount-test/`. Everything else is
+  read-only for them.
+- **Alternatives:** Writes anywhere except `pdmount-m1/` (not chosen).
+- **Consequences:** Real-account scenario scripts take their target directory under `pdmount-test/` and clean it up
+  there only. The persistable fake covers anything that would need to touch other paths.
+- **Refs:** AGENTS.md; DESIGN.md §15.3.
+
+## D029 — Secrets in files only with `--allow-file-secrets` or `--force-file-secrets`
+- **Status:** accepted
+- **Decided by:** user
+- **Date:** 2026-10-20
+- **Context:** D024 fell back to 0600 files silently, whenever the keyring did not answer. The D024 reproduction
+  (D024 Refs) also showed that any keyring error counted as "no entry". After a cancelled unlock dialog, PdMount reported
+  "not logged in" and created a new cache key, which made the existing caches unreadable. The user decided that secrets
+  may go to files in the user directory only when a command-line flag says so.
+- **Decision:**
+  - Three modes, from two mutually exclusive global flags:
+    - no flag: keyring only;
+    - `--allow-file-secrets`: the keyring, and 0600 files only when it is unavailable;
+    - `--force-file-secrets`: files only, without touching the keyring.
+  - A keyring answer is one of three: found, missing, or unavailable (no Secret Service, prompt dismissed, timed out,
+    any other error). Only "missing" counts as no entry. Without a flag, "unavailable" fails the command and names the
+    cause and the two flags.
+  - A secrets file, if present, is the newest copy: every successful keyring write deletes it. It is read first, in
+    every mode. Outside force mode it is then moved into the keyring and deleted, unless another daemon of the profile is
+    running, in which case it is left in place.
+  - Creating a new cache key deletes the profile's SDK caches and block cache, which the old key encrypted.
+  - Keyring calls wait up to 120 s. After 2 s, a note on the terminal says an unlock dialog may be open behind
+    other windows. After the keyring is unavailable once, the process stops calling it, except for one last token save
+    when the daemon stops.
+  - `login` ends the new server session if it cannot store it. `logout` reports keyring entries it could not delete.
+    The daemon stores tokens only when they have changed. `mount` reads the stored session before it starts the
+    daemon, so an unlock dialog appears while the terminal is waiting. The daemon is started with the same flag.
+  - Tests use force mode, except tests that check keyring behaviour.
+- **Alternatives:**
+  - D024's silent fallback: puts secrets on disk without the user's consent, and hides cancelled dialogs.
+  - A single flag: no way to keep agents and tests off a keyring that works.
+  - An environment variable or config option: easier to leave on by accident (the user chose flags only).
+- **Consequences:**
+  - Without a session bus (the agent user, headless machines), every command that reads secrets needs a flag.
+    The systemd unit and the scenario scripts pass one.
+  - Switching between modes can create a new cache key, which costs a cache rebuild. In force mode, the session and
+    the cache key must both be in files; otherwise a new login is needed.
+  - After `logout --force-file-secrets`, keyring entries from earlier runs may remain until a `logout` without a flag.
+- **Refs:** DESIGN.md §12.1, §12.4, §13.1, §14.1, §14.2; crates/pdmount/src/credentials.rs; scripts/repro/keyring-d024.sh;
+  TODO.md M2.0b. Supersedes D024.
+
+## D030 — Stress and conformance tests only on the fake; a load budget for real-account runs
+- **Status:** accepted
+- **Decided by:** user
+- **Date:** 2026-10-20
+- **Context:** The M2 exit check includes a 6 h fsx run, and the task did not say which backend it uses. fsx issues
+  thousands of small writes and truncates per minute; against the real account that becomes a stream of revision
+  uploads that could get the account banned. The M1 run already saw HTTP 429 at a concurrency of 4 (TODO.md Q7).
+- **Decision:**
+  - fsx, pjdfstest and the soak test run only over the fake backend. Its fault injection supplies latency and 429s.
+  - Real-account scenario runs (only under `pdmount-test/`, D028) run one at a time, are not looped or repeated without
+    a reason, and stop at the first HTTP 429 instead of retrying.
+  - Datasets for many-small-file scenarios (G2, G3) stay modest until Q7 has measured limits.
+  - Agents ask the user before starting any long-running test against the real account.
+- **Alternatives:** A short fsx run against the real account: still upload-heavy, and it proves nothing the fake cannot.
+- **Consequences:** The real API is exercised only by the scenario scripts. Rate-limit behaviour under load is learned
+  from short, deliberate runs (Q7), not from stress tools.
+- **Refs:** DESIGN.md §15.1, §15.3, §16; TODO.md M2.8, M2.9, Q7; AGENTS.md.
