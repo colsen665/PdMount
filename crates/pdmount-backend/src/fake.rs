@@ -5,6 +5,23 @@
 //! precondition of renames, trash semantics, quota, and a paged event
 //! stream with `more` and `refresh`. Clones share one drive, so two clones
 //! act as two devices. One-shot failures can be injected per operation.
+//!
+//! [`FakeBackend::open`] persists the drive to a directory, so two daemons
+//! can share one fake (`pdmount mount --backend fake:<dir>`):
+//! - `snapshot.json`: the whole state as of a generation;
+//! - `journal.jsonl`: one line per change after it (the nodes it touched,
+//!   new events and changes, settings), appended before the call returns,
+//!   so a killed daemon loses nothing; compacted into a new snapshot when
+//!   it grows;
+//! - `blobs/<revision>`: content; `epoch`: bumped by every compaction;
+//! - `lock`: every operation holds an exclusive `flock` and first applies
+//!   what other processes appended.
+//!
+//! Growth is bounded for long runs (fsx, the scenario matrix): files keep
+//! their last revisions (`PDMOUNT_FAKE_KEEP_REVISIONS`, default 16), the
+//! most recent trashed nodes are kept, and the event and change logs are
+//! trimmed, keeping absolute sequence numbers. Injected failures and
+//! latency stay per process.
 
 use crate::{
     AccountInfo, Backend, BackendError, BlockInfo, EventId, EventKind, EventPage, FileMeta, LinkId,
@@ -12,10 +29,24 @@ use crate::{
 };
 use bytes::Bytes;
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use sha1::Digest;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
+
+/// Revisions kept per file unless configured otherwise.
+pub const DEFAULT_KEEP_REVISIONS: usize = 16;
+/// Trashed nodes kept (their content stays readable, as in Proton's trash).
+const KEEP_TRASHED: usize = 1024;
+/// Events and changes kept; older ones are trimmed in batches.
+const KEEP_EVENTS: usize = 10_000;
+const KEEP_CHANGES: usize = 50_000;
+/// Journal size that triggers a compaction.
+const COMPACT_BYTES: u64 = 8 << 20;
 
 /// Operations of the [`Backend`] trait, for fault injection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +68,7 @@ pub enum FakeOp {
 }
 
 /// A remote change applied by the fake, in order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FakeChange {
     CreatedFile { link: LinkId, name: String },
     CreatedFolder { link: LinkId, name: String },
@@ -46,15 +77,20 @@ pub enum FakeChange {
     Trashed { link: LinkId },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Revision {
     id: RevisionId,
-    content: Bytes,
+    size: u64,
+    sha1: [u8; 20],
     mtime: SystemTime,
     mode: Option<u32>,
+    /// Held in memory by in-memory fakes; persisted fakes read
+    /// `blobs/<id>` instead.
+    #[serde(skip)]
+    content: Option<Bytes>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Node {
     link: LinkId,
     parent: Option<LinkId>,
@@ -63,11 +99,21 @@ struct Node {
     trashed: bool,
     folder_mtime: Option<SystemTime>,
     revisions: Vec<Revision>,
+    /// Generation of the trashing, for retention.
+    #[serde(default)]
+    trashed_at: u64,
 }
 
 impl Node {
     fn active(&self) -> Option<&Revision> {
         self.revisions.last()
+    }
+
+    fn revision(&self, id: &RevisionId) -> Result<&Revision> {
+        self.revisions
+            .iter()
+            .find(|r| &r.id == id)
+            .ok_or(BackendError::NotFound)
     }
 
     fn to_remote(&self) -> RemoteNode {
@@ -78,10 +124,10 @@ impl Node {
             name: self.name.clone(),
             kind: self.kind,
             active_revision: active.map(|r| r.id.clone()),
-            size: active.map(|r| r.content.len() as u64),
+            size: active.map(|r| r.size),
             mtime: active.map(|r| r.mtime).or(self.folder_mtime),
             mode: active.and_then(|r| r.mode),
-            sha1: active.map(|r| sha1::Sha1::digest(&r.content).into()),
+            sha1: active.map(|r| r.sha1),
             name_hash: Some(name_hash(&self.name)),
             trashed: self.trashed,
         }
@@ -92,24 +138,149 @@ fn name_hash(name: &str) -> NameHash {
     NameHash::new(format!("fake:{name}"))
 }
 
+fn default_page_size() -> usize {
+    50
+}
+
+fn default_keep_revisions() -> usize {
+    DEFAULT_KEEP_REVISIONS
+}
+
+fn io_error(context: &str, error: std::io::Error) -> BackendError {
+    BackendError::Other(format!("fake backend: {context}: {error}"))
+}
+
+/// Settings and counters, journaled as one record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Meta {
+    next_id: u64,
+    quota_max: u64,
+    block_size: usize,
+    events_base: u64,
+    changes_base: u64,
+    keep_revisions: usize,
+}
+
+/// One journaled delta.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum Record {
+    Node(Node),
+    Removed(LinkId),
+    Event(RemoteEvent),
+    Change(FakeChange),
+    Meta(Meta),
+}
+
+/// One journal line: everything one operation changed.
+#[derive(Debug, Serialize, Deserialize)]
+struct Line {
+    generation: u64,
+    records: Vec<Record>,
+}
+
+/// What the current operation changed, for the journal.
+#[derive(Debug, Default)]
+struct Delta {
+    nodes: BTreeSet<LinkId>,
+    events: usize,
+    changes: usize,
+    meta: bool,
+    trashed: bool,
+}
+
+impl Delta {
+    fn is_empty(&self) -> bool {
+        self.nodes.is_empty() && self.events == 0 && self.changes == 0 && !self.meta
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 struct State {
+    /// Persistence directory; `None` for an in-memory fake.
+    #[serde(skip)]
+    dir: Option<PathBuf>,
+    /// Bumped by every journaled change; the snapshot records the last one
+    /// it contains.
+    #[serde(default)]
+    generation: u64,
+    /// Compaction count this process has loaded.
+    #[serde(skip)]
+    epoch: u64,
+    /// Bytes of the journal this process has applied.
+    #[serde(skip)]
+    journal_offset: u64,
     username: String,
     root: LinkId,
     nodes: BTreeMap<LinkId, Node>,
     events: Vec<RemoteEvent>,
     changes: Vec<FakeChange>,
+    /// Absolute index of `events[0]` (event ids are absolute).
+    #[serde(default)]
+    events_base: u64,
+    /// Absolute index of `changes[0]`.
+    #[serde(default)]
+    changes_base: u64,
     next_id: u64,
     quota_max: u64,
     block_size: usize,
+    #[serde(default = "default_keep_revisions")]
+    keep_revisions: usize,
+    #[serde(skip, default = "default_page_size")]
     event_page_size: usize,
+    #[serde(skip)]
     refresh_pending: bool,
+    #[serde(skip)]
     faults: VecDeque<(FakeOp, BackendError)>,
+    #[serde(skip)]
     latency: Duration,
+    #[serde(skip)]
+    delta: Delta,
 }
 
 impl State {
+    fn empty() -> Self {
+        let root = LinkId::new("root");
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            root.clone(),
+            Node {
+                link: root.clone(),
+                parent: None,
+                name: String::new(),
+                kind: NodeKind::Folder,
+                trashed: false,
+                folder_mtime: None,
+                revisions: Vec::new(),
+                trashed_at: 0,
+            },
+        );
+        Self {
+            dir: None,
+            generation: 0,
+            epoch: 0,
+            journal_offset: 0,
+            username: "fake@example.test".into(),
+            root,
+            nodes,
+            events: Vec::new(),
+            changes: Vec::new(),
+            events_base: 0,
+            changes_base: 0,
+            next_id: 0,
+            quota_max: 5 << 30,
+            block_size: FakeBackend::DEFAULT_BLOCK_SIZE,
+            keep_revisions: DEFAULT_KEEP_REVISIONS,
+            event_page_size: default_page_size(),
+            refresh_pending: false,
+            faults: VecDeque::new(),
+            latency: Duration::ZERO,
+            delta: Delta::default(),
+        }
+    }
+
     fn new_id(&mut self, prefix: &str) -> String {
         self.next_id += 1;
+        self.delta.meta = true;
         format!("{prefix}{}", self.next_id)
     }
 
@@ -155,7 +326,7 @@ impl State {
         self.nodes
             .values()
             .flat_map(|n| &n.revisions)
-            .map(|r| r.content.len() as u64)
+            .map(|r| r.size)
             .sum()
     }
 
@@ -167,6 +338,11 @@ impl State {
         }
     }
 
+    /// Marks a node as changed by the current operation.
+    fn touch(&mut self, link: &LinkId) {
+        self.delta.nodes.insert(link.clone());
+    }
+
     fn push_event(&mut self, kind: EventKind, link: &LinkId) {
         let node = &self.nodes[link];
         self.events.push(RemoteEvent {
@@ -175,6 +351,16 @@ impl State {
             parent_link_id: node.parent.clone(),
             trashed: node.trashed,
         });
+        self.delta.events += 1;
+    }
+
+    fn push_change(&mut self, change: FakeChange) {
+        self.changes.push(change);
+        self.delta.changes += 1;
+    }
+
+    fn latest_event(&self) -> u64 {
+        self.events_base + self.events.len() as u64
     }
 
     fn is_descendant(&self, node: &LinkId, ancestor: &LinkId) -> bool {
@@ -187,7 +373,404 @@ impl State {
         }
         false
     }
+
+    fn blob(&self, revision: &RevisionId) -> Option<PathBuf> {
+        self.dir
+            .as_ref()
+            .map(|dir| dir.join("blobs").join(&revision.0))
+    }
+
+    /// `len` bytes of a revision from `start`.
+    fn read_range(&self, revision: &Revision, start: u64, len: u64) -> Result<Bytes> {
+        if let Some(content) = &revision.content {
+            let end = (start + len).min(content.len() as u64);
+            return Ok(content.slice(start as usize..end as usize));
+        }
+        let path = self
+            .blob(&revision.id)
+            .ok_or_else(|| BackendError::Other(format!("no content for {}", revision.id)))?;
+        let mut file = std::fs::File::open(&path).map_err(|e| io_error("open blob", e))?;
+        file.seek(SeekFrom::Start(start))
+            .map_err(|e| io_error("seek blob", e))?;
+        let mut out = Vec::with_capacity(len as usize);
+        file.take(len)
+            .read_to_end(&mut out)
+            .map_err(|e| io_error("read blob", e))?;
+        Ok(Bytes::from(out))
+    }
+
+    fn content(&self, revision: &Revision) -> Result<Bytes> {
+        self.read_range(revision, 0, revision.size)
+    }
+
+    fn new_revision(
+        &mut self,
+        mut staged: Staged,
+        meta: &FileMeta,
+    ) -> Result<(RevisionId, Revision)> {
+        if meta.sha1.is_some_and(|sha1| sha1 != staged.sha1) {
+            return Err(BackendError::Integrity("content SHA-1 mismatch".into()));
+        }
+        let id = RevisionId::new(self.new_id("rev-"));
+        let content = match staged.content.take() {
+            Some(StagedContent::Memory(bytes)) => Some(bytes),
+            Some(StagedContent::Blob(tmp)) => {
+                let path = self
+                    .blob(&id)
+                    .expect("blobs are staged only when persisted");
+                std::fs::rename(&tmp, &path).map_err(|e| io_error("store blob", e))?;
+                None
+            }
+            None => None,
+        };
+        let revision = Revision {
+            id: id.clone(),
+            size: staged.size,
+            sha1: staged.sha1,
+            mtime: meta.mtime,
+            mode: meta.mode,
+            content,
+        };
+        Ok((id, revision))
+    }
+
+    fn meta(&self) -> Meta {
+        Meta {
+            next_id: self.next_id,
+            quota_max: self.quota_max,
+            block_size: self.block_size,
+            events_base: self.events_base,
+            changes_base: self.changes_base,
+            keep_revisions: self.keep_revisions,
+        }
+    }
+
+    /// Bounds growth after an operation. Returns the revisions whose blobs
+    /// are no longer referenced.
+    fn retain(&mut self) -> Vec<RevisionId> {
+        let mut dropped = Vec::new();
+        let keep = self.keep_revisions.max(1);
+        for link in self.delta.nodes.clone() {
+            if let Some(node) = self.nodes.get_mut(&link)
+                && node.revisions.len() > keep
+            {
+                let excess = node.revisions.len() - keep;
+                dropped.extend(node.revisions.drain(..excess).map(|r| r.id));
+            }
+        }
+        if self.delta.trashed {
+            let mut trashed: Vec<(u64, LinkId)> = self
+                .nodes
+                .values()
+                .filter(|n| n.trashed)
+                .map(|n| (n.trashed_at, n.link.clone()))
+                .collect();
+            if trashed.len() > KEEP_TRASHED * 2 {
+                trashed.sort();
+                for (_, link) in &trashed[..trashed.len() - KEEP_TRASHED] {
+                    if let Some(node) = self.nodes.remove(link) {
+                        dropped.extend(node.revisions.into_iter().map(|r| r.id));
+                    }
+                    self.delta.nodes.insert(link.clone());
+                }
+            }
+        }
+        if self.events.len() > KEEP_EVENTS * 3 / 2 {
+            let cut = self.events.len() - KEEP_EVENTS;
+            self.events.drain(..cut);
+            self.events_base += cut as u64;
+            self.delta.events = self.delta.events.min(self.events.len());
+            self.delta.meta = true;
+        }
+        if self.changes.len() > KEEP_CHANGES * 3 / 2 {
+            let cut = self.changes.len() - KEEP_CHANGES;
+            self.changes.drain(..cut);
+            self.changes_base += cut as u64;
+            self.delta.changes = self.delta.changes.min(self.changes.len());
+            self.delta.meta = true;
+        }
+        dropped
+    }
+
+    /// Ends an operation: retention, then the journal line (persisted
+    /// fakes), then the blobs nothing refers to any more.
+    fn finish(&mut self) -> Result<()> {
+        if self.delta.is_empty() {
+            return Ok(());
+        }
+        let dropped = self.retain();
+        let delta = std::mem::take(&mut self.delta);
+        let Some(dir) = self.dir.clone() else {
+            return Ok(());
+        };
+        let mut records: Vec<Record> = delta
+            .nodes
+            .iter()
+            .map(|link| match self.nodes.get(link) {
+                Some(node) => Record::Node(node.clone()),
+                None => Record::Removed(link.clone()),
+            })
+            .collect();
+        records.extend(
+            self.events[self.events.len() - delta.events..]
+                .iter()
+                .cloned()
+                .map(Record::Event),
+        );
+        records.extend(
+            self.changes[self.changes.len() - delta.changes..]
+                .iter()
+                .cloned()
+                .map(Record::Change),
+        );
+        records.push(Record::Meta(self.meta()));
+        self.generation += 1;
+        let mut line = serde_json::to_vec(&Line {
+            generation: self.generation,
+            records,
+        })
+        .map_err(|e| BackendError::Other(format!("fake backend: encode journal: {e}")))?;
+        line.push(b'\n');
+        let mut journal = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("journal.jsonl"))
+            .map_err(|e| io_error("open journal", e))?;
+        let length = journal
+            .metadata()
+            .map_err(|e| io_error("stat journal", e))?
+            .len();
+        if length > self.journal_offset {
+            // A line torn by a killed writer: end it, so ours stays whole.
+            line.insert(0, b'\n');
+        }
+        journal
+            .write_all(&line)
+            .map_err(|e| io_error("append journal", e))?;
+        self.journal_offset = length + line.len() as u64;
+        for revision in dropped {
+            if let Some(path) = self.blob(&revision) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        if self.journal_offset > COMPACT_BYTES {
+            self.compact()?;
+        }
+        Ok(())
+    }
+
+    /// Writes the whole state as a new snapshot and starts an empty journal.
+    /// A crash in between is harmless: journal lines at or below the
+    /// snapshot's generation are skipped on load.
+    fn compact(&mut self) -> Result<()> {
+        let Some(dir) = self.dir.clone() else {
+            return Ok(());
+        };
+        let json = serde_json::to_vec(self)
+            .map_err(|e| BackendError::Other(format!("fake backend: encode state: {e}")))?;
+        write_replace(&dir.join("snapshot.json"), &json)
+            .map_err(|e| io_error("save snapshot", e))?;
+        write_replace(&dir.join("journal.jsonl"), b"").map_err(|e| io_error("reset journal", e))?;
+        self.epoch += 1;
+        write_replace(&dir.join("epoch"), self.epoch.to_string().as_bytes())
+            .map_err(|e| io_error("save epoch", e))?;
+        self.journal_offset = 0;
+        Ok(())
+    }
+
+    fn apply(&mut self, record: Record) {
+        match record {
+            Record::Node(node) => {
+                self.nodes.insert(node.link.clone(), node);
+            }
+            Record::Removed(link) => {
+                self.nodes.remove(&link);
+            }
+            Record::Event(event) => self.events.push(event),
+            Record::Change(change) => self.changes.push(change),
+            Record::Meta(meta) => {
+                self.next_id = meta.next_id;
+                self.quota_max = meta.quota_max;
+                self.block_size = meta.block_size;
+                self.keep_revisions = meta.keep_revisions;
+                if meta.events_base > self.events_base {
+                    let cut =
+                        ((meta.events_base - self.events_base) as usize).min(self.events.len());
+                    self.events.drain(..cut);
+                    self.events_base = meta.events_base;
+                }
+                if meta.changes_base > self.changes_base {
+                    let cut =
+                        ((meta.changes_base - self.changes_base) as usize).min(self.changes.len());
+                    self.changes.drain(..cut);
+                    self.changes_base = meta.changes_base;
+                }
+            }
+        }
+    }
+
+    /// Applies journal lines from byte `from` on; returns the offset after
+    /// the last complete line. A line torn by a killed writer is skipped.
+    fn replay(&mut self, journal: &[u8], from: u64) -> u64 {
+        let mut offset = from as usize;
+        while let Some(end) = journal[offset..].iter().position(|b| *b == b'\n') {
+            let line = &journal[offset..offset + end];
+            offset += end + 1;
+            match serde_json::from_slice::<Line>(line) {
+                Ok(line) if line.generation > self.generation => {
+                    for record in line.records {
+                        self.apply(record);
+                    }
+                    self.generation = line.generation;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "fake backend: skipping a torn journal line");
+                }
+            }
+        }
+        offset as u64
+    }
+
+    /// Takes over another process's changes before an operation.
+    fn refresh(&mut self) -> Result<()> {
+        let Some(dir) = self.dir.clone() else {
+            return Ok(());
+        };
+        let epoch = read_epoch(&dir)?;
+        let journal_len = std::fs::metadata(dir.join("journal.jsonl"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if epoch != self.epoch || journal_len < self.journal_offset {
+            let loaded = load_state(&dir)?;
+            self.take_persisted(loaded);
+            return Ok(());
+        }
+        if journal_len > self.journal_offset {
+            let journal = std::fs::read(dir.join("journal.jsonl"))
+                .map_err(|e| io_error("read journal", e))?;
+            self.journal_offset = self.replay(&journal, self.journal_offset);
+        }
+        Ok(())
+    }
+
+    /// Replaces the persisted part of the state, keeping what is per
+    /// process (faults, latency, page size).
+    fn take_persisted(&mut self, loaded: State) {
+        let State {
+            generation,
+            epoch,
+            journal_offset,
+            username,
+            root,
+            nodes,
+            events,
+            changes,
+            events_base,
+            changes_base,
+            next_id,
+            quota_max,
+            block_size,
+            keep_revisions,
+            ..
+        } = loaded;
+        self.generation = generation;
+        self.epoch = epoch;
+        self.journal_offset = journal_offset;
+        self.username = username;
+        self.root = root;
+        self.nodes = nodes;
+        self.events = events;
+        self.changes = changes;
+        self.events_base = events_base;
+        self.changes_base = changes_base;
+        self.next_id = next_id;
+        self.quota_max = quota_max;
+        self.block_size = block_size;
+        self.keep_revisions = keep_revisions;
+    }
 }
+
+fn read_epoch(dir: &Path) -> Result<u64> {
+    match std::fs::read_to_string(dir.join("epoch")) {
+        Ok(text) => text
+            .trim()
+            .parse()
+            .map_err(|_| BackendError::Other("fake backend: corrupt epoch file".into())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(io_error("read epoch", error)),
+    }
+}
+
+/// The snapshot (or the old one-file format) plus the journal.
+fn load_state(dir: &Path) -> Result<State> {
+    let parse = |path: PathBuf| -> Result<State> {
+        let json = std::fs::read(&path).map_err(|e| io_error("read state", e))?;
+        serde_json::from_slice(&json).map_err(|e| {
+            BackendError::Other(format!("fake backend: corrupt {}: {e}", path.display()))
+        })
+    };
+    let mut state = if dir.join("snapshot.json").exists() {
+        parse(dir.join("snapshot.json"))?
+    } else if dir.join("state.json").exists() {
+        parse(dir.join("state.json"))?
+    } else {
+        State::empty()
+    };
+    state.dir = Some(dir.to_owned());
+    state.epoch = read_epoch(dir)?;
+    match std::fs::read(dir.join("journal.jsonl")) {
+        Ok(journal) => state.journal_offset = state.replay(&journal, 0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error("read journal", error)),
+    }
+    Ok(state)
+}
+
+/// Replaces `path` atomically (a killed process leaves the old content).
+fn write_replace(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(data)?;
+    drop(file);
+    std::fs::rename(&tmp, path)
+}
+
+/// Exclusive lock on a persisted fake, held for one operation.
+fn lock_dir(dir: &Path) -> Result<nix::fcntl::Flock<std::fs::File>> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("lock"))
+        .map_err(|e| io_error("open lock", e))?;
+    nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
+        .map_err(|(_, errno)| io_error("lock", errno.into()))
+}
+
+enum StagedContent {
+    Memory(Bytes),
+    /// A temporary file in `blobs/`, renamed to the revision id on commit.
+    Blob(PathBuf),
+}
+
+/// Upload content, read before the drive is locked.
+struct Staged {
+    size: u64,
+    sha1: [u8; 20],
+    content: Option<StagedContent>,
+}
+
+impl Drop for Staged {
+    /// Removes a temporary blob that was never committed.
+    fn drop(&mut self) {
+        if let Some(StagedContent::Blob(tmp)) = &self.content {
+            let _ = std::fs::remove_file(tmp);
+        }
+    }
+}
+
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// In-memory Proton Drive. `Clone` shares the drive.
 #[derive(Clone)]
@@ -205,36 +788,37 @@ impl FakeBackend {
     pub const DEFAULT_BLOCK_SIZE: usize = 4 << 20;
 
     pub fn new() -> Self {
-        let root = LinkId::new("root");
-        let mut nodes = BTreeMap::new();
-        nodes.insert(
-            root.clone(),
-            Node {
-                link: root.clone(),
-                parent: None,
-                name: String::new(),
-                kind: NodeKind::Folder,
-                trashed: false,
-                folder_mtime: None,
-                revisions: Vec::new(),
-            },
-        );
         Self {
-            state: Arc::new(Mutex::new(State {
-                username: "fake@example.test".into(),
-                root,
-                nodes,
-                events: Vec::new(),
-                changes: Vec::new(),
-                next_id: 0,
-                quota_max: 5 << 30,
-                block_size: Self::DEFAULT_BLOCK_SIZE,
-                event_page_size: 50,
-                refresh_pending: false,
-                faults: VecDeque::new(),
-                latency: Duration::ZERO,
-            })),
+            state: Arc::new(Mutex::new(State::empty())),
         }
+    }
+
+    /// Opens the fake persisted in `dir`, creating an empty drive there if
+    /// needed. `PDMOUNT_FAKE_KEEP_REVISIONS` sets how many revisions files
+    /// keep.
+    pub fn open(dir: &Path) -> Result<Self> {
+        std::fs::create_dir_all(dir.join("blobs")).map_err(|e| io_error("create dir", e))?;
+        let _lock = lock_dir(dir)?;
+        let mut state = load_state(dir)?;
+        if !dir.join("snapshot.json").exists() {
+            // New, or the old format: start the snapshot and journal.
+            state.compact()?;
+            for old in ["state.json", "generation"] {
+                let _ = std::fs::remove_file(dir.join(old));
+            }
+        }
+        if let Some(keep) = std::env::var("PDMOUNT_FAKE_KEEP_REVISIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|keep| *keep > 0 && *keep != state.keep_revisions)
+        {
+            state.keep_revisions = keep;
+            state.delta.meta = true;
+            state.finish()?;
+        }
+        Ok(Self {
+            state: Arc::new(Mutex::new(state)),
+        })
     }
 
     /// Makes the next call of `op` fail with `error` (one-shot, FIFO).
@@ -248,12 +832,30 @@ impl FakeBackend {
     }
 
     pub fn set_quota(&self, max: u64) {
-        self.state.lock().quota_max = max;
+        let _ = self.with_state(None, |s| {
+            s.quota_max = max;
+            s.delta.meta = true;
+            Ok(())
+        });
     }
 
     pub fn set_block_size(&self, block_size: usize) {
         assert!(block_size > 0, "block size must be positive");
-        self.state.lock().block_size = block_size;
+        let _ = self.with_state(None, |s| {
+            s.block_size = block_size;
+            s.delta.meta = true;
+            Ok(())
+        });
+    }
+
+    /// How many revisions each file keeps (older ones are deleted).
+    pub fn set_revision_limit(&self, keep: usize) {
+        assert!(keep > 0, "files keep at least one revision");
+        let _ = self.with_state(None, |s| {
+            s.keep_revisions = keep;
+            s.delta.meta = true;
+            Ok(())
+        });
     }
 
     /// Delays every read call (root, listings, blocks) by `latency`.
@@ -275,44 +877,166 @@ impl FakeBackend {
 
     /// Content of the active revision of a file.
     pub fn content(&self, file: &LinkId) -> Option<Bytes> {
-        let state = self.state.lock();
-        state.nodes.get(file)?.active().map(|r| r.content.clone())
+        self.with_state(None, |s| {
+            let Some(revision) = s.nodes.get(file).and_then(Node::active) else {
+                return Ok(None);
+            };
+            s.content(revision).map(Some)
+        })
+        .ok()
+        .flatten()
     }
 
+    /// Revisions a file still keeps.
     pub fn revision_count(&self, file: &LinkId) -> usize {
-        self.state
-            .lock()
-            .nodes
-            .get(file)
-            .map_or(0, |n| n.revisions.len())
+        self.with_state(None, |s| {
+            Ok(s.nodes.get(file).map_or(0, |n| n.revisions.len()))
+        })
+        .unwrap_or(0)
     }
 
-    /// Every change applied so far, in order.
+    /// The changes still kept, in order.
     pub fn changes(&self) -> Vec<FakeChange> {
-        self.state.lock().changes.clone()
+        self.with_state(None, |s| Ok(s.changes.clone()))
+            .unwrap_or_default()
     }
 
-    fn with_state<T>(&self, op: FakeOp, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
+    /// Kept changes with sequence numbers above `after`. Numbers start at 1
+    /// and survive trimming, so callers can remember where they were.
+    pub fn changes_since(&self, after: u64) -> Vec<(u64, FakeChange)> {
+        self.with_state(None, |s| {
+            Ok(s.changes
+                .iter()
+                .enumerate()
+                .map(|(i, change)| (s.changes_base + i as u64 + 1, change.clone()))
+                .filter(|(seq, _)| *seq > after)
+                .collect())
+        })
+        .unwrap_or_default()
+    }
+
+    /// Uploads a local directory tree into `parent`, keeping file mtimes and
+    /// permission bits (test setup).
+    pub async fn import_dir(&self, local: &Path, parent: &LinkId) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let mut entries: Vec<_> = std::fs::read_dir(local)
+            .map_err(|e| io_error("read source", e))?
+            .collect::<std::io::Result<_>>()
+            .map_err(|e| io_error("read source", e))?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let meta = entry.metadata().map_err(|e| io_error("stat source", e))?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|name| BackendError::Other(format!("not UTF-8: {name:?}")))?;
+            let mtime = meta.modified().map_err(|e| io_error("source mtime", e))?;
+            if meta.is_dir() {
+                let link = self.create_folder(parent, &name, mtime).await?;
+                Box::pin(self.import_dir(&entry.path(), &link)).await?;
+            } else if meta.is_file() {
+                let file_meta = FileMeta {
+                    mtime,
+                    mode: Some(meta.permissions().mode() & 0o7777),
+                    media_type: "application/octet-stream".into(),
+                    sha1: None,
+                };
+                self.upload_new(parent, &name, UploadSource::File(entry.path()), file_meta)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Runs `f` on the locked, current state and journals what it changed.
+    /// With `op`, an injected failure for it fires first.
+    fn with_state<T>(
+        &self,
+        op: Option<FakeOp>,
+        f: impl FnOnce(&mut State) -> Result<T>,
+    ) -> Result<T> {
         let mut state = self.state.lock();
-        state.take_fault(op)?;
-        f(&mut state)
+        let _lock = state.dir.as_deref().map(lock_dir).transpose()?;
+        state.refresh()?;
+        if let Some(op) = op {
+            state.take_fault(op)?;
+        }
+        let result = f(&mut state);
+        state.finish()?;
+        result
+    }
+
+    /// Reads upload content: into memory, or into a temporary blob for a
+    /// persisted fake, hashing it on the way.
+    async fn stage(&self, source: UploadSource) -> Result<Staged> {
+        let blobs = self.state.lock().dir.as_ref().map(|dir| dir.join("blobs"));
+        tokio::task::spawn_blocking(move || stage_blocking(source, blobs))
+            .await
+            .map_err(|e| BackendError::Other(format!("fake backend: staging task: {e}")))?
     }
 }
 
-async fn read_source(source: UploadSource) -> Result<Bytes> {
+fn stage_blocking(source: UploadSource, blobs: Option<PathBuf>) -> Result<Staged> {
+    let Some(blobs) = blobs else {
+        let bytes = match source {
+            UploadSource::Bytes(bytes) => bytes,
+            UploadSource::File(path) => std::fs::read(&path)
+                .map(Bytes::from)
+                .map_err(|e| BackendError::Other(format!("cannot read {}: {e}", path.display())))?,
+        };
+        return Ok(Staged {
+            size: bytes.len() as u64,
+            sha1: sha1::Sha1::digest(&bytes).into(),
+            content: Some(StagedContent::Memory(bytes)),
+        });
+    };
+    let tmp = blobs.join(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    // From here on, dropping `staged` removes the temporary blob.
+    let mut staged = Staged {
+        size: 0,
+        sha1: [0; 20],
+        content: Some(StagedContent::Blob(tmp.clone())),
+    };
+    let mut out = std::fs::File::create(&tmp).map_err(|e| io_error("create blob", e))?;
+    let mut hasher = sha1::Sha1::new();
+    let mut write = |chunk: &[u8]| -> std::io::Result<()> {
+        hasher.update(chunk);
+        staged.size += chunk.len() as u64;
+        out.write_all(chunk)
+    };
     match source {
-        UploadSource::Bytes(bytes) => Ok(bytes),
-        UploadSource::File(path) => tokio::fs::read(&path)
-            .await
-            .map(Bytes::from)
-            .map_err(|e| BackendError::Other(format!("cannot read {}: {e}", path.display()))),
+        UploadSource::Bytes(bytes) => write(&bytes).map_err(|e| io_error("write blob", e))?,
+        UploadSource::File(path) => {
+            let mut input = std::fs::File::open(&path)
+                .map_err(|e| BackendError::Other(format!("cannot read {}: {e}", path.display())))?;
+            let mut buffer = vec![0u8; 1 << 20];
+            loop {
+                let n = input
+                    .read(&mut buffer)
+                    .map_err(|e| io_error("read source", e))?;
+                if n == 0 {
+                    break;
+                }
+                write(&buffer[..n]).map_err(|e| io_error("write blob", e))?;
+            }
+        }
     }
+    staged.sha1 = hasher.finalize().into();
+    Ok(staged)
 }
 
 #[async_trait::async_trait]
 impl Backend for FakeBackend {
+    fn upload_block_size(&self) -> u64 {
+        self.state.lock().block_size as u64
+    }
+
     async fn account(&self) -> Result<AccountInfo> {
-        self.with_state(FakeOp::Account, |s| {
+        self.with_state(Some(FakeOp::Account), |s| {
             Ok(AccountInfo {
                 username: s.username.clone(),
                 root: s.root.clone(),
@@ -322,12 +1046,12 @@ impl Backend for FakeBackend {
 
     async fn root(&self) -> Result<RemoteNode> {
         self.delay().await;
-        self.with_state(FakeOp::Root, |s| Ok(s.nodes[&s.root].to_remote()))
+        self.with_state(Some(FakeOp::Root), |s| Ok(s.nodes[&s.root].to_remote()))
     }
 
     async fn list_children(&self, folder: &LinkId) -> Result<Vec<RemoteNode>> {
         self.delay().await;
-        self.with_state(FakeOp::ListChildren, |s| {
+        self.with_state(Some(FakeOp::ListChildren), |s| {
             s.folder(folder)?;
             let mut children: Vec<_> = s
                 .nodes
@@ -342,7 +1066,7 @@ impl Backend for FakeBackend {
 
     async fn get_nodes(&self, ids: &[LinkId]) -> Result<Vec<Option<RemoteNode>>> {
         self.delay().await;
-        self.with_state(FakeOp::GetNodes, |s| {
+        self.with_state(Some(FakeOp::GetNodes), |s| {
             Ok(ids
                 .iter()
                 .map(|id| s.nodes.get(id).map(Node::to_remote))
@@ -352,20 +1076,14 @@ impl Backend for FakeBackend {
 
     async fn blocks(&self, file: &LinkId, revision: &RevisionId) -> Result<Vec<BlockInfo>> {
         self.delay().await;
-        self.with_state(FakeOp::Blocks, |s| {
+        self.with_state(Some(FakeOp::Blocks), |s| {
             let node = s.nodes.get(file).ok_or(BackendError::NotFound)?;
-            let rev = node
-                .revisions
-                .iter()
-                .find(|r| &r.id == revision)
-                .ok_or(BackendError::NotFound)?;
-            Ok(rev
-                .content
-                .chunks(s.block_size)
-                .zip(1..)
-                .map(|(chunk, index)| BlockInfo {
-                    index,
-                    plain_size: Some(chunk.len() as u32),
+            let rev = node.revision(revision)?;
+            let block = s.block_size as u64;
+            Ok((0..rev.size.div_ceil(block))
+                .map(|i| BlockInfo {
+                    index: i as u32 + 1,
+                    plain_size: Some((rev.size - i * block).min(block) as u32),
                 })
                 .collect())
         })
@@ -373,20 +1091,16 @@ impl Backend for FakeBackend {
 
     async fn fetch_block(&self, file: &LinkId, revision: &RevisionId, index: u32) -> Result<Bytes> {
         self.delay().await;
-        self.with_state(FakeOp::FetchBlock, |s| {
+        self.with_state(Some(FakeOp::FetchBlock), |s| {
             let node = s.nodes.get(file).ok_or(BackendError::NotFound)?;
-            let rev = node
-                .revisions
-                .iter()
-                .find(|r| &r.id == revision)
-                .ok_or(BackendError::NotFound)?;
-            let start = (index as usize)
+            let rev = node.revision(revision)?;
+            let block = s.block_size as u64;
+            let start = u64::from(index)
                 .checked_sub(1)
-                .map(|i| i * s.block_size)
-                .filter(|&start| start < rev.content.len())
+                .map(|i| i * block)
+                .filter(|&start| start < rev.size)
                 .ok_or(BackendError::NotFound)?;
-            let end = (start + s.block_size).min(rev.content.len());
-            Ok(rev.content.slice(start..end))
+            s.read_range(rev, start, block.min(rev.size - start))
         })
     }
 
@@ -397,13 +1111,13 @@ impl Backend for FakeBackend {
         source: UploadSource,
         meta: FileMeta,
     ) -> Result<(LinkId, RevisionId)> {
-        let content = read_source(source).await?;
-        self.with_state(FakeOp::UploadNew, |s| {
+        let staged = self.stage(source).await?;
+        self.with_state(Some(FakeOp::UploadNew), |s| {
             s.folder(parent)?;
             s.ensure_name_free(parent, name, None)?;
-            s.ensure_quota(content.len() as u64)?;
+            s.ensure_quota(staged.size)?;
             let link = LinkId::new(s.new_id("link-"));
-            let revision = RevisionId::new(s.new_id("rev-"));
+            let (revision, rev) = s.new_revision(staged, &meta)?;
             s.nodes.insert(
                 link.clone(),
                 Node {
@@ -413,16 +1127,13 @@ impl Backend for FakeBackend {
                     kind: NodeKind::File,
                     trashed: false,
                     folder_mtime: None,
-                    revisions: vec![Revision {
-                        id: revision.clone(),
-                        content,
-                        mtime: meta.mtime,
-                        mode: meta.mode,
-                    }],
+                    revisions: vec![rev],
+                    trashed_at: 0,
                 },
             );
+            s.touch(&link);
             s.push_event(EventKind::Create, &link);
-            s.changes.push(FakeChange::CreatedFile {
+            s.push_change(FakeChange::CreatedFile {
                 link: link.clone(),
                 name: name.to_owned(),
             });
@@ -437,8 +1148,8 @@ impl Backend for FakeBackend {
         source: UploadSource,
         meta: FileMeta,
     ) -> Result<RevisionId> {
-        let content = read_source(source).await?;
-        self.with_state(FakeOp::UploadRevision, |s| {
+        let staged = self.stage(source).await?;
+        self.with_state(Some(FakeOp::UploadRevision), |s| {
             let node = s.node(file)?;
             if node.kind != NodeKind::File {
                 return Err(BackendError::Other(format!("{file} is not a file")));
@@ -447,18 +1158,14 @@ impl Backend for FakeBackend {
             if current.as_ref() != Some(base) {
                 return Err(BackendError::RevisionConflict { current });
             }
-            s.ensure_quota(content.len() as u64)?;
-            let revision = RevisionId::new(s.new_id("rev-"));
+            s.ensure_quota(staged.size)?;
+            let (revision, rev) = s.new_revision(staged, &meta)?;
             if let Some(node) = s.nodes.get_mut(file) {
-                node.revisions.push(Revision {
-                    id: revision.clone(),
-                    content,
-                    mtime: meta.mtime,
-                    mode: meta.mode,
-                });
+                node.revisions.push(rev);
             }
+            s.touch(file);
             s.push_event(EventKind::UpdateContent, file);
-            s.changes.push(FakeChange::NewRevision {
+            s.push_change(FakeChange::NewRevision {
                 link: file.clone(),
                 revision: revision.clone(),
             });
@@ -472,7 +1179,7 @@ impl Backend for FakeBackend {
         name: &str,
         mtime: SystemTime,
     ) -> Result<LinkId> {
-        self.with_state(FakeOp::CreateFolder, |s| {
+        self.with_state(Some(FakeOp::CreateFolder), |s| {
             s.folder(parent)?;
             s.ensure_name_free(parent, name, None)?;
             let link = LinkId::new(s.new_id("link-"));
@@ -486,10 +1193,12 @@ impl Backend for FakeBackend {
                     trashed: false,
                     folder_mtime: Some(mtime),
                     revisions: Vec::new(),
+                    trashed_at: 0,
                 },
             );
+            s.touch(&link);
             s.push_event(EventKind::Create, &link);
-            s.changes.push(FakeChange::CreatedFolder {
+            s.push_change(FakeChange::CreatedFolder {
                 link: link.clone(),
                 name: name.to_owned(),
             });
@@ -504,7 +1213,7 @@ impl Backend for FakeBackend {
         new_name: &str,
         expected: Option<&NameHash>,
     ) -> Result<()> {
-        self.with_state(FakeOp::Rename, |s| {
+        self.with_state(Some(FakeOp::Rename), |s| {
             if node == &s.root {
                 return Err(BackendError::PermissionDenied);
             }
@@ -530,8 +1239,9 @@ impl Backend for FakeBackend {
                 entry.parent = Some(parent);
                 entry.name = new_name.to_owned();
             }
+            s.touch(node);
             s.push_event(EventKind::UpdateMetadata, node);
-            s.changes.push(FakeChange::Renamed {
+            s.push_change(FakeChange::Renamed {
                 link: node.clone(),
                 name: new_name.to_owned(),
             });
@@ -540,7 +1250,7 @@ impl Backend for FakeBackend {
     }
 
     async fn trash(&self, nodes: &[LinkId]) -> Result<Vec<Result<()>>> {
-        self.with_state(FakeOp::Trash, |s| {
+        self.with_state(Some(FakeOp::Trash), |s| {
             Ok(nodes
                 .iter()
                 .map(|link| {
@@ -548,11 +1258,15 @@ impl Backend for FakeBackend {
                         return Err(BackendError::PermissionDenied);
                     }
                     s.node(link)?;
+                    let at = s.generation + 1;
                     if let Some(entry) = s.nodes.get_mut(link) {
                         entry.trashed = true;
+                        entry.trashed_at = at;
                     }
+                    s.touch(link);
+                    s.delta.trashed = true;
                     s.push_event(EventKind::Delete, link);
-                    s.changes.push(FakeChange::Trashed { link: link.clone() });
+                    s.push_change(FakeChange::Trashed { link: link.clone() });
                     Ok(())
                 })
                 .collect())
@@ -560,30 +1274,33 @@ impl Backend for FakeBackend {
     }
 
     async fn latest_event_id(&self) -> Result<EventId> {
-        self.with_state(FakeOp::LatestEventId, |s| {
-            Ok(EventId::new(s.events.len().to_string()))
+        self.with_state(Some(FakeOp::LatestEventId), |s| {
+            Ok(EventId::new(s.latest_event().to_string()))
         })
     }
 
     async fn poll_events(&self, since: &EventId) -> Result<EventPage> {
-        self.with_state(FakeOp::PollEvents, |s| {
-            let start: usize = since
+        self.with_state(Some(FakeOp::PollEvents), |s| {
+            let latest = s.latest_event();
+            let since: u64 = since
                 .as_str()
                 .parse()
                 .ok()
-                .filter(|&i| i <= s.events.len())
+                .filter(|&i| i <= latest)
                 .ok_or_else(|| BackendError::Other(format!("unknown event id {since}")))?;
-            if std::mem::take(&mut s.refresh_pending) {
+            // A cursor older than the kept events: the client must refresh.
+            if std::mem::take(&mut s.refresh_pending) || since < s.events_base {
                 return Ok(EventPage {
-                    next: EventId::new(s.events.len().to_string()),
+                    next: EventId::new(latest.to_string()),
                     more: false,
                     refresh: true,
                     events: Vec::new(),
                 });
             }
+            let start = (since - s.events_base) as usize;
             let end = (start + s.event_page_size).min(s.events.len());
             Ok(EventPage {
-                next: EventId::new(end.to_string()),
+                next: EventId::new((s.events_base + end as u64).to_string()),
                 more: end < s.events.len(),
                 refresh: false,
                 events: s.events[start..end].to_vec(),
@@ -592,7 +1309,7 @@ impl Backend for FakeBackend {
     }
 
     async fn storage_info(&self) -> Result<StorageInfo> {
-        self.with_state(FakeOp::StorageInfo, |s| {
+        self.with_state(Some(FakeOp::StorageInfo), |s| {
             Ok(StorageInfo {
                 used: s.used(),
                 max: s.quota_max,
@@ -611,6 +1328,7 @@ mod tests {
             mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
             mode: Some(0o644),
             media_type: "application/octet-stream".into(),
+            sha1: None,
         }
     }
 
@@ -880,6 +1598,278 @@ mod tests {
                 link: file,
                 name: "shared".into()
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_persisted_fake_survives_reopening() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (file, rev) = {
+            let fake = FakeBackend::open(dir.path()).expect("open");
+            fake.set_block_size(4);
+            let root = root(&fake).await;
+            let docs = fake
+                .create_folder(&root, "docs", SystemTime::UNIX_EPOCH)
+                .await
+                .expect("mkdir");
+            fake.upload_new(&docs, "a", bytes(b"0123456789"), meta())
+                .await
+                .expect("upload")
+        };
+        let fake = FakeBackend::open(dir.path()).expect("reopen");
+        assert_eq!(fake.content(&file).as_deref(), Some(&b"0123456789"[..]));
+        assert_eq!(
+            fake.fetch_block(&file, &rev, 3).await.expect("block"),
+            &b"89"[..]
+        );
+        let listed = fake
+            .list_children(&LinkId::new("link-1"))
+            .await
+            .expect("list");
+        assert_eq!(
+            listed[0].sha1,
+            Some(sha1::Sha1::digest(b"0123456789").into())
+        );
+        assert_eq!(fake.changes().len(), 2);
+        // The next ids continue after the stored ones.
+        let (other, _) = fake
+            .upload_new(&root(&fake).await, "b", bytes(b"x"), meta())
+            .await
+            .expect("upload");
+        assert_ne!(other, file);
+    }
+
+    #[tokio::test]
+    async fn two_handles_on_one_directory_see_each_others_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = FakeBackend::open(dir.path()).expect("open");
+        let second = FakeBackend::open(dir.path()).expect("open");
+        let root = root(&first).await;
+        let (file, rev) = first
+            .upload_new(&root, "f", bytes(b"v1"), meta())
+            .await
+            .expect("upload");
+        second
+            .upload_revision(&file, &rev, bytes(b"v2"), meta())
+            .await
+            .expect("revision from the other handle");
+        assert_eq!(first.content(&file).as_deref(), Some(&b"v2"[..]));
+        assert!(matches!(
+            first
+                .upload_revision(&file, &rev, bytes(b"v3"), meta())
+                .await,
+            Err(BackendError::RevisionConflict { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_uploads_leave_no_temporary_blobs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = FakeBackend::open(dir.path()).expect("open");
+        let root = root(&fake).await;
+        fake.upload_new(&root, "f", bytes(b"1"), meta())
+            .await
+            .expect("upload");
+        assert!(
+            fake.upload_new(&root, "f", bytes(b"2"), meta())
+                .await
+                .is_err()
+        );
+        let blobs: Vec<_> = std::fs::read_dir(dir.path().join("blobs"))
+            .expect("blobs")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(blobs.len(), 1, "{blobs:?}");
+    }
+
+    #[tokio::test]
+    async fn import_copies_a_local_tree_with_modes_and_mtimes() {
+        use std::os::unix::fs::PermissionsExt;
+        let source = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(source.path().join("sub")).expect("mkdir");
+        std::fs::write(source.path().join("sub/x"), b"xyz").expect("write");
+        std::fs::set_permissions(
+            source.path().join("sub/x"),
+            std::fs::Permissions::from_mode(0o751),
+        )
+        .expect("chmod");
+        let fake = FakeBackend::new();
+        let root = root(&fake).await;
+        fake.import_dir(source.path(), &root).await.expect("import");
+        let sub = &fake.list_children(&root).await.expect("list")[0];
+        assert_eq!((sub.name.as_str(), sub.kind), ("sub", NodeKind::Folder));
+        let x = &fake.list_children(&sub.link_id).await.expect("list")[0];
+        assert_eq!((x.size, x.mode), (Some(3), Some(0o751)));
+        let mtime = std::fs::metadata(source.path().join("sub/x"))
+            .and_then(|m| m.modified())
+            .expect("mtime");
+        assert_eq!(x.mtime, Some(mtime));
+    }
+
+    fn blob_count(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir.join("blobs")).expect("blobs").count()
+    }
+
+    #[tokio::test]
+    async fn the_journal_and_compactions_reload_the_same_drive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = {
+            let fake = FakeBackend::open(dir.path()).expect("open");
+            let root = root(&fake).await;
+            let (file, mut rev) = fake
+                .upload_new(&root, "f", bytes(b"v0"), meta())
+                .await
+                .expect("upload");
+            for i in 1..5 {
+                let data = Bytes::from(format!("v{i}"));
+                rev = fake
+                    .upload_revision(&file, &rev, UploadSource::Bytes(data), meta())
+                    .await
+                    .expect("revision");
+            }
+            // Only one line per change is written; nothing rewrites a whole file.
+            let journal =
+                std::fs::read_to_string(dir.path().join("journal.jsonl")).expect("journal");
+            assert_eq!(journal.lines().count(), 5);
+            file
+        };
+        let fake = FakeBackend::open(dir.path()).expect("reopen from the journal");
+        assert_eq!(fake.content(&file).as_deref(), Some(&b"v4"[..]));
+        fake.state.lock().compact().expect("compact");
+        assert_eq!(
+            std::fs::metadata(dir.path().join("journal.jsonl"))
+                .expect("journal")
+                .len(),
+            0
+        );
+        let other = FakeBackend::open(dir.path()).expect("reopen from the snapshot");
+        assert_eq!(other.content(&file).as_deref(), Some(&b"v4"[..]));
+        assert_eq!(other.changes().len(), 5);
+        // A process that loaded before the compaction catches up too.
+        let root_link = root(&other).await;
+        other
+            .upload_new(&root_link, "g", bytes(b"g"), meta())
+            .await
+            .expect("upload");
+        assert_eq!(fake.list_children(&root_link).await.expect("list").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn files_keep_only_their_last_revisions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = FakeBackend::open(dir.path()).expect("open");
+        fake.set_revision_limit(3);
+        let root = root(&fake).await;
+        let (file, mut rev) = fake
+            .upload_new(&root, "f", bytes(b"0"), meta())
+            .await
+            .expect("upload");
+        for i in 1..10 {
+            let data = Bytes::from(i.to_string());
+            rev = fake
+                .upload_revision(&file, &rev, UploadSource::Bytes(data), meta())
+                .await
+                .expect("revision");
+        }
+        assert_eq!(fake.revision_count(&file), 3);
+        assert_eq!(blob_count(dir.path()), 3, "old blobs are deleted");
+        assert_eq!(fake.content(&file).as_deref(), Some(&b"9"[..]));
+        assert_eq!(
+            fake.storage_info().await.expect("info").used,
+            3,
+            "quota counts kept revisions"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_numbers_survive_trimming() {
+        let fake = FakeBackend::new();
+        let root = root(&fake).await;
+        let mut rev = fake
+            .upload_new(&root, "f", bytes(b"x"), meta())
+            .await
+            .expect("upload")
+            .1;
+        let file = fake.list_children(&root).await.expect("list")[0]
+            .link_id
+            .clone();
+        let total = KEEP_CHANGES * 3 / 2 + 10;
+        for _ in 1..total {
+            rev = fake
+                .upload_revision(&file, &rev, bytes(b"x"), meta())
+                .await
+                .expect("revision");
+        }
+        let kept = fake.changes_since(0);
+        assert!(kept.len() <= KEEP_CHANGES * 3 / 2);
+        assert_eq!(kept.last().map(|(seq, _)| *seq), Some(total as u64));
+        assert_eq!(fake.changes_since(total as u64 - 2).len(), 2);
+        // Events are trimmed the same way; an old cursor asks for a refresh.
+        assert!(
+            fake.poll_events(&EventId::new("0"))
+                .await
+                .expect("poll")
+                .refresh
+        );
+    }
+
+    #[tokio::test]
+    async fn a_torn_journal_line_is_skipped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = {
+            let fake = FakeBackend::open(dir.path()).expect("open");
+            let root = root(&fake).await;
+            fake.upload_new(&root, "f", bytes(b"kept"), meta())
+                .await
+                .expect("upload")
+                .0
+        };
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.path().join("journal.jsonl"))
+            .expect("journal");
+        journal
+            .write_all(b"{\"generation\": 99, \"rec")
+            .expect("tear");
+        drop(journal);
+        let fake = FakeBackend::open(dir.path()).expect("reopen");
+        assert_eq!(fake.content(&file).as_deref(), Some(&b"kept"[..]));
+        let root = root(&fake).await;
+        fake.upload_new(&root, "g", bytes(b"after"), meta())
+            .await
+            .expect("upload after the torn line");
+        let again = FakeBackend::open(dir.path()).expect("reopen");
+        assert_eq!(again.list_children(&root).await.expect("list").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_old_one_file_format_is_migrated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = State::empty();
+        state.next_id = 7;
+        state.changes.push(FakeChange::Trashed {
+            link: LinkId::new("x"),
+        });
+        std::fs::create_dir_all(dir.path().join("blobs")).expect("blobs");
+        std::fs::write(
+            dir.path().join("state.json"),
+            serde_json::to_vec(&state).expect("encode"),
+        )
+        .expect("write");
+        std::fs::write(dir.path().join("generation"), b"3").expect("write");
+        let fake = FakeBackend::open(dir.path()).expect("open");
+        assert_eq!(fake.changes().len(), 1);
+        assert!(dir.path().join("snapshot.json").exists());
+        assert!(!dir.path().join("state.json").exists());
+        let root = root(&fake).await;
+        let (link, _) = fake
+            .upload_new(&root, "f", bytes(b"x"), meta())
+            .await
+            .expect("upload");
+        assert_eq!(
+            link,
+            LinkId::new("link-8"),
+            "ids continue after the stored ones"
         );
     }
 }

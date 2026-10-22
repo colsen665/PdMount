@@ -27,8 +27,9 @@ Status, the next action, open questions and handoff notes are in **`TODO.md`**.
 | `TODO.md` | Status, next action, milestone and task checklist, open questions (Q*), handoff notes |
 | `docs/decisions.md` | Decision log (D*): what was decided, by whom, and why |
 | `DESIGN.md` | The specification |
-| `docs/sdk-patches.md` | SDK fork patches P1–P12: targets, fixes, upstream tracking |
+| `docs/sdk-patches.md` | SDK fork patches P1–P13: targets, fixes, upstream tracking |
 | `docs/pdcli-evaluation.md` | Why the project is not a pdcli fork; what is reused from it |
+| `docs/plans/m3.md` | M3 task specifications (D039); work one task per session, status stays in `TODO.md` |
 
 `DESIGN.md` sections:
 
@@ -58,6 +59,7 @@ Status, the next action, open questions and handoff notes are in **`TODO.md`**.
   - Milestone exit criteria are in DESIGN.md §16, built from the rsync/git scenarios in §15.3 (D005).
   - Denied writes return EROFS (D019).
   - Secrets go to files only with `--allow-file-secrets` or `--force-file-secrets` (D029).
+  - Permission checks in the daemon instead of `default_permissions` (D031).
 - **Secrets:** never print the contents of `~/.config/pdcli`, keyrings, tokens or session files.
 
 ## Source citations
@@ -80,9 +82,11 @@ scratchpad directory that depends on the exact versions and run `cargo fetch`. T
 - Remote: `origin` = a local bare repo, branch `master`, until the user says otherwise.
 - **No GitHub use** (repos, forks, PRs, issues, Actions) until the user says otherwise (D023).
 - SDK fork: `<fork>` (local bare repo, D022). See docs/sdk-patches.md, "Fork repository".
-- Commit or push only when the user asks.
+- Commit or push only when the user asks. Exception during M3 (D039): commit after each task of `docs/plans/m3.md`
+  once `scripts/ci.sh` passes, one commit per task, message `M3.n: <title>`; never push.
 - Author: the repository's local git config (`user.name=Claus`, `user.email=colsen665@proton.me`), set for the sandbox user.
-- Commit message trailer: `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
+- Commit message trailer: the `Co-Authored-By` line of the model that made the change, e.g.
+  `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
 ## Environment (verified 2026-10-19)
 
@@ -102,13 +106,25 @@ scratchpad directory that depends on the exact versions and run `cargo fetch`. T
 - `cargo test --workspace` / `cargo test -p pdmount-backend fake`: tests only.
 - `cargo run -p pdmount -- doctor | status | login [--browser|--no-browser] | logout`, with `--profile <name>` to select a profile
   and, as the sandbox user, `--force-file-secrets` (D029).
-- `pdmount mount [--foreground] [<mnt>] | unmount [--force] [<mnt>] | stats | reset --keep-login` (M1: read-only). The daemon
-  logs to `~/.local/state/pdmount/<profile>.log`.
+- `pdmount mount [--foreground] [<mnt>] | unmount [--force] [<mnt>] | stats | reset --keep-login | trash empty --yes`
+  (D036). The daemon logs to `~/.local/state/pdmount/<profile>.log`.
 - `scripts/repro/keyring-d024.sh [case ...]`: keyring tests (D024 hang, D029 modes) against gnome-keyring in a private D-Bus
   session (about 2 min). Not part of `scripts/ci.sh`.
 - `scripts/testdata/make-m1-dataset.sh <dir>`: the deterministic M1 dataset (upload it with the official client).
-- Scenario scripts: `VERIFY_MODE=live|fresh tests/scenarios/<name>.sh` (`r6`, `g6_read`, `sha`, `kill9`), against the real
-  account; `remount|crash|second` follow in M2/M3.
+- Scenario scripts: `[BACKEND=fake] VERIFY_MODE=live|remount|crash|fresh tests/scenarios/<name>.sh` (R1–R7 `r1`…`r7`, G1–G7
+  `g1`…`g7` plus `g6_read`, `n1`, `a1`…`a6`, `e1`, `sha`, `kill9`); `tests/scenarios/run-all.sh [names]` runs a matrix
+  (`MODES`, `SCENARIOS`; `STOP_ON`, default `429,fail` on the real account, none on the fake; `TRASH_MIN_FREE`, D036).
+  The default backend is the real account; `BACKEND=fake` needs `cargo build -p pdmount --features fake-backend` and
+  keeps its profile, mountpoint and fake drive in tmpfs under `SCENARIO_ROOT` (default `/dev/shm/pdmount-tests`).
+  Writes go only to `<mount>/pdmount-test/<scenario>` (D028). Sizes: `R_FILES`, `R_BIG_MIB`, `G3_COMMITS`,
+  `G4_BLOBS`. `second` follows in M3.
+- `tests/pjdfstest.sh [<dir>/<nn>.t | <dir> ...]`: the pjdfstest subset on the fake (about 75 s); expected failures in
+  `tests/pjdfstest.list`. `FSX_DURATION=<s> tests/fsx.sh`: fsx with mmap on the fake (default 6 h). Both use the scenario
+  setup (`SCENARIO_ROOT`, `PROFILE`); give a long fsx run its own `SCENARIO_ROOT` and `PROFILE` so other fake runs can
+  go on meanwhile.
+- Journal property tests: `PROPTEST_CASES=10000 cargo test -p pdmount-core proptests` (about 140 s; default 32 cases).
+- `scripts/bench/latency.sh [clients] [iterations]`: client-side p50/p99/max of namespace operations on a fake mount, for
+  the §5.7 SLOs (release build with `--features fake-backend`; `SCENARIO_ROOT` on disk to measure the disk).
 - Mounted fake-backend tests (`crates/pdmount-fuse/tests/`) need `/dev/fuse` and `fusermount3`; they skip otherwise.
 
 Workspace layout:
@@ -119,7 +135,8 @@ Workspace layout:
 
 Never run `login` against the user's account without being asked; it creates a real session.
 Real-account tests (profile `default`, account `<test account>`) may create, change and delete only under
-`My Files/pdmount-test/`. Everything else, `pdmount-m1/` in particular, is read-only for agents (D028).
+`My Files/pdmount-test/`. Everything else, `pdmount-m1/` in particular, is read-only for agents (D028). Exception: the
+trash may be emptied when storage runs low during real-account tests (D036).
 fsx, pjdfstest and soak runs use the fake backend only. Real-account scenarios run one at a time and stop at the first
 HTTP 429. Ask the user before any long-running test against the real account (D030).
 Commands that write to the keyring (`login`, `logout`) or open a browser can open desktop dialogs. Tell the user before

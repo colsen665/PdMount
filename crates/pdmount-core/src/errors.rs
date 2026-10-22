@@ -13,6 +13,32 @@ pub enum CoreError {
     IsADirectory,
     #[error("read-only file system")]
     ReadOnly,
+    #[error("file exists")]
+    Exists,
+    #[error("directory not empty")]
+    NotEmpty,
+    #[error("invalid argument")]
+    InvalidArgument,
+    #[error("operation not permitted")]
+    NotPermitted,
+    #[error("permission denied")]
+    AccessDenied,
+    #[error("no space left (quota)")]
+    NoSpace,
+    #[error("file too large")]
+    FileTooLarge,
+    /// The directory must be listed first (slow path); never reaches FUSE.
+    #[error("directory {0} is not listed yet")]
+    NeedsListing(u64),
+    /// Base blocks must be downloaded into staging first (slow path).
+    #[error("inode {0} needs materialization")]
+    NeedsMaterialize(u64),
+    /// No inode number is reserved; the slow path reserves more.
+    #[error("no inode numbers reserved")]
+    NeedsInos,
+    /// A stored errno, returned as is (deferred upload errors, §7.8).
+    #[error("error {0}")]
+    Errno(i32),
     #[error("name is not valid UTF-8")]
     InvalidName,
     #[error("name longer than 255 bytes")]
@@ -38,10 +64,24 @@ impl CoreError {
             Self::NotADirectory => libc::ENOTDIR,
             Self::IsADirectory => libc::EISDIR,
             Self::ReadOnly => libc::EROFS,
+            Self::Exists => libc::EEXIST,
+            Self::NotEmpty => libc::ENOTEMPTY,
+            Self::InvalidArgument => libc::EINVAL,
+            Self::NotPermitted => libc::EPERM,
+            Self::AccessDenied => libc::EACCES,
+            Self::NoSpace => libc::ENOSPC,
+            Self::FileTooLarge => libc::EFBIG,
+            Self::Errno(errno) => *errno,
             Self::InvalidName => libc::EILSEQ,
             Self::NameTooLong => libc::ENAMETOOLONG,
             Self::Backend(error) => backend_errno(error),
-            Self::Timeout | Self::Store(_) | Self::Io(_) | Self::Internal(_) => libc::EIO,
+            Self::Timeout
+            | Self::Store(_)
+            | Self::Io(_)
+            | Self::Internal(_)
+            | Self::NeedsListing(_)
+            | Self::NeedsMaterialize(_)
+            | Self::NeedsInos => libc::EIO,
         }
     }
 }
@@ -74,7 +114,21 @@ impl From<crate::store::StoreError> for CoreError {
 
 impl From<std::io::Error> for CoreError {
     fn from(error: std::io::Error) -> Self {
-        Self::Io(error.to_string())
+        match error.raw_os_error() {
+            Some(libc::ENOSPC) => Self::Errno(libc::ENOSPC),
+            Some(libc::EDQUOT) => Self::Errno(libc::EDQUOT),
+            _ => Self::Io(error.to_string()),
+        }
+    }
+}
+
+impl CoreError {
+    /// Whether the request must continue on the slow path.
+    pub fn is_slow(&self) -> bool {
+        matches!(
+            self,
+            Self::NeedsListing(_) | Self::NeedsMaterialize(_) | Self::NeedsInos
+        )
     }
 }
 

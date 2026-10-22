@@ -39,6 +39,8 @@ pub enum MountState {
     Stale,
     Mounted {
         pid: u64,
+        queue_pending: u64,
+        queue_parked: u64,
         inodes: u64,
         cache_bytes: u64,
         cache_blocks: u64,
@@ -98,11 +100,17 @@ impl fmt::Display for StatusReport {
             ),
             MountState::Mounted {
                 pid,
+                queue_pending,
+                queue_parked,
                 inodes,
                 cache_bytes,
                 cache_blocks,
             } => {
-                writeln!(f, "Mount:      mounted read-only (daemon pid {pid})")?;
+                writeln!(f, "Mount:      mounted (daemon pid {pid})")?;
+                writeln!(
+                    f,
+                    "Queue:      {queue_pending} pending, {queue_parked} parked"
+                )?;
                 writeln!(f, "Inodes:     {inodes}")?;
                 write!(
                     f,
@@ -120,7 +128,7 @@ pub async fn status(
     home: &std::path::Path,
 ) -> anyhow::Result<StatusReport> {
     let device = session::device_identity(paths, config)?;
-    let mountpoint = config.mountpoint(home);
+    let mountpoint = crate::daemon::existing_mountpoint(paths, config, home, None);
     let daemon = control::call(
         &paths.control_socket(),
         Request::Status,
@@ -146,6 +154,8 @@ pub async fn status(
                 .map_or(mountpoint, std::path::PathBuf::from),
             mount: MountState::Mounted {
                 pid: number("pid"),
+                queue_pending: number("queue_pending"),
+                queue_parked: number("queue_parked"),
                 inodes: number("inodes"),
                 cache_bytes: number("cache_bytes"),
                 cache_blocks: number("cache_blocks"),
@@ -229,12 +239,15 @@ mod tests {
             active(),
             MountState::Mounted {
                 pid: 42,
+                queue_pending: 2,
+                queue_parked: 0,
                 inodes: 7,
                 cache_bytes: 1 << 20,
                 cache_blocks: 3,
             },
         );
-        assert!(mounted.contains("mounted read-only (daemon pid 42)"));
+        assert!(mounted.contains("mounted (daemon pid 42)"));
+        assert!(mounted.contains("Queue:      2 pending, 0 parked"));
         assert!(mounted.contains("Cache:      1.0 MiB in 3 blocks"));
     }
 

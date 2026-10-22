@@ -26,6 +26,16 @@ use tokio::sync::Semaphore;
 pub const BLOCK_SIZE: u64 = 4 * 1024 * 1024;
 const NONCE_LEN: usize = 24;
 const LAYOUT_CACHE_ENTRIES: usize = 4096;
+/// Block downloads in flight, all priorities together. One below the official
+/// C# SDK's 6 block transfers per direction
+/// (`cs/client/cs/src/Proton.Drive.Sdk/ProtonDriveClient.cs:28`); the JS SDK
+/// allows 5 files with up to 10 blocks each (D033).
+const DOWNLOADS: usize = 5;
+/// Per priority, within [`DOWNLOADS`]: readahead and prefetch together leave
+/// interactive reads at least two slots.
+const INTERACTIVE_DOWNLOADS: usize = DOWNLOADS;
+const READAHEAD_DOWNLOADS: usize = 2;
+const PREFETCH_DOWNLOADS: usize = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BlockKey {
@@ -472,6 +482,8 @@ pub struct BlockCache {
     interactive: Arc<Semaphore>,
     readahead: Arc<Semaphore>,
     prefetch: Arc<Semaphore>,
+    /// Taken after the priority's own permit.
+    downloads: Arc<Semaphore>,
 }
 
 impl BlockCache {
@@ -502,9 +514,10 @@ impl BlockCache {
             )),
             layout_flights: SingleFlight::default(),
             block_flights: SingleFlight::default(),
-            interactive: Arc::new(Semaphore::new(8)),
-            readahead: Arc::new(Semaphore::new(4)),
-            prefetch: Arc::new(Semaphore::new(2)),
+            interactive: Arc::new(Semaphore::new(INTERACTIVE_DOWNLOADS)),
+            readahead: Arc::new(Semaphore::new(READAHEAD_DOWNLOADS)),
+            prefetch: Arc::new(Semaphore::new(PREFETCH_DOWNLOADS)),
+            downloads: Arc::new(Semaphore::new(DOWNLOADS)),
         })
     }
 
@@ -614,10 +627,12 @@ impl BlockCache {
                     Priority::Readahead => &this.readahead,
                     Priority::Prefetch => &this.prefetch,
                 };
-                let _permit = Arc::clone(permits)
+                let closed = |_| CoreError::Internal("download permits closed".into());
+                let _permit = Arc::clone(permits).acquire_owned().await.map_err(closed)?;
+                let _download = Arc::clone(&this.downloads)
                     .acquire_owned()
                     .await
-                    .map_err(|_| CoreError::Internal("download permits closed".into()))?;
+                    .map_err(closed)?;
                 // Another flight may have filled it while this one waited.
                 if let Some(data) = this.get_local(&owned) {
                     return Ok(data);
@@ -660,6 +675,55 @@ impl BlockCache {
         self.disk.flush_access(&self.store);
     }
 
+    /// Inserts a just-uploaded revision from its local snapshot, split into
+    /// `block_size` blocks (§6.4), so reading it back downloads nothing.
+    pub fn seed(
+        &self,
+        link: &LinkId,
+        rev: &RevisionId,
+        snapshot: &Path,
+        block_size: u64,
+    ) -> Result<()> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(snapshot)?;
+        let size = file.metadata()?.len();
+        let mut infos = Vec::new();
+        let mut index = 1u32;
+        let mut remaining = size;
+        let mut buffer = vec![0u8; block_size as usize];
+        while remaining > 0 {
+            let len = remaining.min(block_size) as usize;
+            file.read_exact(&mut buffer[..len])?;
+            let key = BlockKey {
+                link: link.clone(),
+                rev: rev.clone(),
+                index,
+            };
+            self.disk
+                .put(&key, &buffer[..len], &self.store, &self.metrics)?;
+            infos.push(BlockInfo {
+                index,
+                plain_size: Some(len as u32),
+            });
+            remaining -= len as u64;
+            index += 1;
+        }
+        let layout = Arc::new(Layout::new(&infos, size)?);
+        let rows: Vec<(u32, u32)> = layout.blocks.iter().map(|b| (b.index, b.len)).collect();
+        let (link_owned, rev_owned) = (link.clone(), rev.clone());
+        self.store.write(move |conn| {
+            let mut statement = conn.prepare(
+                "INSERT OR REPLACE INTO revision_blocks(link_id, rev, idx, plain_size) VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (index, len) in &rows {
+                statement.execute((&link_owned.0, &rev_owned.0, index, len))?;
+            }
+            Ok(())
+        });
+        self.layouts.lock().put((link.clone(), rev.clone()), layout);
+        Ok(())
+    }
+
     /// Disk bytes and entry count.
     pub fn usage(&self) -> (u64, usize) {
         self.disk.usage()
@@ -671,6 +735,7 @@ mod tests {
     use super::*;
     use pdmount_backend::fake::FakeBackend;
     use pdmount_backend::{FileMeta, UploadSource};
+    use std::time::Duration;
 
     fn infos(sizes: &[Option<u32>]) -> Vec<BlockInfo> {
         sizes
@@ -730,6 +795,16 @@ mod tests {
         dir: &Path,
         disk_bytes: u64,
     ) -> (Arc<BlockCache>, Arc<Store>, LinkId, RevisionId) {
+        let (cache, store, link, rev, _) = setup_with(dir, disk_bytes, b"0123456789").await;
+        (cache, store, link, rev)
+    }
+
+    /// A cache over a fake drive holding one file `f` with 4-byte blocks.
+    async fn setup_with(
+        dir: &Path,
+        disk_bytes: u64,
+        content: &'static [u8],
+    ) -> (Arc<BlockCache>, Arc<Store>, LinkId, RevisionId, FakeBackend) {
         let backend = FakeBackend::new();
         backend.set_block_size(4);
         let root = backend.root().await.expect("root").link_id;
@@ -737,19 +812,20 @@ mod tests {
             mtime: UNIX_EPOCH,
             mode: None,
             media_type: "application/octet-stream".into(),
+            sha1: None,
         };
         let (link, rev) = backend
             .upload_new(
                 &root,
                 "f",
-                UploadSource::Bytes(Bytes::from_static(b"0123456789")),
+                UploadSource::Bytes(Bytes::from_static(content)),
                 meta,
             )
             .await
             .expect("upload");
         let store = Arc::new(Store::open(&dir.join("state.db")).expect("store"));
         let cache = BlockCache::open(
-            Arc::new(backend),
+            Arc::new(backend.clone()),
             Arc::clone(&store),
             Arc::default(),
             CacheOptions {
@@ -760,7 +836,52 @@ mod tests {
             },
         )
         .expect("cache");
-        (Arc::new(cache), store, link, rev)
+        (Arc::new(cache), store, link, rev, backend)
+    }
+
+    #[tokio::test]
+    async fn at_most_five_blocks_download_at_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cache, _store, link, rev, backend) = setup_with(
+            dir.path(),
+            1 << 20,
+            b"0123456789abcdefghijklmnopqrstuvwxyzABCD",
+        )
+        .await;
+        let layout = cache.layout(&link, &rev, 40).await.expect("layout");
+        assert_eq!(layout.blocks.len(), 10);
+        backend.set_latency(Duration::from_secs(1));
+        let calls = || {
+            cache
+                .metrics
+                .backend_calls
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let before = calls();
+        let priorities = [
+            Priority::Interactive,
+            Priority::Readahead,
+            Priority::Prefetch,
+        ];
+        let gets: Vec<_> = (1..=10)
+            .map(|index: u32| {
+                let cache = Arc::clone(&cache);
+                let key = BlockKey {
+                    link: link.clone(),
+                    rev: rev.clone(),
+                    index,
+                };
+                tokio::spawn(
+                    async move { cache.get(&key, 4, priorities[index as usize % 3]).await },
+                )
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(calls() - before, DOWNLOADS as u64);
+        for get in gets {
+            get.await.expect("join").expect("get");
+        }
+        assert_eq!(calls() - before, 10);
     }
 
     #[tokio::test]

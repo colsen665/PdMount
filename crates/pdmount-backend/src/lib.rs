@@ -16,7 +16,8 @@ use std::time::{Duration, SystemTime};
 macro_rules! id_type {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+        #[serde(transparent)]
         pub struct $name(pub String);
 
         impl $name {
@@ -54,7 +55,7 @@ id_type!(
     NameHash
 );
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum NodeKind {
     File,
     Folder,
@@ -102,9 +103,11 @@ pub struct FileMeta {
     pub mtime: SystemTime,
     pub mode: Option<u32>,
     pub media_type: String,
+    /// SHA-1 of the content, checked by the server-side commit when given.
+    pub sha1: Option<[u8; 20]>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EventKind {
     Delete,
     Create,
@@ -113,7 +116,7 @@ pub enum EventKind {
 }
 
 /// One volume event. Events carry ids only; the node is fetched separately.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RemoteEvent {
     pub kind: EventKind,
     pub link_id: LinkId,
@@ -199,6 +202,13 @@ pub type Result<T> = std::result::Result<T, BackendError>;
 pub trait Backend: Send + Sync + 'static {
     /// Account name and My Files root.
     async fn account(&self) -> Result<AccountInfo>;
+
+    /// Plaintext block size of uploads: revisions uploaded by PdMount are
+    /// split into blocks of this size, last one shorter. The block cache is
+    /// seeded with that layout after an upload.
+    fn upload_block_size(&self) -> u64 {
+        4 << 20
+    }
 
     /// The My Files root folder.
     async fn root(&self) -> Result<RemoteNode>;

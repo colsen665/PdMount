@@ -5,9 +5,8 @@
 //! twice (the second run transfers nothing), `git clone` and `git fsck`.
 //! Skipped when FUSE is not usable (no /dev/fuse or fusermount3).
 
-use bytes::Bytes;
+use pdmount_backend::Backend;
 use pdmount_backend::fake::FakeBackend;
-use pdmount_backend::{Backend, FileMeta, LinkId, UploadSource};
 use pdmount_core::Config;
 use pdmount_core::cache::CacheOptions;
 use pdmount_core::engine::{Engine, EngineOptions};
@@ -101,40 +100,6 @@ fn make_source(root: &Path) {
     ]);
 }
 
-/// Uploads `dir` into `parent` on the fake, keeping mtimes and modes.
-fn upload_dir<'a>(
-    backend: &'a FakeBackend,
-    dir: &'a Path,
-    parent: &'a LinkId,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
-    Box::pin(async move {
-        for entry in std::fs::read_dir(dir).expect("read_dir") {
-            let entry = entry.expect("entry");
-            let meta = entry.metadata().expect("metadata");
-            let name = entry.file_name().into_string().expect("utf8");
-            let mtime = meta.modified().expect("mtime");
-            if meta.is_dir() {
-                let link = backend
-                    .create_folder(parent, &name, mtime)
-                    .await
-                    .expect("mkdir");
-                upload_dir(backend, &entry.path(), &link).await;
-            } else {
-                let content = Bytes::from(std::fs::read(entry.path()).expect("read"));
-                let file_meta = FileMeta {
-                    mtime,
-                    mode: Some(meta.permissions().mode() & 0o7777),
-                    media_type: "application/octet-stream".into(),
-                };
-                backend
-                    .upload_new(parent, &name, UploadSource::Bytes(content), file_meta)
-                    .await
-                    .expect("upload");
-            }
-        }
-    })
-}
-
 struct Mount {
     engine: Arc<Engine>,
     mounted: pdmount_fuse::Mounted,
@@ -151,6 +116,8 @@ fn mount(
             Arc::new(backend.clone()),
             EngineOptions {
                 state_db: state.join("state.db"),
+                staging_dir: state.join("staging"),
+                local_ignore: None,
                 cache: CacheOptions {
                     dir: state.join("blocks"),
                     master_key: [9; 32],
@@ -168,12 +135,18 @@ fn mount(
 }
 
 fn unmount(runtime: &tokio::runtime::Runtime, mount: Mount) {
+    let counts = runtime.block_on(mount.engine.drain(std::time::Duration::from_secs(60)));
+    assert_eq!(
+        counts.pending + counts.parked,
+        0,
+        "queue left at unmount: {counts:?}"
+    );
     mount.mounted.unmount().expect("unmount");
     runtime.block_on(mount.engine.shutdown()).expect("shutdown");
 }
 
 #[test]
-fn read_only_mount_serves_rsync_and_git() {
+fn mount_serves_rsync_and_git_reads() {
     if !fuse_available() {
         eprintln!("skipped: FUSE is not available");
         return;
@@ -190,7 +163,7 @@ fn read_only_mount_serves_rsync_and_git() {
     backend.set_block_size(64 * 1024);
     runtime.block_on(async {
         let root = backend.root().await.expect("root").link_id;
-        upload_dir(&backend, &source, &root).await;
+        backend.import_dir(&source, &root).await.expect("import");
     });
 
     let state = temp.path().join("state");
@@ -243,9 +216,6 @@ fn read_only_mount_serves_rsync_and_git() {
         .arg(format!("file://{}", mnt.join("r.git").display()))
         .arg(&file_clone));
 
-    // Writes are refused.
-    let error = std::fs::write(mnt.join("new"), b"x").expect_err("read-only");
-    assert_eq!(error.raw_os_error(), Some(nix::libc::EROFS));
     assert_eq!(
         std::fs::metadata(mnt.join("missing"))
             .expect_err("missing")
@@ -280,5 +250,130 @@ fn read_only_mount_serves_rsync_and_git() {
             .load(Ordering::Relaxed),
         0
     );
+    unmount(&runtime, m);
+}
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    run(Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t"))
+}
+
+fn rsync_itemize(args: &[&str], from: &Path, to: &Path) -> String {
+    run(Command::new("rsync")
+        .args(args)
+        .arg(format!("{}/", from.display()))
+        .arg(to))
+}
+
+/// R1, R2, R3 and G1–G3 in small: rsync into the mount, change and
+/// delete, git init and commits inside it; then verify on a remount and
+/// on a fresh state that sees only what reached the fake.
+#[test]
+fn mount_takes_rsync_and_git_writes() {
+    if !fuse_available() {
+        eprintln!("skipped: FUSE is not available");
+        return;
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source = temp.path().join("source");
+    make_source(&source);
+    let tree = source.join("tree");
+    let backend = FakeBackend::new();
+    backend.set_block_size(64 * 1024);
+    let state = temp.path().join("state");
+    let mnt: PathBuf = temp.path().join("mnt");
+    std::fs::create_dir_all(&mnt).expect("mkdir");
+    let m = mount(&runtime, &backend, &state, &mnt);
+    let dst = mnt.join("dst");
+
+    // R1: a full copy, then nothing to do, by mtime and by checksum.
+    rsync_itemize(&["-a"], &tree, &dst);
+    assert_eq!(rsync_itemize(&["-ani"], &tree, &dst), "");
+    assert_eq!(rsync_itemize(&["-ani", "--checksum"], &tree, &dst), "");
+
+    // R2 and R3: change one file, delete another, sync with --delete.
+    std::fs::write(tree.join("a.txt"), b"changed").expect("write");
+    std::fs::remove_file(tree.join("dir/sub/c")).expect("rm");
+    let changed = rsync_itemize(&["-ai", "--delete"], &tree, &dst);
+    assert!(
+        changed.contains("a.txt")
+            && changed
+                .lines()
+                .any(|l| l.starts_with("*deleting") && l.ends_with("dir/sub/c")),
+        "{changed}"
+    );
+    assert_eq!(
+        rsync_itemize(&["-ani", "--delete", "--checksum"], &tree, &dst),
+        ""
+    );
+
+    // G1-G3: a repository created and committed to inside the mount.
+    let repo = mnt.join("repo");
+    git(&mnt, &["init", "-q", "-b", "main", "repo"]);
+    assert_eq!(git(&repo, &["config", "core.symlinks"]).trim(), "false");
+    for i in 0..5 {
+        std::fs::write(
+            repo.join(format!("f{i}")),
+            format!("commit {i}\n").repeat(100),
+        )
+        .expect("write");
+        if i == 3 {
+            git(&repo, &["mv", "f0", "renamed"]);
+        }
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", &format!("c{i}")]);
+    }
+    git(&repo, &["fsck", "--full", "--strict"]);
+    assert_eq!(git(&repo, &["status", "--porcelain"]), "");
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+
+    let metrics = m.engine.metrics();
+    assert_eq!(metrics.hot_path_network_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.handler_panics.load(Ordering::Relaxed), 0);
+    unmount(&runtime, m);
+
+    // No temporary name ever reached the fake.
+    for change in backend.changes() {
+        if let pdmount_backend::fake::FakeChange::CreatedFile { name, .. } = change {
+            assert!(
+                !name.ends_with(".lock") && !name.starts_with(".a.txt."),
+                "{name}"
+            );
+        }
+    }
+
+    // Remount: the same state, nothing to transfer.
+    let m = mount(&runtime, &backend, &state, &mnt);
+    assert_eq!(rsync_itemize(&["-ani", "--checksum"], &tree, &dst), "");
+    git(&repo, &["fsck", "--full", "--strict"]);
+    unmount(&runtime, m);
+
+    // Fresh: an empty state sees what the fake has. Directory times are
+    // local-only (D013), so they are not compared.
+    let fresh = temp.path().join("fresh");
+    let m = mount(&runtime, &backend, &fresh, &mnt);
+    assert_eq!(
+        rsync_itemize(&["-ani", "--omit-dir-times"], &tree, &dst),
+        ""
+    );
+    assert_eq!(
+        rsync_itemize(&["-ani", "--checksum", "--omit-dir-times"], &tree, &dst),
+        ""
+    );
+    git(&repo, &["fsck", "--full", "--strict"]);
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), head);
+    assert_eq!(git(&repo, &["status", "--porcelain"]), "");
     unmount(&runtime, m);
 }

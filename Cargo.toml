@@ -24,10 +24,12 @@ dbus-secret-service = "4.1"
 dirs = "6"
 futures = "0.3"
 fuser = "0.18"
+globset = "0.4"
 keyring = { version = "3.6", features = ["linux-native", "sync-secret-service"] }
 lru = "0.16"
-nix = { version = "0.30", features = ["fs", "signal", "user"] }
+nix = { version = "0.30", features = ["fs", "resource", "signal", "user"] }
 parking_lot = "0.12"
+proptest = "1"
 proton-drive-sdk = "0.4"
 rand = "0.10"
 reqwest = { version = "0.13", features = ["json"] }
@@ -55,8 +57,8 @@ unwrap_used = "warn"
 # The community SDK is used through a patched fork (decisions D002, D022).
 # Patches and their status: docs/sdk-patches.md.
 [patch.crates-io]
-proton-drive-sdk = { git = "https://github.com/colsen665/proton-sdk-rs2", rev = "8c7ff8b6dc1a262779a6f2aee593a296744fc338" }
-proton-sdk-rs2 = { git = "https://github.com/colsen665/proton-sdk-rs2", rev = "8c7ff8b6dc1a262779a6f2aee593a296744fc338" }
+proton-drive-sdk = { git = "https://github.com/colsen665/proton-sdk-rs2", rev = "7c92076d6029c08aff2959a77f7eb8456d4e0d24" }
+proton-sdk-rs2 = { git = "https://github.com/colsen665/proton-sdk-rs2", rev = "7c92076d6029c08aff2959a77f7eb8456d4e0d24" }
 
 [profile.dev]
 panic = "unwind"

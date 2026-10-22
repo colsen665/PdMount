@@ -9,6 +9,10 @@ publish.workspace = true
 name = "pdmount"
 path = "src/main.rs"
 
+[features]
+# Test builds: `mount --backend fake:<dir>` and `pdmount fake` (DESIGN.md §15.1).
+fake-backend = []
+
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true

@@ -57,7 +57,7 @@ Path prefixes: `sdk/` = `proton-drive-sdk-0.4.0/src/`, `rs2/` = `proton-sdk-rs2-
 | Milestone | Patches |
 |---|---|
 | M0/M1 (read-only mount) | P1, P2, P4, P8 (P3 recommended) |
-| M2 (writes) | P5, P6, P10 |
+| M2 (writes) | P5, P6, P10, P13 |
 | M3 (multi-device, robustness) | P9, P11, P12 |
 | M4 (performance) | P7 |
 
@@ -145,6 +145,21 @@ Path prefixes: `sdk/` = `proton-drive-sdk-0.4.0/src/`, `rs2/` = `proton-sdk-rs2-
   first 429 or 5xx.
 - **Fix:** bounded retry with exponential backoff and jitter on 408/425/429/5xx for GET requests, honouring `Retry-After`.
 
+### P13 — Batched fresh node fetch
+- **Where:** `sdk/client.rs` (`get_node_uncached`, `enumerate_nodes`), `sdk/node/mod.rs` (`DtoToMetadataConverter`,
+  `NodeBatchLoader`), `sdk/node/operations.rs` (`enumerate_nodes`).
+- **Problem:** the only way to read a node past the entity cache, which revision commits and other devices' changes leave
+  stale (DESIGN.md F14), is `get_node_uncached`: one `get_details` request per node. An event-following client refetches
+  every node an event names, so it sends one request per node where the official SDKs send one per batch (C#: 50 links,
+  `cs/client/cs/src/Proton.Drive.Sdk/BatchLoaderBase.cs:8`; JS: up to 100, `cs/client/js/src/internal/nodes/apiService.ts:32`).
+  `enumerate_nodes` answers from the cache and runs 8 single-node requests at once; `NodeBatchLoader` needs the parent
+  folder key up front and leaves stale cache entries.
+- **Fix:** `ProtonDriveClient::get_nodes_uncached(volume_id, link_ids)`: evicts the links' cache entries, sends one
+  `get_details` per 50 links (`FRESH_NODES_BATCH_SIZE`), one batch after the other, resolves parent keys as
+  `get_fresh_node_metadata` does, and caches the decoded nodes and secrets. Missing links (the API omits them,
+  `apiService.ts:217-221`) are missing from the result.
+- **Test:** the batching helper sends 50, 50 and 20 links for 120 ids, nothing for none, and stops at the first failure.
+
 ## Upstream tracking
 
 | Patch | Fork branch | Commit | Based on | Upstream | State |
@@ -161,14 +176,18 @@ Path prefixes: `sdk/` = `proton-drive-sdk-0.4.0/src/`, `rs2/` = `proton-sdk-rs2-
 | P10 | `feat/move-with-rename` | `c7bf10b` | `base/0.4.0` | deferred (D023) | merged into `pdmount` |
 | P11 | `feat/revision-conflict-error` | `1e777f3` | P8 | deferred (D023) | merged into `pdmount` |
 | P12 | `feat/metadata-retry` | `59fca73` | P8 | deferred (D023) | merged into `pdmount` |
+| P13 | `feat/fresh-node-batch` | `7b4dcf9` | `base/0.4.0` | deferred (D023) | merged into `pdmount` |
 
 Integration: `pdmount` = `base/0.4.0` + all branches above, merged with `--no-ff`. It also contains `9176b0f`, a test-only fix
 setting the new `FolderNode` field (from P5) in a test helper added by P10. Checks on 2026-10-19: 236 SDK tests pass (baseline
-150), pdcli builds and its tests pass, and `cargo fmt --check` passes. All tests are offline; none ran against the live API.
+150), pdcli builds and its tests pass, and `cargo fmt --check` passes. The fork's own tests are all offline. P13 was merged on 2026-10-21 (`4548aa7`, pinned by PdMount); the
+fork's workspace tests (278) pass on it. Through PdMount, the patches ran against the live API in the M2.8 real-account matrix
+(60 of 60 runs passed, 2026-10-22).
 
-## Behaviour changes (for review)
+## Behaviour changes
 
-These changes differ from 0.4.0 and can affect existing callers such as pdcli:
+These changes differ from 0.4.0 and can affect existing callers such as pdcli. Approved by the user on 2026-10-21 (P2,
+P8, P9, P11, P12; P13 only adds an API and changes no existing behaviour):
 
 | Patch | Change |
 |---|---|

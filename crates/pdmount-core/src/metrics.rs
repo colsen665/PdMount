@@ -47,6 +47,8 @@ counters! {
     deadline_expired,
     /// FUSE callbacks that panicked (answered EIO).
     handler_panics,
+    /// Files uploaded (new files and revisions).
+    uploads,
 }
 
 impl Metrics {

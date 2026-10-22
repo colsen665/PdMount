@@ -1,16 +1,16 @@
 //! [`Backend`] on top of the community Proton Drive SDK (patched fork,
 //! docs/sdk-patches.md).
 //!
-//! The read side is implemented (account, listing, node lookup, blocks,
-//! events, quota). Uploads and namespace changes return
-//! [`BackendError::Unsupported`] until M2.
+//! Uploads commit with the content's SHA-1 checked by the server. Renames
+//! go through `rename_node`, moves with an optional new name through
+//! `move_node` (P10), one call each; the SDK reads the current name hash
+//! itself, so `expected` is not used.
 
 use crate::{
     AccountInfo, Backend, BackendError, BlockInfo, EventId, EventKind, EventPage, FileMeta, LinkId,
     NameHash, NodeKind, RemoteEvent, RemoteNode, Result, RevisionId, StorageInfo, UploadSource,
 };
 use bytes::Bytes;
-use futures::StreamExt;
 use parking_lot::Mutex;
 use proton_drive_sdk::client::ProtonDriveClient;
 use proton_drive_sdk::error::ApiError;
@@ -65,6 +65,12 @@ impl ProtonBackend {
 
     pub fn client(&self) -> &ProtonDriveClient {
         &self.client
+    }
+
+    /// Deletes everything in the account's trash for good (`pdmount trash
+    /// empty`, D036). Not part of `Backend`: the mount never needs it.
+    pub async fn empty_trash(&self) -> Result<()> {
+        self.client.empty_trash().await.map_err(map_error)
     }
 
     fn node_uid(&self, link: &LinkId) -> NodeUid {
@@ -206,6 +212,12 @@ pub fn map_error(error: anyhow::Error) -> BackendError {
         || error
             .downcast_ref::<CompletedDownloadManifestVerificationException>()
             .is_some()
+        || error
+            .downcast_ref::<proton_drive_sdk::error::ChecksumMismatchIntegrityException>()
+            .is_some()
+        || error
+            .downcast_ref::<proton_drive_sdk::error::ContentSizeMismatchIntegrityException>()
+            .is_some()
     {
         return BackendError::Integrity(format!("{error:#}"));
     }
@@ -274,7 +286,52 @@ fn convert_event_kind(raw: i32) -> Option<EventKind> {
     })
 }
 
-const WRITES_UNSUPPORTED: &str = "uploads and namespace changes are implemented in M2";
+/// Content and size of an upload.
+async fn open_source(
+    source: UploadSource,
+) -> Result<(u64, Box<dyn tokio::io::AsyncRead + Unpin + Send>)> {
+    match source {
+        UploadSource::Bytes(bytes) => {
+            Ok((bytes.len() as u64, Box::new(std::io::Cursor::new(bytes))))
+        }
+        UploadSource::File(path) => {
+            let file = tokio::fs::File::open(&path)
+                .await
+                .map_err(|e| BackendError::Other(format!("cannot read {}: {e}", path.display())))?;
+            let size = file
+                .metadata()
+                .await
+                .map_err(|e| BackendError::Other(format!("cannot stat {}: {e}", path.display())))?
+                .len();
+            Ok((size, Box::new(file)))
+        }
+    }
+}
+
+/// Additional revision metadata: the permission bits (F10).
+fn mode_metadata(
+    mode: Option<u32>,
+) -> Option<Vec<proton_drive_sdk::meta::AdditionalMetadataProperty>> {
+    mode.map(|mode| {
+        vec![proton_drive_sdk::meta::AdditionalMetadataProperty {
+            key: MODE_METADATA_KEY.into(),
+            value: format!("{:o}", mode & 0o7777),
+        }]
+    })
+}
+
+impl ProtonBackend {
+    async fn upload(
+        &self,
+        uploader: proton_drive_sdk::node::file::upload::FileUploader,
+        reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    ) -> Result<proton_drive_sdk::node::file::upload::UploadResult> {
+        uploader
+            .upload_from_stream_with_revision(reader, Vec::new(), Box::new(|_, _| {}))
+            .await
+            .map_err(map_error)
+    }
+}
 
 #[async_trait::async_trait]
 impl Backend for ProtonBackend {
@@ -308,22 +365,28 @@ impl Backend for ProtonBackend {
             .collect())
     }
 
+    /// Fresh from the API, 50 links per request (P13): `enumerate_nodes`
+    /// answers from the SDK's entity cache, which neither our own revisions
+    /// nor other devices' changes update, so events would look like echoes
+    /// (D035). `get_nodes_uncached` refreshes those cache entries on the way.
+    /// The API leaves out links that no longer exist.
     async fn get_nodes(&self, ids: &[LinkId]) -> Result<Vec<Option<RemoteNode>>> {
-        let uids = ids.iter().map(|id| self.node_uid(id)).collect();
-        let mut found: HashMap<LinkId, RemoteNode> = HashMap::new();
-        let mut stream =
-            std::pin::pin!(self.client.enumerate_nodes(uids).await.map_err(map_error)?);
-        while let Some(item) = stream.next().await {
-            match item.map_err(map_error) {
-                Ok(object) => {
-                    if let Some(node) = decrypted(object) {
-                        found.insert(node.link_id.clone(), node);
-                    }
-                }
-                Err(BackendError::NotFound) => {}
-                Err(error) => return Err(error),
-            }
+        if ids.is_empty() {
+            return Ok(Vec::new());
         }
+        let links = ids
+            .iter()
+            .map(|id| proton_drive_sdk::links::LinkId::new(id.as_str().to_owned()))
+            .collect();
+        let mut found: HashMap<LinkId, RemoteNode> = self
+            .client
+            .get_nodes_uncached(self.volume.clone(), links)
+            .await
+            .map_err(map_error)?
+            .into_iter()
+            .filter_map(decrypted)
+            .map(|node| (node.link_id.clone(), node))
+            .collect();
         Ok(ids.iter().map(|id| found.remove(id)).collect())
     }
 
@@ -354,45 +417,116 @@ impl Backend for ProtonBackend {
 
     async fn upload_new(
         &self,
-        _parent: &LinkId,
-        _name: &str,
-        _source: UploadSource,
-        _meta: FileMeta,
+        parent: &LinkId,
+        name: &str,
+        source: UploadSource,
+        meta: FileMeta,
     ) -> Result<(LinkId, RevisionId)> {
-        Err(BackendError::Unsupported(WRITES_UNSUPPORTED))
+        let (size, reader) = open_source(source).await?;
+        let mut uploader = self
+            .client
+            .get_file_uploader(
+                self.node_uid(parent),
+                name.to_owned(),
+                meta.media_type,
+                size as i64,
+                Some(meta.mtime),
+                mode_metadata(meta.mode),
+                None,
+                false,
+            )
+            .await
+            .map_err(map_error)?;
+        if let Some(sha1) = meta.sha1 {
+            uploader.set_expected_sha1(sha1.to_vec());
+        }
+        let result = self.upload(uploader, reader).await?;
+        Ok((
+            link_of(&result.node_uid),
+            RevisionId::new(result.revision_uid.revision_id.raw()),
+        ))
     }
 
     async fn upload_revision(
         &self,
-        _file: &LinkId,
-        _base: &RevisionId,
-        _source: UploadSource,
-        _meta: FileMeta,
+        file: &LinkId,
+        base: &RevisionId,
+        source: UploadSource,
+        meta: FileMeta,
     ) -> Result<RevisionId> {
-        Err(BackendError::Unsupported(WRITES_UNSUPPORTED))
+        let (size, reader) = open_source(source).await?;
+        let mut uploader = self
+            .client
+            .get_file_revision_uploader(
+                self.revision_uid(file, base),
+                size as i64,
+                Some(meta.mtime),
+                mode_metadata(meta.mode),
+                None,
+            )
+            .await
+            .map_err(map_error)?;
+        if let Some(sha1) = meta.sha1 {
+            uploader.set_expected_sha1(sha1.to_vec());
+        }
+        let result = self.upload(uploader, reader).await?;
+        Ok(RevisionId::new(result.revision_uid.revision_id.raw()))
     }
 
     async fn create_folder(
         &self,
-        _parent: &LinkId,
-        _name: &str,
-        _mtime: SystemTime,
+        parent: &LinkId,
+        name: &str,
+        mtime: SystemTime,
     ) -> Result<LinkId> {
-        Err(BackendError::Unsupported(WRITES_UNSUPPORTED))
+        let folder = self
+            .client
+            .create_folder(self.node_uid(parent), name.to_owned(), Some(mtime))
+            .await
+            .map_err(map_error)?;
+        Ok(link_of(&folder.base.uid))
     }
 
     async fn rename(
         &self,
-        _node: &LinkId,
-        _new_parent: Option<&LinkId>,
-        _new_name: &str,
+        node: &LinkId,
+        new_parent: Option<&LinkId>,
+        new_name: &str,
         _expected: Option<&NameHash>,
     ) -> Result<()> {
-        Err(BackendError::Unsupported(WRITES_UNSUPPORTED))
+        let uid = self.node_uid(node);
+        match new_parent {
+            Some(parent) => self
+                .client
+                .move_node(uid, self.node_uid(parent), Some(new_name.to_owned()))
+                .await
+                .map_err(map_error),
+            None => self
+                .client
+                .rename_node(uid, new_name.to_owned(), None)
+                .await
+                .map_err(map_error),
+        }
     }
 
-    async fn trash(&self, _nodes: &[LinkId]) -> Result<Vec<Result<()>>> {
-        Err(BackendError::Unsupported(WRITES_UNSUPPORTED))
+    async fn trash(&self, nodes: &[LinkId]) -> Result<Vec<Result<()>>> {
+        let uids: Vec<NodeUid> = nodes.iter().map(|link| self.node_uid(link)).collect();
+        let mut results = self
+            .client
+            .trash_nodes(uids.clone())
+            .await
+            .map_err(map_error)?;
+        Ok(uids
+            .iter()
+            .map(|uid| match results.remove(uid) {
+                Some(Ok(())) => Ok(()),
+                Some(Err(error)) => Err(map_error(error)),
+                None => Err(BackendError::Other(format!(
+                    "the server did not report on trashing {}",
+                    uid.link_id.raw()
+                ))),
+            })
+            .collect())
     }
 
     async fn latest_event_id(&self) -> Result<EventId> {

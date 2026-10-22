@@ -4,6 +4,8 @@
 source "$(dirname "$0")/lib.sh"
 ensure_dataset
 prepare_mount
+require_m1
+verify_cycle
 make_workdir
 
 step "R6 [$VERIFY_MODE]: rsync -a from the mount"

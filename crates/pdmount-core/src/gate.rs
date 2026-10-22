@@ -7,7 +7,7 @@
 //! only while no foreground request (a listing or read a FUSE request waits
 //! on) is in flight.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, MutexGuard, Notify};
 use tokio::time::Instant;
@@ -17,7 +17,8 @@ pub struct Gate {
     next_start: Mutex<Instant>,
     foreground: AtomicUsize,
     quiet: Notify,
-    interval: Duration,
+    /// Spacing of turns, in microseconds.
+    interval: AtomicU64,
 }
 
 /// Marks a foreground request in flight.
@@ -42,8 +43,15 @@ impl Gate {
             next_start: Mutex::new(Instant::now()),
             foreground: AtomicUsize::new(0),
             quiet: Notify::new(),
-            interval,
+            interval: AtomicU64::new(micros(interval)),
         }
+    }
+
+    /// Spaces turns `interval` apart from now on (tests that use the fake
+    /// backend and need no pacing).
+    #[cfg(test)]
+    pub(crate) fn set_interval(&self, interval: Duration) {
+        self.interval.store(micros(interval), Ordering::Relaxed);
     }
 
     pub fn foreground(&self) -> Foreground<'_> {
@@ -60,7 +68,7 @@ impl Gate {
         let mut next_start = self.next_start.lock().await;
         tokio::time::sleep_until(*next_start).await;
         self.wait_quiet().await;
-        *next_start = Instant::now() + self.interval;
+        *next_start = Instant::now() + Duration::from_micros(self.interval.load(Ordering::Relaxed));
         Turn {
             _next_start: next_start,
         }
@@ -77,6 +85,10 @@ impl Gate {
             notified.await;
         }
     }
+}
+
+fn micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

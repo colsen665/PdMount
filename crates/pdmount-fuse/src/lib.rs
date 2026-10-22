@@ -1,40 +1,40 @@
 //! FUSE adapter (DESIGN.md §4): maps fuser callbacks onto [`Engine`].
 //!
 //! Hot operations are answered on the fuser thread inside a
-//! [`metrics::hot`] scope. Operations that need the network (first listing of
-//! a directory, a block that is not cached) move their Reply into a tokio
-//! task, bounded by a semaphore and a deadline; on expiry the request gets
-//! EIO while the download continues and warms the cache. Every callback runs
-//! inside `catch_unwind`: a panic drops the Reply, which answers EIO, and the
-//! mount stays up.
-//!
-//! M1 is read-only: the mount uses `ro` and every write-side operation
-//! returns EROFS.
+//! [`metrics::hot`] scope. Operations that need the network (a directory
+//! that was never listed, a block that is not cached, a base block a write
+//! only partly covers) move their Reply into a tokio task, bounded by a
+//! semaphore and a deadline; on expiry the request gets EIO while the work
+//! continues and warms the cache. Every callback runs inside `catch_unwind`:
+//! a panic drops the Reply, which answers EIO, and the mount stays up.
 
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags,
-    KernelConfig, MountOption, Notifier, OpenFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
-    ReplyXattr, Request,
+    KernelConfig, MountOption, Notifier, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen,
+    ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
 };
 use pdmount_backend::NodeKind;
-use pdmount_core::engine::Engine;
+use pdmount_core::config::FsyncMode;
+use pdmount_core::engine::{Engine, OpenMode, SetAttr};
 use pdmount_core::errors::{CoreError, Result};
 use pdmount_core::metrics::{self, Metrics};
-use pdmount_core::vfs::{Attr, Invalidation, Lookup};
+use pdmount_core::vfs::{Attr, Invalidation, Lookup, RenameMode};
 use std::ffi::OsStr;
 use std::future::Future;
 use std::os::unix::ffi::OsStrExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::sync::{Semaphore, mpsc};
 
 /// Concurrent slow-path requests (§4.2); matches `max_background`.
 const SLOW_PATH_LIMIT: usize = 64;
 const FUSER_THREADS: usize = 4;
 const BLKSIZE: u32 = 128 * 1024;
+/// Slow-path attempts before giving up (listing, then inode numbers, ...).
+const SLOW_ATTEMPTS: usize = 4;
 
 pub struct PdFs {
     engine: Arc<Engine>,
@@ -100,12 +100,55 @@ impl PdFs {
                 Err(CoreError::Timeout)
             });
             if let Err(error) = &result
-                && !matches!(error, CoreError::NotFound)
+                && !matches!(
+                    error,
+                    CoreError::NotFound | CoreError::Exists | CoreError::NotEmpty
+                )
             {
-                tracing::debug!(op, %error, "request failed");
+                // EIO says nothing to the caller; the log has to.
+                if error.errno() == nix::libc::EIO {
+                    tracing::warn!(op, %error, "request failed; answered EIO");
+                } else {
+                    tracing::debug!(op, %error, "request failed");
+                }
             }
             reply(result);
         });
+    }
+
+    /// Runs `attempt` on the hot path; if it needs a listing or inode
+    /// numbers, provides them on the slow path and tries again.
+    fn retrying<T, A>(
+        &self,
+        op: &'static str,
+        attempt: A,
+        reply: impl FnOnce(Result<T>) + Send + 'static,
+    ) where
+        T: Send + 'static,
+        A: Fn() -> Result<T> + Send + 'static,
+    {
+        match attempt() {
+            Err(error) if is_resolvable(&error) => {
+                let engine = Arc::clone(&self.engine);
+                self.slow(
+                    op,
+                    self.metadata_deadline,
+                    async move {
+                        let mut error = error;
+                        for _ in 0..SLOW_ATTEMPTS {
+                            resolve(&engine, &error).await?;
+                            match attempt() {
+                                Err(next) if is_resolvable(&next) => error = next,
+                                result => return result,
+                            }
+                        }
+                        Err(error)
+                    },
+                    reply,
+                );
+            }
+            result => reply(result),
+        }
     }
 
     fn file_attr(&self, attr: &Attr) -> FileAttr {
@@ -123,6 +166,44 @@ impl PdFs {
             self.negative_ttl,
         );
     }
+
+    /// Sends a successful reply only once the store has committed the rows
+    /// the request queued (§5.6); errors go out at once.
+    fn committed<T: Send + 'static>(
+        &self,
+        reply: impl FnOnce(Result<T>) + Send + 'static,
+    ) -> impl FnOnce(Result<T>) + Send + 'static {
+        let engine = Arc::clone(&self.engine);
+        move |result| match result {
+            Ok(value) => engine.after_commit(move || reply(Ok(value))),
+            Err(error) => reply(Err(error)),
+        }
+    }
+
+    fn entry_reply(&self) -> impl FnOnce(Result<Attr>, ReplyEntry) + Send + 'static {
+        let (uid, gid, attr_ttl, entry_ttl) = (self.uid, self.gid, self.attr_ttl, self.entry_ttl);
+        move |result, reply| match result {
+            Ok(attr) => reply.entry_with_ttls(
+                &attr_ttl,
+                &entry_ttl,
+                &file_attr(&attr, uid, gid),
+                Generation(0),
+            ),
+            Err(error) => reply.error(errno(&error)),
+        }
+    }
+}
+
+fn is_resolvable(error: &CoreError) -> bool {
+    matches!(error, CoreError::NeedsListing(_) | CoreError::NeedsInos)
+}
+
+async fn resolve(engine: &Arc<Engine>, error: &CoreError) -> Result<()> {
+    match error {
+        CoreError::NeedsListing(dir) => engine.ensure_listed(*dir).await,
+        CoreError::NeedsInos => engine.reserve_inos(16).await,
+        other => Err(other.clone()),
+    }
 }
 
 fn errno(error: &CoreError) -> Errno {
@@ -134,14 +215,11 @@ fn file_attr(attr: &Attr, uid: u32, gid: u32) -> FileAttr {
         ino: INodeNo(attr.ino),
         size: attr.size,
         blocks: attr.size.div_ceil(512),
-        atime: attr.mtime,
+        atime: attr.atime,
         mtime: attr.mtime,
-        ctime: attr.mtime,
+        ctime: attr.ctime,
         crtime: attr.mtime,
-        kind: match attr.kind {
-            NodeKind::File => FileType::RegularFile,
-            NodeKind::Folder => FileType::Directory,
-        },
+        kind: file_type(attr.kind),
         perm: attr.perm as u16,
         nlink: attr.nlink,
         uid,
@@ -182,6 +260,8 @@ fn reply_lookup(
                 kind: NodeKind::File,
                 size: 0,
                 mtime: std::time::UNIX_EPOCH,
+                ctime: std::time::UNIX_EPOCH,
+                atime: std::time::UNIX_EPOCH,
                 perm: 0,
                 nlink: 0,
             };
@@ -210,6 +290,22 @@ fn fill_dir(entries: &[pdmount_core::vfs::DirEntry], offset: u64, reply: &mut Re
     }
 }
 
+fn open_mode(flags: i32) -> OpenMode {
+    let access = OpenFlags(flags).acc_mode();
+    OpenMode {
+        read: access != OpenAccMode::O_WRONLY,
+        write: access != OpenAccMode::O_RDONLY,
+        truncate: flags & nix::libc::O_TRUNC != 0,
+    }
+}
+
+fn time(value: TimeOrNow) -> SystemTime {
+    match value {
+        TimeOrNow::SpecificTime(time) => time,
+        TimeOrNow::Now => SystemTime::now(),
+    }
+}
+
 impl Filesystem for PdFs {
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
         for flag in [
@@ -230,6 +326,9 @@ impl Filesystem for PdFs {
         }
         if let Err(max) = config.set_max_background(SLOW_PATH_LIMIT as u16) {
             let _ = config.set_max_background(max);
+        }
+        if let Err(max) = config.set_max_write(1 << 20) {
+            let _ = config.set_max_write(max);
         }
         Ok(())
     }
@@ -274,17 +373,237 @@ impl Filesystem for PdFs {
         });
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        self.handle("open", || match self.engine.open_file(ino.0) {
-            Ok((handle, keep_cache)) => {
-                let flags = if keep_cache {
-                    FopenFlags::FOPEN_KEEP_CACHE
-                } else {
-                    FopenFlags::empty()
-                };
-                reply.opened(FileHandle(handle), flags);
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        fh: Option<FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<fuser::BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        self.handle("setattr", || {
+            // Files belong to the mounting user; only no-op chowns pass.
+            if uid.is_some_and(|u| u != self.uid) || gid.is_some_and(|g| g != self.gid) {
+                return reply.error(Errno::EPERM);
             }
-            Err(error) => reply.error(errno(&error)),
+            let change = SetAttr {
+                mode,
+                size,
+                mtime: mtime.map(time),
+                atime: atime.map(time),
+                handle: fh.map(|fh| fh.0),
+            };
+            let (uid, gid, ttl) = (self.uid, self.gid, self.attr_ttl);
+            let respond = self.committed(move |result: Result<Attr>| match result {
+                Ok(attr) => reply.attr(&ttl, &file_attr(&attr, uid, gid)),
+                Err(error) => reply.error(errno(&error)),
+            });
+            match self.engine.setattr(ino.0, &change) {
+                Err(CoreError::NeedsMaterialize(_)) => {
+                    let engine = Arc::clone(&self.engine);
+                    self.slow(
+                        "setattr",
+                        self.block_deadline,
+                        async move { engine.setattr_slow(ino.0, change).await },
+                        respond,
+                    );
+                }
+                result => respond(result),
+            }
+        });
+    }
+
+    fn mknod(
+        &self,
+        _req: &Request,
+        _parent: INodeNo,
+        _name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        // §8.7: special files cannot exist remotely.
+        reply.error(Errno::EPERM);
+    }
+
+    fn mkdir(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        reply: ReplyEntry,
+    ) {
+        self.handle("mkdir", || {
+            let engine = Arc::clone(&self.engine);
+            let name = name.to_owned();
+            let respond = self.entry_reply();
+            self.retrying(
+                "mkdir",
+                move || engine.mkdir(parent.0, name.as_bytes(), mode & !umask),
+                self.committed(move |result| respond(result, reply)),
+            );
+        });
+    }
+
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        self.handle("unlink", || {
+            let engine = Arc::clone(&self.engine);
+            let name = name.to_owned();
+            self.retrying(
+                "unlink",
+                move || engine.unlink(parent.0, name.as_bytes()),
+                self.committed(move |result| match result {
+                    Ok(()) => reply.ok(),
+                    Err(error) => reply.error(errno(&error)),
+                }),
+            );
+        });
+    }
+
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        self.handle("rmdir", || {
+            let engine = Arc::clone(&self.engine);
+            let name = name.to_owned();
+            self.retrying(
+                "rmdir",
+                move || engine.rmdir(parent.0, name.as_bytes()),
+                self.committed(move |result| match result {
+                    Ok(()) => reply.ok(),
+                    Err(error) => reply.error(errno(&error)),
+                }),
+            );
+        });
+    }
+
+    fn symlink(
+        &self,
+        _req: &Request,
+        _parent: INodeNo,
+        _link_name: &OsStr,
+        _target: &Path,
+        reply: ReplyEntry,
+    ) {
+        reply.error(Errno::EPERM);
+    }
+
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        flags: RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        self.handle("rename", || {
+            if flags.intersects(RenameFlags::RENAME_EXCHANGE | RenameFlags::RENAME_WHITEOUT)
+                || !(flags - RenameFlags::RENAME_NOREPLACE).is_empty()
+            {
+                return reply.error(Errno::EINVAL);
+            }
+            let mode = if flags.contains(RenameFlags::RENAME_NOREPLACE) {
+                RenameMode::NoReplace
+            } else {
+                RenameMode::Replace
+            };
+            let engine = Arc::clone(&self.engine);
+            let (name, newname) = (name.to_owned(), newname.to_owned());
+            self.retrying(
+                "rename",
+                move || {
+                    engine.rename(
+                        parent.0,
+                        name.as_bytes(),
+                        newparent.0,
+                        newname.as_bytes(),
+                        mode,
+                    )
+                },
+                self.committed(move |result| match result {
+                    Ok(()) => reply.ok(),
+                    Err(error) => reply.error(errno(&error)),
+                }),
+            );
+        });
+    }
+
+    fn link(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _newparent: INodeNo,
+        _newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        reply.error(Errno::EPERM);
+    }
+
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        self.handle("open", || {
+            let respond = self.committed(move |result: Result<(u64, bool)>| match result {
+                Ok((handle, keep_cache)) => {
+                    let flags = if keep_cache {
+                        FopenFlags::FOPEN_KEEP_CACHE
+                    } else {
+                        FopenFlags::empty()
+                    };
+                    reply.opened(FileHandle(handle), flags);
+                }
+                Err(error) => reply.error(errno(&error)),
+            });
+            respond(self.engine.open_file(ino.0, open_mode(flags.0)));
+        });
+    }
+
+    fn create(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        flags: i32,
+        reply: ReplyCreate,
+    ) {
+        self.handle("create", || {
+            let engine = Arc::clone(&self.engine);
+            let name = name.to_owned();
+            let exclusive = flags & nix::libc::O_EXCL != 0;
+            let open = open_mode(flags);
+            let (uid, gid, attr_ttl, entry_ttl) =
+                (self.uid, self.gid, self.attr_ttl, self.entry_ttl);
+            self.retrying(
+                "create",
+                move || engine.create(parent.0, name.as_bytes(), mode & !umask, exclusive, open),
+                self.committed(move |result| match result {
+                    Ok((attr, handle)) => {
+                        // `created` takes one TTL for both entry and attributes.
+                        let ttl = attr_ttl.min(entry_ttl);
+                        reply.created(
+                            &ttl,
+                            &file_attr(&attr, uid, gid),
+                            Generation(0),
+                            FileHandle(handle),
+                            FopenFlags::empty(),
+                        );
+                    }
+                    Err(error) => reply.error(errno(&error)),
+                }),
+            );
         });
     }
 
@@ -319,6 +638,53 @@ impl Filesystem for PdFs {
         });
     }
 
+    fn write(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        data: &[u8],
+        _write_flags: fuser::WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        reply: ReplyWrite,
+    ) {
+        self.handle("write", || {
+            let respond = self.committed(move |result: Result<u32>| match result {
+                Ok(written) => reply.written(written),
+                Err(error) => reply.error(errno(&error)),
+            });
+            match self.engine.write_local(fh.0, offset, data) {
+                Err(CoreError::NeedsMaterialize(_)) => {
+                    let engine = Arc::clone(&self.engine);
+                    let data = data.to_vec();
+                    self.slow(
+                        "write",
+                        self.block_deadline,
+                        async move { engine.write(fh.0, offset, data).await },
+                        respond,
+                    );
+                }
+                result => respond(result),
+            }
+        });
+    }
+
+    fn flush(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _lock_owner: fuser::LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        self.handle("flush", || match self.engine.flush(fh.0) {
+            Ok(()) => self.engine.after_commit(move || reply.ok()),
+            Err(error) => reply.error(errno(&error)),
+        });
+    }
+
     fn release(
         &self,
         _req: &Request,
@@ -331,30 +697,42 @@ impl Filesystem for PdFs {
     ) {
         self.handle("release", || {
             self.engine.release_file(fh.0);
-            reply.ok();
+            self.engine.after_commit(move || reply.ok());
         });
-    }
-
-    fn flush(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _fh: FileHandle,
-        _lock_owner: fuser::LockOwner,
-        reply: ReplyEmpty,
-    ) {
-        self.handle("flush", || reply.ok());
     }
 
     fn fsync(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         _fh: FileHandle,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        self.handle("fsync", || reply.ok());
+        self.handle("fsync", || {
+            let engine = Arc::clone(&self.engine);
+            let remote = engine.config().fsync.mode == FsyncMode::Remote;
+            let deadline = if remote {
+                self.block_deadline
+            } else {
+                self.metadata_deadline
+            };
+            self.slow(
+                "fsync",
+                deadline,
+                async move {
+                    engine.fsync(ino.0).await?;
+                    if remote {
+                        engine.sync_remote(ino.0, deadline).await?;
+                    }
+                    Ok(())
+                },
+                move |result| match result {
+                    Ok(()) => reply.ok(),
+                    Err(error) => reply.error(errno(&error)),
+                },
+            );
+        });
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
@@ -473,7 +851,18 @@ impl Filesystem for PdFs {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        self.handle("fsyncdir", || reply.ok());
+        self.handle("fsyncdir", || {
+            let engine = Arc::clone(&self.engine);
+            self.slow(
+                "fsyncdir",
+                self.metadata_deadline,
+                async move { engine.fsyncdir().await },
+                move |result| match result {
+                    Ok(()) => reply.ok(),
+                    Err(error) => reply.error(errno(&error)),
+                },
+            );
+        });
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
@@ -506,128 +895,14 @@ impl Filesystem for PdFs {
         });
     }
 
-    fn access(&self, _req: &Request, _ino: INodeNo, _mask: fuser::AccessFlags, reply: ReplyEmpty) {
-        // `default_permissions` makes the kernel check modes itself.
-        self.handle("access", || reply.ok());
-    }
-
-    // ---- write side: read-only in M1 ----
-
-    fn setattr(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
-        _size: Option<u64>,
-        _atime: Option<fuser::TimeOrNow>,
-        _mtime: Option<fuser::TimeOrNow>,
-        _ctime: Option<std::time::SystemTime>,
-        _fh: Option<FileHandle>,
-        _crtime: Option<std::time::SystemTime>,
-        _chgtime: Option<std::time::SystemTime>,
-        _bkuptime: Option<std::time::SystemTime>,
-        _flags: Option<fuser::BsdFileFlags>,
-        reply: ReplyAttr,
-    ) {
-        reply.error(Errno::EROFS);
-    }
-
-    fn mknod(
-        &self,
-        _req: &Request,
-        _parent: INodeNo,
-        _name: &OsStr,
-        _mode: u32,
-        _umask: u32,
-        _rdev: u32,
-        reply: ReplyEntry,
-    ) {
-        reply.error(Errno::EROFS);
-    }
-
-    fn mkdir(
-        &self,
-        _req: &Request,
-        _parent: INodeNo,
-        _name: &OsStr,
-        _mode: u32,
-        _umask: u32,
-        reply: ReplyEntry,
-    ) {
-        reply.error(Errno::EROFS);
-    }
-
-    fn unlink(&self, _req: &Request, _parent: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
-        reply.error(Errno::EROFS);
-    }
-
-    fn rmdir(&self, _req: &Request, _parent: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
-        reply.error(Errno::EROFS);
-    }
-
-    fn symlink(
-        &self,
-        _req: &Request,
-        _parent: INodeNo,
-        _link_name: &OsStr,
-        _target: &Path,
-        reply: ReplyEntry,
-    ) {
-        reply.error(Errno::EPERM);
-    }
-
-    fn rename(
-        &self,
-        _req: &Request,
-        _parent: INodeNo,
-        _name: &OsStr,
-        _newparent: INodeNo,
-        _newname: &OsStr,
-        _flags: fuser::RenameFlags,
-        reply: ReplyEmpty,
-    ) {
-        reply.error(Errno::EROFS);
-    }
-
-    fn link(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _newparent: INodeNo,
-        _newname: &OsStr,
-        reply: ReplyEntry,
-    ) {
-        reply.error(Errno::EPERM);
-    }
-
-    fn write(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _fh: FileHandle,
-        _offset: u64,
-        _data: &[u8],
-        _write_flags: fuser::WriteFlags,
-        _flags: OpenFlags,
-        _lock_owner: Option<fuser::LockOwner>,
-        reply: ReplyWrite,
-    ) {
-        reply.error(Errno::EROFS);
-    }
-
-    fn create(
-        &self,
-        _req: &Request,
-        _parent: INodeNo,
-        _name: &OsStr,
-        _mode: u32,
-        _umask: u32,
-        _flags: i32,
-        reply: ReplyCreate,
-    ) {
-        reply.error(Errno::EROFS);
+    fn access(&self, _req: &Request, ino: INodeNo, mask: fuser::AccessFlags, reply: ReplyEmpty) {
+        // Without `default_permissions` the daemon checks modes (D031).
+        self.handle("access", || {
+            match self.engine.access(ino.0, mask.bits() as u32) {
+                Ok(()) => reply.ok(),
+                Err(error) => reply.error(errno(&error)),
+            }
+        });
     }
 
     fn setxattr(
@@ -640,11 +915,11 @@ impl Filesystem for PdFs {
         _position: u32,
         reply: ReplyEmpty,
     ) {
-        reply.error(Errno::EROFS);
+        reply.error(Errno::ENOTSUP);
     }
 
     fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
-        reply.error(Errno::EROFS);
+        reply.error(Errno::NO_XATTR);
     }
 
     fn fallocate(
@@ -657,23 +932,8 @@ impl Filesystem for PdFs {
         _mode: i32,
         reply: ReplyEmpty,
     ) {
-        reply.error(Errno::EROFS);
-    }
-
-    fn copy_file_range(
-        &self,
-        _req: &Request,
-        _ino_in: INodeNo,
-        _fh_in: FileHandle,
-        _offset_in: u64,
-        _ino_out: INodeNo,
-        _fh_out: FileHandle,
-        _offset_out: u64,
-        _len: u64,
-        _flags: fuser::CopyFileRangeFlags,
-        reply: ReplyWrite,
-    ) {
-        reply.error(Errno::EROFS);
+        // glibc's `posix_fallocate` falls back to writing (§8.7).
+        reply.error(Errno::EOPNOTSUPP);
     }
 }
 
@@ -698,8 +958,8 @@ impl Mounted {
     }
 }
 
-/// Mounts `engine` read-only at `mountpoint` and starts the notify task.
-/// Blocks until the kernel handshake is done; call from a plain thread or
+/// Mounts `engine` at `mountpoint` and starts the notify task. Blocks until
+/// the kernel handshake is done; call from a plain thread or
 /// `spawn_blocking`, not from an async task.
 pub fn mount(
     engine: Arc<Engine>,
@@ -712,8 +972,9 @@ pub fn mount(
     config.mount_options = vec![
         MountOption::FSName("pdmount".into()),
         MountOption::Subtype("pdmount".into()),
-        MountOption::RO,
-        MountOption::DefaultPermissions,
+        // No `default_permissions`: the kernel would answer EACCES from the
+        // write bits cleared in `ro` subtrees before PdMount could answer
+        // EROFS (D019, D031); the engine checks permissions instead.
         MountOption::NoAtime,
         MountOption::NoDev,
         MountOption::NoSuid,

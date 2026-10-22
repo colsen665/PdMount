@@ -31,7 +31,7 @@ Source citations use these prefixes:
 | RQ3 | Use from several devices at once (PdMount instances and the official apps). Conflicting changes are expected and must never lose data | §10 |
 | RQ4 | Per-path access control: a path and its sub-entries are Read or Read+Write. Rules are changed and listed at runtime with the CLI | §11 |
 | RQ5 | Web authentication either opens the link in the default browser or only prints it on the command line | §12.2 |
-| RQ6 | Crash-safe: acknowledged writes survive a daemon crash or power loss and are uploaded later | §7, §9 |
+| RQ6 | Crash-safe: acknowledged writes survive a daemon crash; fsync'd writes also survive a power loss; both are uploaded later | §4.3, §5.6, §7, §9 |
 | RQ7 | A mount never hangs indefinitely, and recovery never needs a reboot | §4, §14.4 |
 | RQ8 | Scope is My Files only | — |
 
@@ -84,13 +84,14 @@ All of these are fixed in the fork (`docs/sdk-patches.md`) and are hidden behind
 | F11 | New-revision drafts send `CurrentRevisionID` (an optimistic-concurrency base), and rename/move send `OriginalHash` | `sdk/node/draft.rs:175-178`; `sdk/api/links.rs:562`, `:638` | P11 |
 | F12 | Events contain only ids and type (`Delete=0, Create=1, UpdateMetadata=2, UpdateContent=3`, `link_id`, `parent_link_id`, `is_trashed`), plus `more` and `refresh` flags | `sdk/api/events.rs:143-214` | — |
 | F13 | Login is only the browser session fork; `on_sign_in(url, code)` callback | `rs2/session.rs:240-250` | — |
+| F14 | `get_node` and `enumerate_nodes` (one `get_node` per id, 8 at once) answer from the SDK's entity cache, which revision commits and other devices' changes do not update; `get_node_uncached` evicts the entry and fetches it again; `get_nodes_uncached` (P13) does that for many links, 50 per `get_details`. Folder listings (`NodeBatchLoader`, 50 links per `get_details`) are always fresh but do not refresh that cache. Seen on the real API in M2.10 (D035) | fork `9176b0f`: `client.rs:556-563`, `node/operations.rs` (`get_node_metadata`, `enumerate_nodes`), `node/mod.rs` (`NodeBatchLoader`) | — |
 
 ### 2.3 Environment (development machine)
 
 - Gentoo, libfuse/fusermount3 (setuid), `/home` on btrfs, so `FICLONE` reflinks are available.
 - `/etc/fuse.conf` has `user_allow_other` commented out. fuser rejects `AutoUnmount` without `allow_other`/`allow_root`
   (`fuser/session.rs:163-171`), so the design must not depend on it (§14.4).
-- pjdfstest and fsx are not installed; agents build them from source outside the repo (TODO.md M2.9).
+- pjdfstest and fsx are not installed; agents build them from source in `<tools dir>/` (§15.1).
 
 ### 2.4 Official SDK constraints (`cs/README.md`)
 
@@ -111,6 +112,7 @@ PdMount/
 ├── crates/
 │   ├── pdmount-core/          no fuser dependency; all logic; unit + property tests
 │   │   ├── engine.rs          M1: hot/slow operations for the FUSE adapter, prefetch, revalidation
+│   │   ├── events.rs          M2: event loop, echo filter, refresh (§9, D034)
 │   │   ├── singleflight.rs    M1: shared in-flight work (listings, block maps, blocks)
 │   │   ├── vfs/               inode table, dentries, handles, dir locks, attrs, name rules
 │   │   ├── access/            access rules, effective-mode resolution (§11)
@@ -132,6 +134,7 @@ PdMount/
 │   └── pdmount/               binary: CLI, daemon, control socket, auth, service unit
 ├── tests/
 │   ├── scenarios/             rsync_*.sh, git_*.sh, access_*.sh, multi_*.sh (VERIFY_MODE)
+│   ├── pjdfstest.sh           runner: the subset, expected failures from pjdfstest.list
 │   ├── pjdfstest.list
 │   └── fsx.sh
 ├── benches/
@@ -257,13 +260,34 @@ When a deadline expires, the request replies EIO and logs it. The background fet
 ### 4.3 State and locking
 
 - **Inode table** (RAM, authoritative for FUSE): `HashMap<Ino, Node>` plus per-directory `BTreeMap<Name, Ino>` child maps.
-  M1 keeps the whole table under one `RwLock`, held for microseconds and never across `.await`. It is loaded completely
-  from the store at mount. Sharding is an M4 option if profiling shows contention.
-- **Directory namespace mutex** per directory, held for microseconds. Rename locks both parents in ino order. No lock is held
-  across `.await` or while calling the Notifier.
-- **SQLite** (WAL): one writer task owns the write connection. Mutations are sent as batches, with group commit every ≤5 ms.
-  Callers that need durability (fsync, fsyncdir, `access set`, journal state transitions) await the commit, with
-  `synchronous=FULL` for those batches. Readers use a small read-connection pool.
+  Each node holds its local state, its last known remote state and its generations (§8.2). The whole table is under one
+  `RwLock`, held for microseconds and never across `.await`; it is loaded completely from the store at mount. Sharding
+  is an M4 option if profiling shows contention.
+- **Per-inode staging lock**: the staging file and its sidecar (§7.1) of a changed file have their own mutex, so file I/O
+  never holds the table lock. Order: a staging lock may be taken before the table lock, never while holding it, and
+  before the map of staged inodes, never while holding that. A write or truncation changes the staging and the node
+  (size, `content_gen`) under the staging lock, and an upload commit compares the generations and takes a clean
+  staging out of the map under it (§7.4 7–8); otherwise a write between the two is lost (fsx, M2.9). Access
+  rules (§11) have their own lock, taken before the table lock. No lock is held across `.await` or while calling the
+  Notifier. A staging file is closed only after the map of staged inodes is unlocked: on btrfs, closing a file that
+  was truncated to 0 bytes flushes it and waits for a commit in progress.
+- **SQLite** (WAL): one writer thread owns the write connection. Mutations are sent as batches, with group commit: everything
+  queued when the writer wakes goes into one transaction. The writer never waits for the disk: it commits with
+  `synchronous=NORMAL` and automatic checkpoints are off. Callers that need durability (fsync, fsyncdir, `access set`,
+  inode reservations, staging removal) are acknowledged by a sync thread once it has fsync'd the WAL after their
+  commit, which is what `synchronous=FULL` does. The same thread runs a `PASSIVE` checkpoint once no commit has come for
+  1 s, or after 20 000 writes under steady load: on btrfs a checkpoint slows every file creation in the file system for
+  as long as it runs (600 ms measured after a burst). A passive checkpoint never catches up with a writer that keeps
+  committing, so under steady load the WAL never starts over (14 GB in a few hours of fsx, M2.9). When 64 MiB or more
+  is left in it after a passive checkpoint, the writer runs a `TRUNCATE` checkpoint before its next batch, which
+  copies the rest and empties the file. It runs on the writer's connection because on another one it made writes in
+  the writer's transactions fail with `SQLITE_BUSY` (lost rows); between two batches a failed checkpoint loses
+  nothing. Readers use a separate read connection.
+- **Replies wait for the commit** (D032): a successful reply to a request that changes state (create, mkdir, unlink,
+  rmdir, rename, setattr, open, write, flush, release) is sent only once the batch holding the rows it queued has
+  committed (`synchronous=NORMAL`, no fsync). The fuser thread does not wait: the Reply moves to the writer, which sends
+  it after the commit. A request that queued nothing, or whose rows are already committed, is answered at once; on the
+  hot path only the rows queued by the handler's own thread count. Errors are answered at once.
 - **Kernel notifications** go through a single async notify task (§9.5). They are never sent from a FUSE handler thread, because invalidating
   an inode with a request in flight on the same channel can deadlock.
 
@@ -272,18 +296,22 @@ When a deadline expires, the request replies EIO and logs it. The background fet
 ```
 main
  ├─ tokio multi-thread runtime (workers = num_cpus, max 8)
- │   ├─ store writer task
  │   ├─ sync engine task
  │   ├─ journal executor (upload workers = 4, namespace worker = 1 ordered)
- │   ├─ cache scheduler (download permits: interactive 8, readahead 4, prefetch 2)
+ │   ├─ cache scheduler (block downloads: 5 in total; interactive 5, readahead 2, prefetch 1; D033)
  │   ├─ notify task
  │   ├─ auth task (proactive refresh, needs_login)
  │   └─ control socket server
+ ├─ store writer thread and store sync thread (§4.3)
  └─ fuser BackgroundSession (4 threads, clone_fd)
 ```
 
 `Session::new` performs the handshake and calls `init` (`fuser/session.rs:186`). The notifier is obtained via
 `Session::notifier()` (`fuser/session.rs:493`) before `spawn()`.
+
+Before mounting, the daemon raises its soft open-file limit to the hard limit and grows its descriptor table once, to
+min(hard limit, 65 536). Each staged file holds a descriptor, and each later growth of the table makes every thread that
+opens a file wait for an RCU grace period: 30–80 ms stalls of all FUSE threads at once, measured with 4 writers.
 
 ---
 
@@ -294,18 +322,20 @@ main
 - After a directory has been listed once, every lookup (including negative), getattr, readdir, readdirplus, and statfs is
   answered from RAM. The SQLite store persists the tree, so a remount serves the last known state immediately and catches up in
   the background.
-- **Startup revalidation (D025):** after mounting, every listed directory is listed again in the background (4 at a time,
-  root first). Differences are applied like a listing and reach the kernel through the invalidation queue (§9.5). Until the
-  event engine exists (M3), this is how remote changes made while unmounted become visible.
+- **Catching up after a mount (D034):** the event task resumes the stream from the stored cursor (§9.1), so remote changes
+  made while unmounted arrive as events and reach the kernel through the invalidation queue (§9.5). The listed tree is
+  walked (every listed directory listed again, one at a time, paced as in §5.3 by D027, root first) only when the server
+  asks for a `refresh` or the profile has no cursor (§9.4). This replaced startup revalidation on every mount (D025).
 - **Network guard:** handlers marked hot run inside a `HotPath` scope. Any `Backend` call within that scope increments
   `hot_path_network_calls` and, in debug builds, panics. Tests assert the counter is 0.
 
 ### 5.2 Write-back
 
-- A write is acknowledged after `pwrite` to the staging file and the in-RAM generation bump. Durability comes from fsync or the group commit;
-  uploads are asynchronous (§7).
-- Namespace operations (create, mkdir, rename, unlink, rmdir, setattr) are acknowledged after the in-RAM update and are
-  queued to the store writer.
+- A write is acknowledged after `pwrite` to the staging file and the in-RAM generation bump (and, for the first write
+  that makes a file dirty, the commit of its row). Durability against power loss comes from fsync; uploads are
+  asynchronous (§7).
+- Namespace operations (create, mkdir, rename, unlink, rmdir, setattr) are acknowledged after the in-RAM update and the
+  group commit of their rows, without fsync (§4.3, D032).
 
 ### 5.3 Prefetch and pinning
 
@@ -316,7 +346,7 @@ main
 | Sequential readahead | A per-handle detector prefetches the next 2–4 blocks (8–16 MiB) | readahead permits |
 | Pins (`pdmount pin <path>`) | Every file under the path is downloaded and kept, and new revisions are fetched on UpdateContent | Reported separately from the cache cap |
 
-Speculative API work (listing prefetch, small-file prefetch, startup revalidation) is paced (D027): one request at a time,
+Background API work (listing prefetch, small-file prefetch, the event loop and refresh listings, §9) is paced (D027): one request at a time,
 at most two starts per second, and none while a foreground listing or read is in flight. Proton rate-limits bursts with
 HTTP 429, and the SDK's retry back-off exceeds the 20 s metadata deadline, so unpaced prefetch turns into EIO for users.
 
@@ -361,6 +391,9 @@ invalidation, except access-rule changes (§11.4).
 | `remote` (global, or per glob via `fsync.remote_paths`) | Block until the generation captured at fsync time is uploaded and committed. Upload errors are returned (ENOSPC, EIO) | Workflows that need "on the server when fsync returns" |
 
 - `fsyncdir` commits the store.
+- A crash of the daemon (`kill -9`, panic, OOM kill) loses nothing a request was answered for: replies wait for the store
+  commit (§4.3), and writes to staging files are in the page cache. Only a power loss or kernel crash is limited to what
+  was fsync'd.
 - `flush` (close) never blocks on uploads. It returns any error deferred from a previous upload of that inode (§7.8).
 - `pdmount sync [<path>]` is the explicit remote barrier. It returns when every pending item under the path is uploaded.
 
@@ -385,6 +418,8 @@ These are measured in the daemon from request receipt to reply, on SSD, warm pro
   `hot_path_network_calls`.
 - `pdmount stats` prints them over the control socket. An optional Prometheus textfile is written every 15 s.
 - Tracing spans per FUSE request id, with fields for ino, op, and duration. Slow requests (over 50 ms on the hot path) are logged at WARN.
+- A slow-path request answered EIO is logged at WARN with its operation and cause, since EIO tells the caller nothing.
+  Other failures are logged at DEBUG, except the expected ENOENT, EEXIST and ENOTEMPTY, which are not logged.
 
 ---
 
@@ -423,6 +458,16 @@ transparently. Local corruption is treated as a cache miss, never as a fatal err
 
 - **In-flight dedup:** a `HashMap<BlockKey, Shared<oneshot>>` means readers, readahead, prefetch, and materialization share one download.
 - **Priority classes** with separate permits, in order: interactive read, materialization, upload, readahead, prefetch.
+- **Transfer limits (D033), kept slightly below the official SDKs:**
+  - Downloads: at most 5 blocks in flight over all classes. The C# SDK allows 6 block transfers per direction, shared by
+    all files (`cs/client/cs/src/Proton.Drive.Sdk/ProtonDriveClient.cs:28`, `Nodes/TransferQueue.cs:39-41`); the JS
+    SDK 5 files (`download/queue.ts:17`) with up to 10 blocks each (`download/fileDownloader.ts:22`). Readahead (2) and
+    prefetch (1) together leave interactive reads at least 2.
+  - Uploads: `upload.concurrency` (4) jobs prepare at once, but the SDK sends one file at a time, because PdMount does
+    not set P7's `max_concurrent_file_transfers` (default 1), with up to 6 blocks in flight (the community SDK's fixed
+    default, the same as C#'s). The official limits are 5 files with 5 blocks each and 40 MiB in total (JS,
+    `upload/queue.ts:11,20`, `upload/streamUploader.ts:69`) and 6 files with 6 blocks in total (C#). When P7 is used
+    (M4), files stay below 5 and blocks below 6.
 - **Seeding:** after a successful upload, the snapshot is split into blocks and inserted under the new revision. When git reads a pack it
   just wrote, nothing is downloaded.
 
@@ -437,17 +482,29 @@ return EOF.
 
 ### 7.1 Staging
 
-- One sparse file per inode: `~/.local/share/pdmount/<profile>/staging/<ino>`, directory mode 0700.
-- Per-inode state in the store:
+- One sparse file per inode: `~/.local/share/pdmount/<profile>/staging/<ino>`, directory mode 0700. Its length is always
+  the file's size.
+- A sidecar `staging/<ino>.state` beside it (JSON, replaced atomically) holds:
 
   | Field | Meaning |
   |---|---|
-  | `base_rev` | Remote revision the edits derive from; NULL for new files |
-  | `size` | Current local size |
-  | `materialized` | Bitmap per 4 MiB block |
+  | `base_rev` | Remote revision the edits derive from (the upload precondition); NULL for new files |
+  | `base` | The revision whose content is still partly used, and how many of its bytes (truncation cuts it) |
+  | `materialized` | The 4 MiB blocks of the base already copied into staging |
+
+  The sidecar is replaced before a write that depends on it is acknowledged, so data and bookkeeping agree after a
+  crash of the daemon. Both reach the disk with `fsync` (§5.6). The `staging` table of §13.2 is not used.
+- The generations live in the inode row (§13.2):
+
+  | Field | Meaning |
+  |---|---|
   | `content_gen`, `meta_gen` | Generation counters (u64) |
   | `uploaded_content_gen`, `uploaded_meta_gen` | Generations last confirmed uploaded |
 
+- A staging file is deleted (clean after upload, unlinked and closed, trashed, removed remotely) only after the store rows
+  that stop naming it are committed durably, and not if a write has started a new staging of the inode by then. Otherwise
+  a daemon crash in between leaves a stored row whose content is gone, and the file comes back empty. Removals are
+  collected for 1 s and share one store fsync, because each fsync stalls the commits that replies wait for (§4.3).
 - Staging is plaintext (it is the working copy). The recommended mitigation is full-disk encryption (§17).
 
 ### 7.2 Open, write, truncate
@@ -477,7 +534,9 @@ The job executes against the current local state, not a payload stored at enqueu
 3. Compute SHA-1 (`set_expected_sha1`, `sdk/node/file/upload.rs:117`) and the exact size. The SDK requires the size up front and
    rejects a mismatch at commit with `ContentSizeMismatchIntegrityException` (`sdk/node/revision.rs:667`).
 4. If the SHA-1 equals the remote active revision's SHA-1, adopt the remote revision and skip the upload (§10.3).
-5. Conflict pre-check: `get_nodes([link])`. If `active_rev != base_rev`, run the conflict procedure (§10.4).
+5. Conflict pre-check: `get_nodes([link])`. If `active_rev != base_rev`, run the conflict procedure (§10.4). M2 relies on the
+   server precondition instead: a `RevisionConflict` whose current revision has the snapshot's SHA-1 is adopted (an
+   upload that reached the server before a crash), any other parks the item until the conflict engine (M3).
 6. Upload:
    - Existing node: `upload_revision(link, base_rev, snap, meta)` (`get_file_revision_uploader`, `sdk/client.rs:718`).
    - New node: `upload_new(parent_link, name, snap, meta)` (`get_file_uploader`, `sdk/client.rs:687`).
@@ -488,15 +547,17 @@ The job executes against the current local state, not a payload stored at enqueu
    - Set `uploaded_*_gen = snap_*gen`.
    - **Mark clean only if `content_gen == snap_gen` and `meta_gen == snap_meta_gen`.** Otherwise the inode stays dirty and the job is
      re-queued on the new base.
-8. Seed the block cache from the snapshot (§6.4) and delete the snapshot.
+8. Seed the block cache from the snapshot (§6.4) and delete the snapshot. A clean inode's staging leaves the map of
+   staged inodes in step 7, under its staging lock (§4.3); its files go after the durable commit of step 7 (§7.1).
 
 ### 7.5 Echo suppression
 
-- Revisions uploaded by this instance are recorded from P6's return value in `own_revisions`. An UpdateContent event whose active revision is in
-  `own_revisions` is ignored.
-- Events for an inode in state `uploading` are deferred until the job finishes, then re-evaluated. This closes the window
-  between the server committing and the client learning the revision id.
-- Metadata echoes are ignored when the remote `(parent, name, name_hash)` already equals the local state.
+- The executor records every remote change it makes in the tree's remote state: the revision an upload returns (P6, also
+  kept in `own_revisions`), the new parent and name of a rename, the trash. An event whose node, fetched with `get_nodes`,
+  equals that state (parent, name, active revision) is an echo and changes nothing (§9.3); no listing is made.
+- An event for an inode whose upload is in flight may arrive before the client knows the new revision. It then lists the
+  directory again, and the listing leaves the inode alone: remote state recorded after the listing was fetched wins
+  (`remote_stamp`), and pending content is never replaced (§8.2).
 
 ### 7.6 Atomic-save rename (temp → existing target)
 
@@ -513,7 +574,8 @@ Locally, the rename is always atomic: one in-RAM swap plus one store transaction
 
 - File: `<mountroot>/.pdignore` (synced like any file) plus `~/.config/pdmount/<profile>.pdignore` (local). Gitignore syntax;
   matcher adapted from `pdcli/pdignore.rs`. **The default list is empty.**
-- "Ignored" means **local-only**: content lives in `localonly/<ino>`, survives remounts, and is never uploaded.
+- "Ignored" means **local-only**: content lives in the staging file of the inode (§7.1) with the `local_only` flag set,
+  survives remounts, and is never uploaded. Entries created inside a local-only folder are local-only too.
 - An ignore rule only prevents creating new remote nodes. A remote file renamed to an ignored name keeps syncing.
 - A local-only file renamed to a non-ignored name becomes a normal pending upload. If it is renamed over an existing remote target, it becomes a
   revision of the target (§7.6). pdcli instead trashed the original (`docs/pdcli-evaluation.md` §2 #4).
@@ -525,7 +587,9 @@ Locally, the rename is always atomic: one in-RAM swap plus one store transaction
 - Pre-check in `write`: if pending upload bytes plus quota used (from `storage_info`, cached 60 s) exceed the maximum, return ENOSPC.
 - Remote quota failure during upload (200001, 200002, 200100) parks the job and sets `deferred_error = ENOSPC` on the inode. The next
   `flush`, `fsync`, or `close` on that inode returns it, then clears it. 200003 (file size limit) gives EFBIG.
-- Parked jobs show in `pdmount status` and `pdmount queue list`. `queue retry` re-arms them.
+- Parked jobs show in `pdmount status` (count) and, with paths and reasons, in the `unmount` output; `pdmount queue list`
+  and `queue retry` follow with the queue tooling (M4). Parked state is kept in RAM: a new local change of the inode, or the
+  next mount, retries it.
 
 ---
 
@@ -546,10 +610,21 @@ Locally, the rename is always atomic: one in-RAM swap plus one store transaction
   Trash. Sequences coalesce naturally. For example, create → write → rename → unlink before the first upload produces nothing remotely.
 - **Dependencies are by inode.** A create or move waits until the parent's `link_id` is known. A rename or trash waits until its own
   `link_id` is known. Waiters use per-inode notify; no remote ids are captured at enqueue time.
+- **Listings are merged, not copied:** a node follows its remote placement and attributes only while it has no pending
+  local change of that kind; local nodes the server does not know are kept; a node removed remotely while something below
+  it changed locally is kept and created again (M3 resurrects only the minimal chain, §10).
 - **Name reservation:** before creating or moving a node to `(P, N)` remotely, any remote occupant that the local state has moved or
   deleted is processed first. Cycles (a ↔ b swaps) are broken through a temporary `.pdmount-swap-<ino>` name.
 - **Backoff and parking:** transient errors back off exponentially (1 s → 5 min with jitter). Permanent errors (typed, P8) park
-  the item with a reason. Nothing is retried in a tight loop, and parked items never grow without bound (one row per inode).
+  the item with a reason, at once for quota, size, permission and unsupported errors, after 5 attempts for the others.
+  Nothing is retried in a tight loop, and parked items never grow without bound (one entry per inode).
+- **Where the journal lives:** the entries (schedule, attempts, parked reasons) are in RAM; what is pending is derived from
+  the inode rows at mount (new nodes, tombstones, generations, placements that differ from the remote ones). The `journal`
+  table of §13.2 is not used.
+- **Stale plans:** every local change bumps the entry's generation; a plan made from an older generation does not defer,
+  block or remove the entry, so a change made while the executor plans is never dropped.
+- **Draining:** `unmount` (`--wait` is the default) makes everything eligible at once and waits up to 10 minutes for the
+  queue to empty; what remains continues at the next mount. `reset --keep-login` refuses while changes are pending.
 
 ### 8.3 rename
 
@@ -569,7 +644,7 @@ fuser routes RENAME and RENAME2 to `rename(.., flags)` (`fuser/lib.rs:536`).
 ### 8.4 unlink and rmdir
 
 - `unlink` removes the name. If the inode is open, it becomes an **orphan** (`parent_ino = NULL`). Staging and cache pins are kept until the
-  last release and `nlookup == 0` (forget). A remote node gets a Trash work item; the per-node result map is checked
+  last release and `nlookup == 0` (forget); meanwhile `fstat` reports `nlink` 0. A remote node gets a Trash work item; the per-node result map is checked
   (`sdk/client.rs:1053`). A never-uploaded file cancels its pending work.
 - `rmdir` returns ENOTEMPTY if any child exists, including pending and local-only children. An unlisted directory is listed first, so a directory
   with unknown remote children is never trashed blindly.
@@ -581,9 +656,9 @@ fuser routes RENAME and RENAME2 to `rename(.., flags)` (`fuser/lib.rs:536`).
 |---|---|
 | mode | Stored `& 0o7777`. Sent as XAttr `pdmount.mode` on the next revision |
 | uid / gid | Accepted only when equal to the mounting user; otherwise EPERM |
-| size | Truncate (§7.2) |
+| size | Truncate (§7.2). Through a handle opened for writing (`ftruncate`) the write bit is not checked again |
 | mtime (`TimeOrNow::Now` or a value) | Stored. Sent as `ModificationTime` on the next revision |
-| atime | Local only |
+| atime | Local only (`inodes.atime_ns`); never set (0), it is reported as mtime |
 | ctime | Updated locally on every change |
 
 A mode or mtime change bumps `meta_gen`. On a dirty file it folds into the pending upload. On a clean file it creates a
@@ -623,41 +698,60 @@ directories show their creation time. Scenario R1 therefore uses `--omit-dir-tim
 ### 9.1 Cursor
 
 On first mount, the engine calls `latest_event_id()` (`sdk/client.rs:1110`) and persists the cursor **before** the initial root
-listing, so no change can fall into a gap. The cursor is stored in `event_cursor` and advanced in the same transaction that applies
-each page.
+listing, so no change can fall into a gap. The cursor is stored in `event_cursor`. It is queued to the store after the rows a
+page changed, so a crash never stores it without them, and is not stored at all while a refresh runs (§9.4). Every mount
+resumes the stream from the stored cursor, so changes made while unmounted arrive as events; a profile without a cursor
+refreshes.
 
 ### 9.2 Loop
 
 ```
 loop {
     page = poll_events(cursor)                    // sdk/client.rs:1121
-    if page.refresh { full_reconcile(); continue }
-    tx { apply(page.events); cursor = page.next } // one transaction per page
-    enqueue invalidations
+    if page.refresh { cursor = start_refresh(); continue }   // §9.4, in the background
+    apply(page.events)                            // §9.3; invalidations queued
+    cursor = page.next; store(cursor) unless refreshing
     if page.more { continue }                     // drain immediately
-    sleep(adaptive)                               // 5 s after activity, 15 s normal, 30 s idle
+    sleep(sync.poll_interval)                     // 30 s, as the official clients (D033)
 }
 ```
 
-Errors never end the loop. Retries use exponential backoff with jitter, from 1 s up to 5 min. After 3 consecutive connection failures, the shared state becomes `offline`
-(§9.6).
+Every API call of the loop (poll, `get_nodes`, listings) takes a background turn (D027), so user requests go first.
+
+Errors never end the loop. After a failed poll the next one waits `poll_interval` times 1, 1, 2, 3, 5, 8, 13 (then 13 again,
+6.5 min at 30 s) plus up to 1 s of jitter, as the official event manager does (`cs/client/js/src/internal/events/eventManager.ts:4,132`);
+a 429's `Retry-After` is honoured when longer. A successful poll resets the sequence. After 3 consecutive connection
+failures, the shared state becomes `offline` (§9.6).
 
 ### 9.3 Applying events
 
-Events carry only ids (F12). The engine resolves them in batches with `get_nodes`, and only for links already known or whose parent is a
-listed directory. Events for unlisted subtrees are dropped, because a later listing will fetch fresh state.
+Events carry only ids (F12). Applying a page (D034):
 
-| Event | Clean inode | Dirty / pending inode |
+1. Keep the events whose link the tree knows, or whose parent is a listed directory. Others are dropped: a later listing
+   fetches fresh state.
+2. Resolve those links with `get_nodes`, fresh from the API, 50 links per request as in the official SDKs (F14, D035, P13).
+3. A node whose parent, name and (for files) active revision equal the tree's remote state is an **echo** (§7.5) and needs
+   nothing.
+4. For every other node, list again the listed directories it is in now and was in before (its local parent and the directory
+   of its known remote parent). A directory a node left is listed after the one it moved into, so a node moved between two
+   listed directories keeps its inode and its listed subtree; a cycle (two nodes swapped) is broken in event order.
+
+So remote changes take the same path as listings (`Tree::apply_listing_at`, §8.2), whose rules the property tests check:
+
+| Change (event kind on the real API, M2.10) | Clean inode | Dirty / pending inode (until M3's conflict engine) |
 |---|---|---|
-| Create | Insert. `inval_entry(parent, name)` drops any cached negative dentry | Name collision with a pending create → §10.6 |
-| UpdateMetadata | Diff `(parent, name)` against `remote`. Apply the rename/move locally. `inval_entry` on old and new names; `inval_inode` if mode or mtime changed | Local namespace intent wins. The remote state becomes the new remote base, and the conflict rule (§10.5) applies |
-| UpdateContent | Ignored if the revision is in `own_revisions`. Otherwise update rev/size/mtime/mode and call `inval_inode(ino, 0, 0)` | Mark `remote_newer`, notify the user, keep the local content. Resolved at upload (§10.4) |
-| Delete / `is_trashed` | Remove the subtree. `notifier.delete(parent, ino, name)` (`fuser/notify.rs:102`) | Resurrect (§10.5) |
+| Create (Create) | Inserted. `inval_entry(parent, name)` drops any cached negative dentry | A new remote node with a locally used name is not shown (§10.6 in M3) |
+| Rename, move (UpdateContent) | Applied. `inval_entry` on the old and new names, `inval_inode` on the directories | Local namespace intent wins; the remote state becomes the new remote base |
+| New revision (UpdateMetadata) | Rev, size, mtime and mode updated, the content epoch bumped (no `FOPEN_KEEP_CACHE` at the next open), `inval_inode` | Local content kept; the upload's base-revision precondition parks the conflict (§10.4) |
+| Trash (UpdateContent) | Subtree removed, `notifier.delete(parent, ino, name)` (`fuser/notify.rs:102`) | Kept and uploaded again (resurrection, §10.5) |
 
 ### 9.4 Refresh
 
-When `refresh = true`, the engine keeps serving the current state. It takes a fresh `latest_event_id`, re-enumerates every listed
-directory in the background (bounded concurrency), diffs and applies the results through the same rules as §9.3, then adopts the fresh cursor.
+When `refresh = true`, the engine keeps serving the current state. It takes a fresh `latest_event_id` and follows the event
+stream from it at once, while a background task lists every listed directory again (one at a time, paced, D027) through the same
+rules as §9.3. Only when that pass succeeds is a cursor stored again, so a crash during a refresh finds the old cursor and the
+next mount refreshes again. A refresh asked for while one runs makes it run once more, because listings made before the newer
+cursor may have missed changes. A failed pass is retried after 30 s.
 
 ### 9.5 Kernel invalidation queue
 
@@ -794,16 +888,18 @@ system".
 | `rename` | source parent **and** target parent (and the target entry when replaced) |
 
 - Moving an entry with a rule carries the rule. Moving a subtree out of a `ro` area is denied, because its source parent is `ro`.
-- **Reported attributes:** in `ro` subtrees, `getattr`/`readdirplus` clear the write bits (`& !0o222`). Tools see read-only before they try
-  to write, and `DefaultPermissions` enforces it in the kernel as a second layer. The stored mode is unchanged, so switching back to `rw`
-  restores the exact original mode.
+- **Reported attributes:** in `ro` subtrees, `getattr`/`lookup`/`readdirplus` clear the write bits (`& !0o222`). Tools see read-only
+  before they try to write. The stored mode is unchanged, so switching back to `rw` restores the exact original mode.
+- **Permission checks** are the daemon's, not the kernel's: the mount has no `default_permissions`, which would answer
+  EACCES from the cleared bits before PdMount could answer EROFS (D031). The engine checks the owner bits of the stored mode
+  (read, write, search) and answers `access(2)`; EROFS comes first.
 - **Remote changes keep syncing into `ro` subtrees.** `ro` blocks local writes; it does not freeze synchronization. Conflict handling is
   unchanged.
 
 ### 11.3 Resolution
 
-Each inode memoizes `(effective_mode, deciding_rule, access_version)`. A rule change increments `meta.access_version`, so memoized values
-recompute lazily by walking up parent links (bounded by tree depth). A check is O(1) when memoized.
+A check walks up parent links to the nearest rule (bounded by tree depth); with no rules at all it is O(1). A rule change
+increments `meta.access_version`. Memoizing per inode is an M4 option if profiling shows the walk.
 
 ### 11.4 Changing rules at runtime
 
@@ -963,21 +1059,21 @@ Waiting for sign-in… done. Logged in as <account>.
 | `~/.config/pdmount/<profile>.pdignore` | local ignore rules |
 | `~/.local/share/pdmount/<profile>/state.db` | SQLite store (WAL) |
 | `~/.local/share/pdmount/<profile>/staging/` | staging files and snapshots (0700) |
-| `~/.local/share/pdmount/<profile>/localonly/` | content of ignored files |
+| `~/.local/share/pdmount/<profile>/staging/<ino>.state` | staging sidecar: base revision and materialized blocks (§7.1) |
 | `~/.cache/pdmount/<profile>/blocks/` | encrypted block cache |
 | `~/.local/share/pdmount/<profile>/sdk-secrets.db` | SDK secret cache (encrypted). Losing it forces a new login, so it is not in the cache directory |
 | `~/.local/share/pdmount/<profile>/credentials.json`, `cache.key` | session and cache key in the file modes of §12.4 (0600) |
 | `~/.local/share/pdmount/<profile>/device-id` | device identity (§10.2). Stays a file so `reset --keep-login` keeps it |
 | `~/.cache/pdmount/<profile>/sdk-entities.db` | SDK entity cache (encrypted, rebuildable) |
 | `$XDG_RUNTIME_DIR/pdmount/<profile>.sock` | control socket (0600); `~/.local/share/pdmount/<profile>/control.sock` when the session has no runtime directory |
-| `<control socket>.pid` | process id of the mount daemon, for `unmount --force` |
+| `<control socket>.pid` | process id and mountpoint of the mount daemon, for `unmount --force` and for `status` after a crash |
 | `$XDG_STATE_HOME/pdmount/<profile>.log` | log (rotated) |
 
 ### 13.2 Schema
 
 ```sql
 meta(key TEXT PRIMARY KEY, value BLOB)
-  -- root_link, ino_reserved (inode numbers up to it are handed out; reserved 1024 at a time, durably),
+  -- root_link, ino_reserved (inode numbers up to it are handed out; reserved 16 384 at a time, durably),
   -- access_version, quota_used, quota_max. The schema version is `PRAGMA user_version`.
 
 inodes(ino INTEGER PRIMARY KEY, kind INTEGER, parent_ino INTEGER NULL, name TEXT NULL,
@@ -986,6 +1082,9 @@ inodes(ino INTEGER PRIMARY KEY, kind INTEGER, parent_ino INTEGER NULL, name TEXT
        content_gen INTEGER, meta_gen INTEGER, uploaded_content_gen INTEGER, uploaded_meta_gen INTEGER,
        state INTEGER, remote_newer INTEGER, deferred_error INTEGER NULL)
   -- UNIQUE(parent_ino, name) WHERE parent_ino IS NOT NULL
+  -- mode, mtime_ns, atime_ns (0: never set) and size are the local state; tombstones (deleted = 1) have no parent and name.
+  -- Rows are rewritten in two steps (names and links cleared first), so renames and link adoptions in one batch
+  -- never collide with the unique indexes. Migration 2 fills `mode` of M1 rows from the remote mode or the default.
 
 remote(link_id TEXT PRIMARY KEY, parent_link TEXT, name TEXT, name_hash TEXT, kind INTEGER,
        active_rev TEXT NULL, size INTEGER, mtime_ns INTEGER, mode INTEGER NULL, sha1 BLOB NULL,
@@ -993,10 +1092,11 @@ remote(link_id TEXT PRIMARY KEY, parent_link TEXT, name TEXT, name_hash TEXT, ki
 
 staging(ino INTEGER PRIMARY KEY, base_rev TEXT NULL, size INTEGER, materialized BLOB,
         snap_gen INTEGER NULL, snap_meta_gen INTEGER NULL)
+  -- not used: the staging sidecar holds this (§7.1)
 
 journal(ino INTEGER PRIMARY KEY, kind INTEGER, state INTEGER, attempts INTEGER, next_at INTEGER,
         last_error TEXT NULL, parked_reason TEXT NULL, updated_at INTEGER)
-  -- one row per inode: desired-state reconciliation, not an op log
+  -- not used: the journal is derived from the inode rows at mount (§8.2)
 
 own_revisions(link_id TEXT, rev TEXT, created_at INTEGER, PRIMARY KEY(link_id, rev))
 
@@ -1040,9 +1140,9 @@ placed before the subcommand (`pdmount --profile work status`). The global optio
 |---|---|
 | `login [--browser\|--no-browser]` | Web sign-in (§12.2) |
 | `logout` | Remove the session and keys |
-| `mount [--foreground] [--browser\|--no-browser] [--no-login] [-o ro] [<mountpoint>]` | Start the daemon and mount (mountpoint overrides config). M1: `--foreground` only; the mount is always read-only |
-| `unmount [--wait\|--force] [<mountpoint>]` | `--wait`: drain the queue first (M1: nothing to drain). `--force`: see §14.4 |
-| `status` | Online/offline/needs_login, queue depth, oldest pending, parked items, conflicts, cache use, sign-in link if pending |
+| `mount [--foreground] [--browser\|--no-browser] [--no-login] [-o ro] [--backend proton\|fake:<dir>] [<mountpoint>]` | Start the daemon and mount (mountpoint overrides config). `--backend fake:<dir>` and `pdmount fake seed\|changes\|rename\|trash` exist only in test builds (feature `fake-backend`, §15.1). M2: `--foreground` and `--backend` only; `-o ro` follows |
+| `unmount [--wait\|--force] [<mountpoint>]` | `--wait` (the default): upload what is pending first, up to 10 minutes, and list parked items (§8.2). `--force`: see §14.4 |
+| `status` | Online/offline/needs_login, queue depth, oldest pending, parked items, conflicts, cache use, sign-in link if pending. M2: session, quota, mount, `Queue: N pending, M parked`, inodes, cache |
 | `sync [<path>]` | Remote barrier: wait until everything under `<path>` is uploaded |
 | `access set ro\|rw <path>` / `access unset <path>` / `access list [<path>]` / `access effective <path>` | §11.5 |
 | `pin <path>` / `unpin <path>` | Keep offline (§5.3) |
@@ -1051,6 +1151,7 @@ placed before the subcommand (`pdmount --profile work status`). The global optio
 | `cache stats` / `cache gc [--target <bytes>]` / `cache wipe [<path>]` | Block cache maintenance (pinned and dirty-base blocks are never wiped) |
 | `stats` | Latency histograms and counters (§5.8) |
 | `reset --keep-login` | Rebuild local state (refused while the queue is non-empty) |
+| `trash empty --yes` | Delete everything in the account's trash for good (Proton only; refused while the profile is mounted, since the daemon holds the session). Real-account test runs use it when storage runs low (D036) |
 | `doctor` | Check `/dev/fuse`, fusermount3, `/etc/fuse.conf`, keyring (reachable, default collection locked or not, read without prompting; the effective secret storage mode), clock skew, disk space, SDK and crypto version |
 | `service install\|uninstall` | systemd user unit |
 
@@ -1099,14 +1200,15 @@ JSON-lines request/response over a Unix socket at `$XDG_RUNTIME_DIR/pdmount/<pro
 | Layer | Content |
 |---|---|
 | Unit | Name validation, conflict naming, ignore matcher, errno mapping, block offset math (with and without `BlockSizes`), access resolution |
-| Fake backend | Proton model: name uniqueness (2500), `CurrentRevisionID` and `OriginalHash` preconditions, trash, quota, an event log with `more`/`refresh`, several client handles with independent cursors (one plays the "official app"). Fault injection: latency and bandwidth profiles, 401/429/5xx, offline windows, partial batch failures, crash points. Persistable to a directory, so two daemons can share one fake (`--backend fake:<dir>`, test builds only) |
+| Fake backend | Proton model: name uniqueness (2500), `CurrentRevisionID` and `OriginalHash` preconditions, trash, quota, an event log with `more`/`refresh`, several client handles with independent cursors (one plays the "official app"). Fault injection: latency and bandwidth profiles, 401/429/5xx, offline windows, partial batch failures, crash points. Persistable to a directory, so two daemons can share one fake (`--backend fake:<dir>`, test builds only): `snapshot.json` plus an append-only `journal.jsonl` (one line per change, written before the call returns, so a `kill -9` of the daemon loses nothing), compacted into the snapshot at 8 MiB; an `epoch` file tells other handles to reload. Growth is bounded: the last 16 revisions per file (`PDMOUNT_FAKE_KEEP_REVISIONS`), 1024 trashed nodes, 10 000 events and 50 000 changes are kept; dropped revisions delete their blobs. Changes and events keep absolute sequence numbers across trimming (`pdmount fake changes --after <n>`) |
 | Property (proptest) | Random sequences of create, write, truncate, rename (all flags, over existing, swaps), unlink while open, mkdir, rmdir, setattr, access set/unset, crash/restart, and concurrent mutations from a second fake client. Invariants listed below |
-| Mounted, CI | Local CI script (`scripts/ci.sh`) on the dev machine with fuse3, over the fake backend; hosted CI deferred (D023). pjdfstest subset (open incl. O_EXCL, rename, unlink, mkdir, rmdir, truncate, chmod, utimensat; link/symlink/mknod expected EPERM). fsx with mmap (6 h for the M2 exit check). Every scenario below. fsx, pjdfstest and soak never run against the real account (D030) |
+| Mounted, CI | Local CI script (`scripts/ci.sh`) on the dev machine with fuse3, over the fake backend; hosted CI deferred (D023). Every scenario below. **pjdfstest subset** (`tests/pjdfstest.sh`; pjdfstest built from source at the commit named in `tests/pjdfstest.list`): open (incl. O_EXCL), rename, unlink, mkdir, rmdir, truncate, ftruncate, chmod, utimensat, with the file-type loops cut to regular files and directories; link, symlink, mknod and mkfifo give EPERM by design (§8.7, scenario N1) and are left out. The failures of each test file must equal the list's: cases that need other users (the agent is not root, and without `user_allow_other` only the mounting user reaches the mount, D020), unsupported file types, directory `nlink` 1, and ENOSPC from the quota check (§7.8) for a huge truncate. **fsx** (`tests/fsx.sh`; xfstests' `ltp/fsx.c` built standalone): two instances at once with mapped reads and writes, 256 KiB and 8 MiB files; 6 h for the M2 exit check; without `-c`, which needs root for `drop_caches`. fsx, pjdfstest and soak never run against the real account (D030) |
 | Real account | Two profiles on one machine, each with its own login. Scenario scripts only, under `pdmount-test/` (D028), one run at a time, stopping at the first HTTP 429; datasets kept modest (D030). Manual; long runs only with the user's approval |
 | Soak | Over the fake backend (D030). 24 h: rsync cron, git commit loop, second-client edits, network flaps (`ip link set down`), forced token expiry. Pass: zero EIO outside injected outages, zero parked jobs, stable RSS |
 
 **Property test invariants:**
-- After every step, the local view matches a POSIX model.
+- After every step, the local view matches a POSIX model. Steps include restarts, crashes and another device's changes
+  (write, create, rename, trash) made on the fake at clean points; those arrive through the event stream (§9).
 - After quiescing:
   - the fake tree equals the model: names, bytes, mtime, mode;
   - the journal is empty;
@@ -1148,6 +1250,11 @@ Every script under `tests/scenarios/` takes `VERIFY_MODE`:
 | `fresh` | `reset --keep-login` (empty local state), mount, verify. Everything comes from the API |
 | `second` | A second profile (separate login, separate state) mounts the same account (or the same fake) and verifies |
 
+With `BACKEND=fake`, everything a run writes (fake drive, dataset, mountpoint, work directories, and the test profile's
+state, staging, cache and log through the XDG variables) lives under `SCENARIO_ROOT`, by default the tmpfs
+`/dev/shm/pdmount-tests`, to spare the disks. The test profile gets a small cache (`CACHE_MAX`, default 1 GiB) and the fake
+keeps 4 revisions per file. Real-account runs keep the local dataset copy in `~/.cache/pdmount-scenarios/m1`.
+
 **rsync**
 
 | ID | Steps | Pass condition |
@@ -1184,6 +1291,12 @@ Every script under `tests/scenarios/` takes `VERIFY_MODE`:
 | A5 | Rename the `ro` directory from the second client; delete another ruled directory | Rule follows the rename (`list` shows the new path, `active`); the deleted one shows `orphaned` |
 | A6 | Open a file for writing, write, `access set ro` on its parent, write again, close | Second write → EROFS; the first write's data still uploads (verified on `second`) |
 
+**Event sync** (the fake's CLI is the second client, so `BACKEND=fake` only)
+
+| ID | Steps | Pass condition |
+|---|---|---|
+| E1 | While mounted, another client renames a directory, trashes a file and writes a new revision of a file read before | All three visible without a remount within 75 s (two poll intervals and the pacing); the old names are gone from the kernel's caches and the file reads its new content; the state survives the verify mode |
+
 **Multi-device** (deterministic interleavings via fake injection points; selected cases repeated on two real profiles)
 
 | ID | Interleaving | Pass condition |
@@ -1206,8 +1319,8 @@ Exit criteria are functional tests. A milestone is done when its listed tests pa
 |---|---|---|
 | **M0 Foundations** | Workspace; SDK fork with P1, P2, P4, P8; `Backend` trait and fake; local CI script that builds `gopenpgp-sys` (Go ≥ 1.22, clang, protoc); `login`/`logout`/`status`/`doctor` | `pdmount login` opens the browser **and** `login --no-browser` prints the link; both complete sign-in. `status` shows the account and quota. Fake-backend unit tests pass. `doctor` passes on the Gentoo machine |
 | **M1 Read-only mount** | Inode table, store, listing, block cache (P3), readahead and prefetch, notify queue, `catch_unwind`, deadlines, unmount tooling; writes return EROFS | **R6** and **G6 read side** (clone, fsck) on data uploaded by the official client, in `live` and `fresh` modes. This confirms API size, mtime, and content. sha256 of 5 MB / 41 MB / 2 GB files equals the web download. `hot_path_network_calls == 0`. `kill -9` → `unmount --force` → remount without a reboot |
-| **M2 Writes, single device, access control** | Staging, journal, §7–§8, `fsync=local`, `.pdignore`, quota errors, metadata revisions, P5, P6, P10; access rules (§11) | **R1–R7, G1–G7, N1, A1–A6** pass in `live`, `remount`, `crash`, `fresh` on the fake (CI) and in `live`, `remount`, `fresh` on the real account. pjdfstest subset green and fsx 6 h clean, both on the fake (D030); journal property tests at 10k cases |
-| **M3 Multi-device and sync robustness** | Event engine, refresh, remote rename/move, echo suppression, the full conflict engine, offline mode, auth refresh and `needs_login`, P9, P11, P12; verify server precondition behaviour (§10.4) | **M1–M7** and every R/G/A scenario in `second` mode on two real profiles. Zero data loss. Remote changes visible within 30 s. 24 h soak on the fake passes (D030) |
+| **M2 Writes, single device, access control** | Staging, journal, §7–§8, `fsync=local`, `.pdignore`, quota errors, metadata revisions, P5, P6, P10; access rules (§11); event engine for clean inodes with refresh and echo suppression (§9.1–§9.5, §7.5; D033) | **R1–R7, G1–G7, N1, A1–A6, E1** pass in `live`, `remount`, `crash`, `fresh` on the fake (CI), and all but A5 and E1 (which need a second client) in `live`, `remount`, `fresh` on the real account. pjdfstest subset green and fsx 6 h clean, both on the fake (D030); journal property tests at 10k cases |
+| **M3 Multi-device and sync robustness** | Remote changes to dirty inodes, the full conflict engine, offline mode, auth refresh and `needs_login`, P9, P11, P12; verify server precondition behaviour (§10.4) | **M1–M7** and every R/G/A scenario in `second` mode on two real profiles. Zero data loss. Remote changes visible within `sync.poll_interval` + 10 s, 40 s at the default (D037). 24 h soak on the fake passes (D030) |
 | **M4 Performance and operations** | SLO instrumentation, benchmarks, P7 parallel uploads, pins, writeback-cache experiment, `cache gc`, queue tooling, systemd unit, documentation | §5.7 SLOs met. Over the fake backend with an 80 ms RTT / 20 MB/s profile: `git status` on warm git.git ≤ 2× local btrfs; untar of 5k small files ≤ 3× local (time to acknowledgement); cached sequential read ≥ 500 MB/s; `cache gc` holds the cap ±5 % |
 | **M5 Upstream and crypto migration** | Upstream patches; track Proton's new crypto model; rebase the fork | Fork diff reduced to unmerged patches; migration plan documented; full matrix re-run |
 
@@ -1294,9 +1407,7 @@ negative_ttl = "10s"
 writeback_cache = false
 
 [sync]
-poll_active = "5s"
-poll_normal = "15s"
-poll_idle = "30s"
+poll_interval = "30s"           # event polling; at least 30s, the official clients' interval (D033)
 
 [timeouts]
 metadata = "20s"

@@ -53,12 +53,21 @@ Rules for this log:
 | D022 | SDK fork hosted in a local bare repo | accepted | user | 2026-10-19 |
 | D023 | GitHub use postponed until further notice | accepted | user | 2026-10-19 |
 | D024 | Keyring calls time out after 20 s and fall back to 0600 files | superseded by D029 | claude | 2026-10-19 |
-| D025 | Startup revalidation of listed directories until the event engine exists | accepted | claude | 2026-10-19 |
+| D025 | Startup revalidation of listed directories until the event engine exists | superseded by D034 | claude | 2026-10-19 |
 | D026 | The mount daemon re-executes itself instead of forking | accepted | claude | 2026-10-19 |
 | D027 | Speculative API work is paced and yields to user requests | accepted | claude | 2026-10-19 |
 | D028 | Real-account tests write only under `pdmount-test/` | accepted | user | 2026-10-19 |
 | D029 | Secrets in files only with `--allow-file-secrets` or `--force-file-secrets` | accepted | user | 2026-10-20 |
 | D030 | Stress and conformance tests only on the fake; a load budget for real-account runs | accepted | user | 2026-10-20 |
+| D031 | Permission checks in the daemon, not `default_permissions` | accepted | claude | 2026-10-20 |
+| D032 | Replies wait for the store commit, so a daemon crash loses nothing acknowledged | accepted | user | 2026-10-20 |
+| D033 | Follow the official SDK's operational requirements: 5 block downloads, event-based sync before real-account runs | accepted | user | 2026-10-20 |
+| D034 | Events are applied by listing the affected listed directories again | accepted | claude | 2026-10-20 |
+| D035 | The Proton adapter fetches event nodes fresh, bypassing the SDK's entity cache | accepted | claude | 2026-10-20 |
+| D036 | Agents may empty the real account's trash when storage runs low during real-account tests | accepted | user | 2026-10-21 |
+| D037 | Visibility SLO for remote changes: `sync.poll_interval` + 10 s | accepted | user | 2026-10-22 |
+| D038 | Fork patch P14: rename/move with a caller-supplied original name hash | accepted | user | 2026-10-22 |
+| D039 | M3 is implemented task by task from `docs/plans/m3.md`, one commit per task | accepted | user | 2026-10-22 |
 
 ---
 
@@ -346,7 +355,7 @@ Rules for this log:
   - `doctor` reports a locked keyring as OK, because its probe reads an entry that does not exist and so needs no unlock.
 
 ## D025 — Startup revalidation of listed directories until the event engine exists
-- **Status:** accepted
+- **Status:** superseded by D034 (2026-10-20): mounts resume the event stream; the listed tree is walked only for a refresh
 - **Decided by:** claude
 - **Date:** 2026-10-19
 - **Context:** M1 serves the stored tree immediately after a remount (§5.1), but the event engine that keeps it current is
@@ -466,3 +475,253 @@ Rules for this log:
 - **Consequences:** The real API is exercised only by the scenario scripts. Rate-limit behaviour under load is learned
   from short, deliberate runs (Q7), not from stress tools.
 - **Refs:** DESIGN.md §15.1, §15.3, §16; TODO.md M2.8, M2.9, Q7; AGENTS.md.
+
+## D031 — Permission checks in the daemon, not `default_permissions`
+- **Status:** accepted
+- **Decided by:** claude
+- **Date:** 2026-10-20
+- **Context:** §11.2 asked for two things at once: denied writes in `ro` subtrees return EROFS (D019), and `getattr`
+  clears the write bits there with `default_permissions` enforcing them in the kernel. With `default_permissions`, the
+  kernel checks the cleared bits itself and answers EACCES ("Permission denied") before PdMount sees the request, so
+  `rsync` and `git` never report "Read-only file system". Found while writing scenario A1.
+- **Decision:** Mount without `default_permissions`. The engine checks permissions itself, from the owner bits of
+  the stored (unmasked) mode: read for opening to read and for `opendir`; write for opening to write and for
+  truncation; write and search on a directory to change its entries; search for lookups; write on a directory moved
+  to another parent. Only the mounting user reaches the mount (no `allow_other`, D020), so the owner bits are the ones
+  that apply. EROFS for `ro` subtrees comes first, as on a read-only file system. `access(2)` is answered the same way.
+- **Alternatives:**
+  - Keep `default_permissions` and give up the cleared write bits: tools no longer see read-only before they try.
+  - Keep both and accept EACCES: contradicts D019.
+- **Consequences:** The daemon carries POSIX permission semantics for the owner. M2.9's pjdfstest subset checks them.
+- **Refs:** DESIGN.md §11.2; crates/pdmount-core/src/engine.rs (`ensure_allowed`); D019. Accepted by user 2026-10-20.
+
+## D032 — Replies wait for the store commit, so a daemon crash loses nothing acknowledged
+- **Status:** accepted
+- **Decided by:** user
+- **Date:** 2026-10-20
+- **Context:** Scenario G5 in `crash` mode lost git's last checkout steps (the `index.lock` → `index` rename, the HEAD
+  update). The daemon had answered those requests, but their store rows were still queued when `kill -9` came, and git
+  does not fsync them. §5.6 promised only fsync'd data across a crash, so this was allowed, but a daemon crash (bug, OOM
+  kill) is far more likely than a power loss, and it left repositories half switched. TODO.md Q9 offered (a) fsync in the
+  scenarios before the kill, or (b) commit the store before replying. The user chose (b), to be measured against the
+  §5.7 SLOs.
+- **Decision:**
+  - A successful reply to a request that changes state (create, mkdir, unlink, rmdir, rename, setattr, open, write,
+    flush, release) is sent once the store batch holding its rows has committed with `synchronous=NORMAL` (written to the
+    WAL, no fsync). The fuser thread hands the Reply to the store writer and goes on; requests that queued nothing are
+    answered at once. A crash of the daemon then loses nothing the kernel was told. A power loss still loses what was
+    not fsync'd.
+  - The writer never waits for the disk. A sync thread acknowledges durable writes after fsyncing the WAL (what
+    `synchronous=FULL` did at commit), and checkpoints when the store is idle for 1 s or after 20 000 writes.
+  - Staging removals are batched for 1 s to share one fsync.
+- **Alternatives:**
+  - (a) fsync before the kill in the scenarios: no hot-path cost, but real daemon crashes keep losing acknowledged
+    renames.
+  - Blocking the fuser thread until the commit: same guarantee, but 4 threads would serialize on the writer.
+  - `synchronous=FULL` per reply: a fsync per namespace operation, several ms on SSD.
+- **Consequences:**
+  - Measured 2026-10-20 with `scripts/bench/latency.sh` (Python client timing 8 operations per iteration, fake backend
+    on tmpfs, daemon state on the btrfs SATA SSD or on tmpfs; 1 client × 2000 iterations and 4 × 1000), p99 in µs,
+    baseline (replies not deferred) → D032: btrfs 1 client create 84 → 214–285, other namespace ops 25 → 141–259, write 21 → 54–58; btrfs 4
+    clients create 149 → 300–321, others 49 → 251–317, write 39 → 210–218; tmpfs 4 clients create 119 → 303, others
+    76 → 262, write 63 → 210. Every case is within §5.7 (namespace < 2 ms, write < 1 ms); the maximum stayed ≤ 1.7 ms.
+  - Getting there exposed three older stalls that hit every case, baseline included, and were fixed with it: the
+    descriptor table growing under load (§4.4), staging files closed under the staged-map lock while btrfs flushed them,
+    and inode reservations running out (now 16 384 at a time). Before D032's sync thread, a reply could also wait behind
+    a `synchronous=FULL` batch: btrfs create p99 was 12 ms.
+  - Proptests' `kill()` (store flushed first) now models the mount exactly.
+  - RQ6 reworded by the user (2026-10-20) to match: acknowledged writes survive a daemon crash; fsync'd writes also
+    survive a power loss.
+- **Refs:** DESIGN.md §4.3, §4.4, §5.2, §5.6, §7.1; crates/pdmount-core/src/store/mod.rs (`Store::after`, `Syncer`);
+  crates/pdmount-fuse/src/lib.rs (`PdFs::committed`); TODO.md Q9.
+
+## D033 — Follow the official SDK's operational requirements: 5 block downloads, event-based sync before real-account runs
+- **Status:** accepted
+- **Decided by:** user
+- **Date:** 2026-10-20
+- **Context:** The official SDK's "Operational requirements" (`cs/README.md`) exist to "protect service availability",
+  and PdMount must not put it at risk. They apply to clients that call the API without the official SDK, which PdMount
+  does through the community SDK: they must match its caching, event-based sync, parallelism limits and exponential
+  backoff. A review found:
+  - Honest `x-pm-appversion`, official endpoints, the third-party notice, caching and backoff are met (P12's retry with
+    `Retry-After` and a 60 s stop after repeated 429s; the journal's per-item backoff; paced background work, D027).
+  - Block downloads could run 14 at a time (interactive 8, readahead 4, prefetch 2). The official SDKs limit transfers at
+    two levels. C#: 6 files and 6 block transfers in total per direction (`cs/client/cs/src/Proton.Drive.Sdk/
+    ProtonDriveClient.cs:28`, `Nodes/TransferQueue.cs:39-41`). JS: downloads 5 files with up to 10 blocks each
+    (`download/queue.ts:17`, `download/fileDownloader.ts:22`); uploads 5 files with up to 5 blocks each and 40 MiB of
+    expected size in total (`upload/queue.ts:11,20`, `upload/streamUploader.ts:69`).
+  - There is no event-based sync yet (M3). Startup revalidation (D025) walks the listed tree on every mount, which the
+    requirements forbid when frequent, and the real-account scenario matrix mounts about 60 times.
+  - The planned event loop (§9.2: 5 s after activity, 15 s normal, 30 s idle) would poll more often than the official
+    clients: 30 s for the own volume in the foreground, 10 min in the background, retries backing off by the interval
+    times 1, 1, 2, 3, 5, 8, 13 (`cs/client/js/src/internal/events/eventScheduler.ts:1-2`, `eventManager.ts:4,132`).
+- **Decision:**
+  - Transfer limits stay slightly below the official SDKs (the user's choice): at most 5 block downloads in flight over
+    all priorities, one below C#'s 6, with readahead 2 and prefetch 1 within them so interactive reads keep at least 2.
+    Uploads go one file at a time with up to 6 blocks (the community SDK's fixed default, the same as C#); when P7's
+    file limit is used (M4), files stay below 5 and blocks below 6.
+  - Event-based sync is brought forward from M3 (TODO.md M2.10) and done before the real-account matrix. Once a stored
+    cursor resumes the event stream at mount, startup revalidation (D025) runs only for a `refresh` (§9.4).
+  - The event loop polls like the official clients: every 30 s, immediately again while `more` is set, retries at 30 s
+    times 1, 1, 2, 3, 5, 8, 13 with jitter.
+  - No switches or test-only settings that bypass these rules (proposed and dropped: turning revalidation off and
+    lowering upload concurrency for test profiles).
+- **Alternatives:** Config switches for test runs (rejected by the user: the product would still walk the tree on
+  every mount). Keep 14 downloads and wait for 429s: the rules ask for the SDK's limits.
+- **Consequences:**
+  - Cold reads of many blocks are capped at 5 in flight; large sequential reads get less readahead.
+  - Uploads already go out one file at a time: PdMount never sets P7's `max_concurrent_file_transfers`, so the SDK's
+    default of 1 applies whatever `upload.concurrency` (4) says. Its 6 block uploads equal C#'s limit rather than staying
+    below it; `ProtonDriveClient::new` cannot change that, so lowering it needs the SDK's lower-level constructor (M4,
+    with P7).
+  - The real-account matrix waits for M2.10. Remote changes become visible while mounted (within about 30 s), which
+    M3's exit criterion asks for anyway.
+- **Refs:** DESIGN.md §4.4, §5.1, §6.4, §9; crates/pdmount-core/src/cache.rs (`DOWNLOADS`); D025, D027, D030; TODO.md M2.10.
+
+## D034 — Events are applied by listing the affected listed directories again
+- **Status:** accepted
+- **Decided by:** claude
+- **Date:** 2026-10-20
+- **Context:** D033 brings event-based sync (§9) forward. Events carry only ids. DESIGN §9.3 planned to fetch each node
+  with `get_nodes` and apply it to the tree directly, with its own rules per event kind and inode state. The tree already
+  has one reconciliation for remote state, `Tree::apply_listing_at`, which handles moves between directories, pending local
+  changes (placement, content, mode and mtime), stale data (`remote_stamp`), own trashes, name collisions and resurrection,
+  and which the journal property tests have hardened (four bugs found and fixed there). A second rule set for events would
+  have to reproduce all of it.
+- **Decision:**
+  - Resolve the links of a page with batched `get_nodes`, only for links the tree knows or whose parent is listed.
+  - Skip echoes: nodes whose parent, name and active revision equal the tree's remote state. The executor records every
+    remote change it makes there, so the client's own changes cost no listing.
+  - For the rest, list again each listed directory the node is in now and was in before, a directory a node left after the
+    one it entered (so moves keep inodes and listed subtrees).
+  - Mounts resume from the stored cursor, so startup revalidation (D025) is gone. A `refresh` lists every listed directory
+    in the background while events keep flowing from the fresh cursor; the cursor is stored again only after that pass
+    succeeds.
+- **Alternatives:**
+  - Per-node application (§9.3's plan): fewer API calls when a busy directory changes often, but a second set of rules.
+  - Refresh in the foreground of the event loop (the first version): simple, but a refresh of a large tree, paced at two
+    listings a second, stopped every remote change from showing for minutes (seen in the scenario matrix: 499
+    directories, 4.3 min).
+- **Consequences:**
+  - A real remote change costs one `get_nodes` per page and one listing per touched directory, at most once per poll
+    (30 s) and paced (D027). A directory with many children that changes remotely at every poll costs a full listing each
+    time; per-node application can replace this later if M4 measures it as a problem.
+  - Tested by event tests on the fake (every kind, moves, echoes, local changes, pages, cursor durability, refresh with
+    events during it), by the property tests with another device's changes, and by scenario E1.
+  - The property tests found two bugs on the way, both fixed: a staging file left over from an upload revived old content
+    after a crash once the remote revision had moved on; and that fix at first dropped staging of files written after an
+    upload, because stored rows do not say `Content::Staged` (the generations decide).
+- **Refs:** DESIGN.md §5.1, §7.5, §9.1–§9.4, §15.1, §15.3 (E1), §16; crates/pdmount-core/src/events.rs; D025, D027, D033.
+  Accepted by user 2026-10-20.
+
+## D035 — The Proton adapter fetches event nodes fresh, bypassing the SDK's entity cache
+- **Status:** accepted
+  Accepted by user 2026-10-21 (as amended: batched, P13).
+- **Decided by:** claude
+- **Date:** 2026-10-20
+- **Context:** The real-account check of M2.10 showed `get_nodes` returning a file's previous revision a few seconds after
+  PdMount committed a new one. The adapter used the SDK's `enumerate_nodes`, which answers from the SDK's entity cache;
+  revision commits and other devices' changes do not update that cache (DESIGN F14). Own revisions therefore cost a
+  listing each (not recognized as echoes), and, worse, another device's change to a node in that cache would match the
+  tree's stale remote state and be skipped as an echo. The fake has no such cache, so the tests could not show it.
+- **Decision:** `get_nodes` calls the fork's `get_nodes_uncached` (P13, amended 2026-10-21): it evicts the links' cache
+  entries and fetches them again from the API with one `get_details` request per 50 links, one batch after the other, as
+  the C# SDK's batch loader does (the JS SDK sends up to 100). The fresh nodes also refresh the cache for later SDK calls.
+- **Amendment (2026-10-21):** the first version called `get_node_uncached` once per link: one request per node, 437
+  during the calibration slice, most of them for our own creations. A check against the official SDK's operational
+  requirements (`cs/README.md:38-47`: caching, event-based sync, parallelism limits, backoff) found no rule broken (the
+  calls follow events, run one at a time and go through P12's backoff; evicting an entry an event names is what the JS
+  SDK does, which marks it stale, `cs/client/js/src/internal/nodes/events.ts:31-46`), but the requirement to match the
+  SDK's safety guarantees covers request volume, and both official SDKs batch these requests. The user asked for the
+  batched patch before the real-account matrix.
+- **Alternatives:**
+  - `get_node_uncached` per link (the first version): correct, but one request per node.
+  - `NodeBatchLoader` (50 links per call): it decrypts with the parent folder key from the secret cache (degraded when
+    that is missing) and leaves the stale cache entries in place for later SDK calls.
+  - Fetch lazily, when a node is next read, as the JS SDK does: a mount must know at once whether a change touches its
+    tree.
+  - Keep `enumerate_nodes`: misses other devices' changes.
+- **Consequences:**
+  - One API request per 50 changed nodes that the tree knows or that are in a listed directory, per page (30 s).
+  - Not yet measured on the real account: the batched requests have only offline tests in the fork; the real-account
+    matrix exercises them.
+  - Verified on the real account: an overwrite's event is an echo again (no listing). Event kinds seen there: Create for
+    new nodes, UpdateMetadata for a new revision, UpdateContent for a rename and for a trash (DESIGN §9.3).
+  - The journal's conflict check (`same_content`) reads fresh state as well.
+- **Refs:** DESIGN.md F14, §9.3; docs/sdk-patches.md P13; crates/pdmount-backend/src/proton.rs (`get_nodes`); D033, D034.
+
+## D036 — Agents may empty the real account's trash when storage runs low during real-account tests
+- **Status:** accepted
+- **Decided by:** user
+- **Date:** 2026-10-21
+- **Context:** Every real-account scenario run deletes the previous run's area under `pdmount-test/`, and deleted nodes
+  go to the trash, which presumably counts against the quota (the dataset about
+  2.3 GiB). The full real-account matrix (60 runs) may fill it. Emptying the trash is account-wide, outside what D028
+  allows.
+- **Decision:** An exception to D028: during real-account tests, agents may empty the account's whole trash when storage
+  is low: less than 1 GiB free before a run, or a run failed because the quota was full. Nothing else changes: writes
+  stay under `pdmount-test/`, `pdmount-m1/` stays read-only.
+- **Alternatives:** Delete from the trash only nodes that came from `pdmount-test/` (safer for other trashed items, but
+  needs their origin; not asked for). Stop the matrix and ask the user each time.
+- **Consequences:**
+  - Anything else in the account's trash is deleted for good as well.
+  - `pdmount trash empty --yes` (DESIGN.md §14.2) calls the SDK's `empty_trash`; it is refused while the profile is
+    mounted. `tests/scenarios/run-all.sh` checks `pdmount status` before each real-account run and, below
+    `TRASH_MIN_FREE` (1 GiB), unmounts and empties the trash. A run that fails on the quota stops the matrix
+    (`STOP_ON=fail`); the agent empties the trash by hand then.
+  - Each emptying is printed in the matrix output, with the storage before and after.
+- **Refs:** D028, D030; TODO.md (M2.8 real-account matrix).
+
+## D037 — Visibility SLO for remote changes: `sync.poll_interval` + 10 s
+- **Status:** accepted
+- **Decided by:** user
+- **Date:** 2026-10-22
+- **Context:** DESIGN.md §16 asked for remote changes to be visible within 30 s for M3. D033 fixes the event poll
+  interval at a minimum of 30 s, as the official clients do, so the worst case is 30 s plus the `get_nodes` fetch, the
+  listings and the D027 pacing: a hard 30 s bound cannot be met without polling faster than the official clients.
+- **Decision:** The M3 exit criterion becomes "remote changes visible within `sync.poll_interval` + 10 s" (40 s at the
+  default). D033 stays unchanged.
+- **Alternatives:** A median of 30 s with a maximum of 45 s (needs many samples per run). A hard 30 s (needs polling
+  below 30 s, against D033).
+- **Consequences:** Every `second`-mode scenario run measures the delay with a marker file and fails above the bound
+  (docs/plans/m3.md M3.18). E1's limit (75 s) is tightened to 40 s in M3.18. A conflicting file that stays open for
+  writing surfaces only at close or at `upload.max_dirty_age`; the SLO covers visibility, not that case.
+- **Refs:** DESIGN.md §9.2, §16; D033; docs/plans/m3.md M3.18.
+
+## D038 — Fork patch P14: rename/move with a caller-supplied original name hash
+- **Status:** accepted
+- **Decided by:** user
+- **Date:** 2026-10-22
+- **Context:** Rename/rename detection (DESIGN.md §10.5) relies on the server's `OriginalHash` precondition. The SDK's
+  `rename_node`/`move_node` compute that hash from the SDK's entity cache, which is often stale (F14, D035), and the
+  Proton adapter cannot pass the hash it knows: `convert_node` leaves `name_hash` empty and `rename` ignores `expected`.
+  So the precondition protects nothing on the real account, and a stale cache can even reject our own renames.
+- **Decision:** A new fork patch P14 lets the caller supply the original name hash to `rename_node`/`move_node` and
+  exposes a decoded node's name hash. The adapter fills `RemoteState.name_hash` from fresh node fetches and passes it.
+  Each rename also gets a fresh pre-check (`get_nodes`) before it is sent.
+- **Alternatives:** A pre-check only, without an SDK change: leaves a race window, as with trash, and keeps the stale
+  cache hash in the request.
+- **Consequences:** One more fork patch to carry and upstream later (D023). One extra `get_nodes` per rename or move.
+  Whether the server enforces `OriginalHash` at all is verified in M3.1 (TODO.md Q1, Q6); if it does not, only the
+  pre-check remains and DESIGN.md §17 gets a "rename race" risk.
+- **Refs:** DESIGN.md §10.4, §10.5; docs/sdk-patches.md (P14, added in M3.1); TODO.md Q1, Q6; docs/plans/m3.md M3.1,
+  M3.11, M3.12.
+
+## D039 — M3 is implemented task by task from `docs/plans/m3.md`, one commit per task
+- **Status:** accepted
+- **Decided by:** user
+- **Date:** 2026-10-22
+- **Context:** The user plans M3 with Opus, has Sonnet implement it over several sessions, and reviews the result with
+  Opus. The plan must therefore be detailed and self-contained, and the review needs small, separable changes.
+- **Decision:**
+  - The M3 task specifications live in `docs/plans/m3.md`; status and checkboxes stay in TODO.md.
+  - Each implementing session does one task. It commits after `scripts/ci.sh` passes, one commit per task, message
+    `M3.n: <title>`, never pushes. This is an exception to AGENTS.md's "commit only when the user asks" for M3.
+  - Deviations from the plan are recorded in the commit body and in TODO.md Handoff notes.
+  - M3.1 (the P14 patch and the Q1/Q6 check on the real API) and M3.21 (exit check) are done by Opus; real-account
+    runs stay user-gated (D030).
+  - The M3.0 commit is tagged `m3-start`, so the final review can diff `m3-start..HEAD`.
+- **Alternatives:** Leave changes uncommitted until the user reviews them (one large diff to review).
+- **Consequences:** The plan's decisions D040–D043 are created as `proposed` by the tasks that implement them, for the
+  user's review.
+- **Refs:** docs/plans/m3.md; AGENTS.md (Git); TODO.md (M3 tasks).

@@ -200,20 +200,22 @@ impl Default for KernelConfig {
     }
 }
 
+/// The official clients poll their own volume every 30 s
+/// (`cs/client/js/src/internal/events/eventScheduler.ts:1`).
+const MIN_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SyncConfig {
-    pub poll_active: HumanDuration,
-    pub poll_normal: HumanDuration,
-    pub poll_idle: HumanDuration,
+    /// Event polling interval; never below the official clients' 30 s
+    /// (D033).
+    pub poll_interval: HumanDuration,
 }
 
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
-            poll_active: HumanDuration(Duration::from_secs(5)),
-            poll_normal: HumanDuration(Duration::from_secs(15)),
-            poll_idle: HumanDuration(Duration::from_secs(30)),
+            poll_interval: HumanDuration(MIN_POLL_INTERVAL),
         }
     }
 }
@@ -285,6 +287,9 @@ impl Config {
     fn validate(&self) -> Result<(), String> {
         if self.upload.concurrency == 0 {
             return Err("upload.concurrency must be at least 1".into());
+        }
+        if self.sync.poll_interval.0 < MIN_POLL_INTERVAL {
+            return Err("sync.poll_interval must be at least 30s".into());
         }
         if self.device.name.as_deref().is_some_and(|name| {
             name.trim().is_empty() || name.contains(['/', '(', ')']) || name.len() > 64
@@ -373,7 +378,7 @@ remote_paths = ["/important/**"]
 writeback_cache = true
 
 [sync]
-poll_idle = "1m"
+poll_interval = "1m"
 
 [timeouts]
 metadata = "30s"
@@ -403,7 +408,7 @@ metadata = "30s"
         );
         assert_eq!(config.fsync.mode, FsyncMode::Remote);
         assert!(config.kernel.writeback_cache);
-        assert_eq!(config.sync.poll_idle.0, Duration::from_secs(60));
+        assert_eq!(config.sync.poll_interval.0, Duration::from_secs(60));
         assert_eq!(config.timeouts.metadata.0, Duration::from_secs(30));
     }
 
@@ -423,6 +428,10 @@ metadata = "30s"
         ));
         assert!(matches!(
             parse("[upload]\nconcurrency = 0"),
+            Err(ConfigError::Invalid { .. })
+        ));
+        assert!(matches!(
+            parse("[sync]\npoll_interval = \"5s\""),
             Err(ConfigError::Invalid { .. })
         ));
         assert!(matches!(

@@ -14,13 +14,31 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     Ping,
     Status,
     Stats,
+    /// Upload everything pending, then answer (`unmount --wait`).
+    Drain {
+        timeout_secs: u64,
+    },
     Unmount,
+    /// Access rules (DESIGN.md §11.5); paths are relative to the mount root.
+    AccessSet {
+        path: String,
+        mode: pdmount_core::config::AccessMode,
+    },
+    AccessUnset {
+        path: String,
+    },
+    AccessList {
+        path: Option<String>,
+    },
+    AccessEffective {
+        path: String,
+    },
 }
 
 pub type Handler =

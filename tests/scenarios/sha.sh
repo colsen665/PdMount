@@ -4,11 +4,15 @@
 source "$(dirname "$0")/lib.sh"
 ensure_dataset
 prepare_mount
+require_m1
+verify_cycle
 
 step "sha256 [$VERIFY_MODE]"
 (cd "$REMOTE" && time sha256sum --quiet -c "$LOCAL/MANIFEST.sha256") || fail "checksum mismatch"
 echo "all $(wc -l <"$LOCAL/MANIFEST.sha256") files match"
 for file in big/5MiB.bin big/41MiB.bin big/2GiB.bin; do
+    # The fake's dataset has no 2 GiB file (--no-big).
+    [[ -e "$LOCAL/$file" ]] || continue
     local_size=$(stat -c %s "$LOCAL/$file")
     remote_size=$(stat -c %s "$REMOTE/$file")
     [[ "$local_size" == "$remote_size" ]] || fail "$file: size $remote_size, expected $local_size"

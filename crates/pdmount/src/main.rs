@@ -1,5 +1,6 @@
 //! `pdmount` command-line interface (DESIGN.md §14).
 
+mod access;
 mod control;
 mod credentials;
 mod daemon;
@@ -7,6 +8,7 @@ mod doctor;
 mod mounts;
 mod session;
 mod status;
+mod trash;
 
 use clap::{Args, Parser, Subcommand};
 use pdmount_core::config::BrowserMode;
@@ -45,7 +47,7 @@ enum Command {
     Logout,
     /// Show session, account, storage, device and mount.
     Status,
-    /// Mount My Files (read-only in this version) and run in the background.
+    /// Mount My Files and run in the background.
     Mount(MountArgs),
     /// Unmount.
     Unmount(UnmountArgs),
@@ -55,6 +57,107 @@ enum Command {
     Reset(ResetArgs),
     /// Check FUSE, keyring, login, disk space and clock.
     Doctor,
+    /// Read-only and read-write rules per path (while mounted).
+    #[command(subcommand)]
+    Access(AccessCommand),
+    /// The account's trash (Proton only, while not mounted).
+    #[command(subcommand)]
+    Trash(TrashCommand),
+    /// Test builds: manage a persisted fake drive (DESIGN.md §15.1).
+    #[cfg(feature = "fake-backend")]
+    #[command(subcommand)]
+    Fake(FakeCommand),
+}
+
+#[cfg(feature = "fake-backend")]
+#[derive(Debug, Subcommand)]
+enum FakeCommand {
+    /// Copy a local directory tree into the root of the fake drive.
+    Seed {
+        /// Local directory to copy.
+        #[arg(long)]
+        from: std::path::PathBuf,
+        /// The fake drive's directory (created if missing).
+        dir: std::path::PathBuf,
+    },
+    /// Print the changes the fake drive keeps, one per line, numbered.
+    Changes {
+        /// Only changes numbered above this.
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+        /// The fake drive's directory.
+        dir: std::path::PathBuf,
+    },
+    /// Rename or move a node as another client would (`/a/b` paths).
+    Rename {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+        dir: std::path::PathBuf,
+    },
+    /// Move a node to the trash as another client would.
+    Trash {
+        #[arg(long)]
+        path: String,
+        dir: std::path::PathBuf,
+    },
+    /// Upload a local file as a new revision of a file, as another client
+    /// would (its mode is kept).
+    Write {
+        #[arg(long)]
+        path: String,
+        #[arg(long)]
+        from: std::path::PathBuf,
+        dir: std::path::PathBuf,
+    },
+}
+
+/// The link of `/a/b` on a fake drive.
+#[cfg(feature = "fake-backend")]
+async fn fake_resolve(
+    fake: &pdmount_backend::fake::FakeBackend,
+    path: &str,
+) -> anyhow::Result<pdmount_backend::LinkId> {
+    use pdmount_backend::Backend;
+    let mut link = fake.root().await?.link_id;
+    for part in path.split('/').filter(|p| !p.is_empty()) {
+        link = fake
+            .list_children(&link)
+            .await?
+            .into_iter()
+            .find(|child| child.name == part)
+            .map(|child| child.link_id)
+            .ok_or_else(|| anyhow::anyhow!("{path} not found on the fake drive"))?;
+    }
+    Ok(link)
+}
+
+#[derive(Debug, Subcommand)]
+enum AccessCommand {
+    /// Set `ro` or `rw` on a path and everything below it.
+    Set {
+        #[arg(value_parser = access::parse_mode)]
+        mode: pdmount_core::config::AccessMode,
+        /// Absolute inside the mountpoint, or relative to the mount root.
+        path: std::path::PathBuf,
+    },
+    /// Remove the rule on a path (also an orphaned one).
+    Unset { path: std::path::PathBuf },
+    /// Show all rules, or those at or below a path.
+    List { path: Option<std::path::PathBuf> },
+    /// Show the mode of a path and the rule that decides it.
+    Effective { path: std::path::PathBuf },
+}
+
+#[derive(Debug, Subcommand)]
+enum TrashCommand {
+    /// Delete everything in the trash for good, account-wide.
+    Empty {
+        /// Required: the deletion cannot be undone.
+        #[arg(long, required = true)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -72,13 +175,17 @@ struct MountArgs {
     /// Stay in the foreground (used by the background launcher and services).
     #[arg(long)]
     foreground: bool,
+    /// Storage backend: `proton`, or `fake:<dir>` in test builds.
+    #[arg(long, default_value = "proton", value_parser = daemon::BackendChoice::parse,
+          hide = !cfg!(feature = "fake-backend"))]
+    backend: daemon::BackendChoice,
     /// Mountpoint; default: `mountpoint` from the config (~/ProtonDrive).
     mountpoint: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Args)]
 struct UnmountArgs {
-    /// Wait for pending uploads first (the default; nothing is pending in a read-only mount).
+    /// Wait for pending uploads first (the default).
     #[arg(long, conflicts_with = "force")]
     wait: bool,
     /// Detach the mount even if it is busy or the daemon hangs, and stop the daemon.
@@ -125,6 +232,80 @@ fn init_logging(verbose: u8) {
         // The daemon's stderr is its log file: no color codes there.
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .init();
+}
+
+#[cfg(feature = "fake-backend")]
+async fn fake_command(command: FakeCommand) -> anyhow::Result<ExitCode> {
+    use pdmount_backend::Backend;
+    use pdmount_backend::fake::{FakeBackend, FakeChange};
+    match command {
+        FakeCommand::Seed { from, dir } => {
+            let fake = FakeBackend::open(&dir)?;
+            let root = fake.root().await?.link_id;
+            fake.import_dir(&from, &root).await?;
+            println!(
+                "Copied {} into the fake drive {}.",
+                from.display(),
+                dir.display()
+            );
+        }
+        FakeCommand::Rename { from, to, dir } => {
+            let fake = FakeBackend::open(&dir)?;
+            let node = fake_resolve(&fake, &from).await?;
+            let (parent, name) = to.rsplit_once('/').unwrap_or(("", to.as_str()));
+            let parent = fake_resolve(&fake, parent).await?;
+            fake.rename(&node, Some(&parent), name, None).await?;
+        }
+        FakeCommand::Trash { path, dir } => {
+            let fake = FakeBackend::open(&dir)?;
+            let node = fake_resolve(&fake, &path).await?;
+            for result in fake.trash(&[node]).await? {
+                result?;
+            }
+        }
+        FakeCommand::Write { path, from, dir } => {
+            let fake = FakeBackend::open(&dir)?;
+            let link = fake_resolve(&fake, &path).await?;
+            let node = fake
+                .get_nodes(std::slice::from_ref(&link))
+                .await?
+                .pop()
+                .flatten()
+                .ok_or_else(|| anyhow::anyhow!("{path} not found"))?;
+            let base = node
+                .active_revision
+                .ok_or_else(|| anyhow::anyhow!("{path} is not a file"))?;
+            let data = anyhow::Context::with_context(std::fs::read(&from), || {
+                format!("cannot read {}", from.display())
+            })?;
+            let meta = pdmount_backend::FileMeta {
+                mtime: std::time::SystemTime::now(),
+                mode: node.mode,
+                media_type: "application/octet-stream".into(),
+                sha1: None,
+            };
+            let source = pdmount_backend::UploadSource::Bytes(data.into());
+            fake.upload_revision(&link, &base, source, meta).await?;
+        }
+        FakeCommand::Changes { after, dir } => {
+            for (seq, change) in FakeBackend::open(&dir)?.changes_since(after) {
+                match change {
+                    FakeChange::CreatedFile { link, name } => {
+                        println!("{seq} created-file {link} {name}")
+                    }
+                    FakeChange::CreatedFolder { link, name } => {
+                        println!("{seq} created-folder {link} {name}")
+                    }
+                    FakeChange::NewRevision { link, revision } => {
+                        println!("{seq} revision {link} {revision}")
+                    }
+                    FakeChange::Renamed { link, name } => println!("{seq} renamed {link} {name}"),
+                    FakeChange::Trashed { link } => println!("{seq} trashed {link}"),
+                }
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn home_dir() -> anyhow::Result<std::path::PathBuf> {
@@ -181,20 +362,46 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let config = Config::load(&paths.config_file())?;
             let mountpoint = daemon::mountpoint(&config, &home_dir()?, args.mountpoint);
             if args.foreground {
-                daemon::run_foreground(&paths, &config, &mountpoint).await
+                daemon::run_foreground(&paths, &config, &mountpoint, &args.backend).await
             } else {
-                daemon::mount_background(&paths, &mountpoint, cli.verbose).await
+                daemon::mount_background(&paths, &mountpoint, &args.backend, cli.verbose).await
             }
         }
         Command::Unmount(args) => {
             let config = Config::load(&paths.config_file())?;
-            let mountpoint = daemon::mountpoint(&config, &home_dir()?, args.mountpoint);
+            let mountpoint =
+                daemon::existing_mountpoint(&paths, &config, &home_dir()?, args.mountpoint);
             daemon::unmount(&paths, &mountpoint, args.force).await
         }
         Command::Stats => daemon::stats(&paths).await,
         Command::Reset(_) => {
             let config = Config::load(&paths.config_file())?;
-            daemon::reset(&paths, &config.mountpoint(&home_dir()?)).await
+            let mountpoint = daemon::existing_mountpoint(&paths, &config, &home_dir()?, None);
+            daemon::reset(&paths, &mountpoint).await
+        }
+        #[cfg(feature = "fake-backend")]
+        Command::Fake(command) => fake_command(command).await,
+        Command::Trash(TrashCommand::Empty { .. }) => {
+            let config = Config::load(&paths.config_file())?;
+            trash::empty(&paths, &config).await
+        }
+        Command::Access(command) => {
+            let config = Config::load(&paths.config_file())?;
+            let mountpoint = daemon::existing_mountpoint(&paths, &config, &home_dir()?, None);
+            let relative = |path: &std::path::Path| access::mount_relative(path, &mountpoint);
+            match command {
+                AccessCommand::Set { mode, path } => {
+                    access::set(&paths, relative(&path)?, mode).await
+                }
+                AccessCommand::Unset { path } => access::unset(&paths, relative(&path)?).await,
+                AccessCommand::List { path } => {
+                    let path = path.map(|p| relative(&p)).transpose()?;
+                    access::list(&paths, path).await
+                }
+                AccessCommand::Effective { path } => {
+                    access::effective(&paths, relative(&path)?).await
+                }
+            }
         }
         Command::Doctor => {
             let checks = doctor::run(&paths).await;
@@ -268,6 +475,17 @@ mod tests {
                 .profile,
             Profile::default()
         );
+    }
+
+    #[test]
+    fn trash_empty_requires_yes() {
+        assert!(Cli::try_parse_from(["pdmount", "trash", "empty"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["pdmount", "trash", "empty", "--yes"])
+                .expect("parse")
+                .command,
+            Command::Trash(TrashCommand::Empty { yes: true })
+        ));
     }
 
     #[test]
