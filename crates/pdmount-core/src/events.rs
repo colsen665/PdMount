@@ -22,6 +22,7 @@
 
 use crate::engine::{Engine, MY_FILES_VOLUME};
 use crate::errors::{CoreError, Result};
+use crate::health::Connectivity;
 use crate::metrics::check_not_hot;
 use crate::store::Store;
 use crate::vfs::Ino;
@@ -36,7 +37,7 @@ use std::time::Duration;
 const BACKOFF_STEPS: [u32; 7] = [1, 1, 2, 3, 5, 8, 13];
 const JITTER: Duration = Duration::from_secs(1);
 /// Links resolved per `get_nodes` call.
-const NODE_BATCH: usize = 100;
+pub(crate) const NODE_BATCH: usize = 100;
 /// Wait before listing again after a failed refresh.
 const REFRESH_RETRY: Duration = Duration::from_secs(30);
 
@@ -45,6 +46,16 @@ const REFRESH_RETRY: Duration = Duration::from_secs(30);
 pub(crate) struct RefreshState {
     running: bool,
     again: bool,
+}
+
+/// Stores the cursor of My Files.
+pub(crate) fn write_cursor(conn: &rusqlite::Connection, cursor: &EventId) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO event_cursor(volume, event_id, updated_at)
+         VALUES (?1, ?2, strftime('%s','now'))",
+        (MY_FILES_VOLUME, cursor.as_str()),
+    )
+    .map(drop)
 }
 
 /// The stored cursor of My Files; `None` before the first mount recorded one.
@@ -99,10 +110,16 @@ impl Engine {
         let interval = self.config.sync.poll_interval.0;
         let mut failures = 0;
         loop {
+            // After a lost connection the first poll comes at once.
+            self.health.wait_online().await;
             let delay = match self.sync_events().await {
                 Ok(()) => {
                     failures = 0;
                     interval
+                }
+                Err(_) if self.health.state() != Connectivity::Online => {
+                    failures = 0;
+                    continue;
                 }
                 Err(error) => {
                     let delay = backoff(interval, failures, &error);
@@ -188,6 +205,7 @@ impl Engine {
             if let Err(error) = self.revalidate().await {
                 tracing::warn!(%error, "refresh incomplete; listing again later");
                 tokio::time::sleep(REFRESH_RETRY).await;
+                self.health.wait_online().await;
                 continue;
             }
             // Refreshes start only under the cursor lock (`sync_events`),
@@ -209,15 +227,8 @@ impl Engine {
     }
 
     fn store_cursor(&self, cursor: &EventId) {
-        let cursor = cursor.as_str().to_owned();
-        self.store.write(move |conn| {
-            conn.execute(
-                "INSERT OR REPLACE INTO event_cursor(volume, event_id, updated_at)
-                 VALUES (?1, ?2, strftime('%s','now'))",
-                (MY_FILES_VOLUME, &cursor),
-            )
-            .map(drop)
-        });
+        let cursor = cursor.clone();
+        self.store.write(move |conn| write_cursor(conn, &cursor));
     }
 
     /// Lists again the listed directories that a page of events changes.
@@ -309,10 +320,39 @@ impl Engine {
         for dir in dirs {
             let _turn = self.gate.background().await;
             match self.list(dir).await {
-                // Removed by an earlier listing of this page.
-                Ok(()) | Err(CoreError::NotFound) => {}
+                // Removed by an earlier listing of this page, or trashed on
+                // the drive (the server no longer lists a trashed folder).
+                // The pass below deals with what the folder held locally.
+                Ok(()) | Err(CoreError::NotFound | CoreError::Backend(BackendError::NotFound)) => {}
                 Err(error) => return Err(error),
             }
+        }
+        // Removed nodes with local changes. The listings above found those
+        // in a listed folder; this also catches nodes moved locally out of
+        // the removed node's remote parent (children of a trashed folder are
+        // not reported trashed themselves, so no listing shows them gone).
+        let gone: Vec<Ino> = {
+            let tree = self.tree.read();
+            let mut gone_links = HashSet::new();
+            let mut inos = Vec::new();
+            for (link, node) in links.iter().zip(&nodes) {
+                if node.as_ref().is_some_and(|node| !node.trashed) {
+                    continue;
+                }
+                gone_links.insert(link.clone());
+                if let Some(ino) = tree.by_link(link)
+                    && tree.subtree_has_pending(ino)
+                {
+                    inos.push(ino);
+                }
+            }
+            if !gone_links.is_empty() {
+                inos.extend(tree.pending_under_remote(&gone_links));
+            }
+            inos
+        };
+        if !gone.is_empty() {
+            self.resolve_vanished(gone).await?;
         }
         Ok(())
     }

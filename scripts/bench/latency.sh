@@ -35,13 +35,16 @@ mkdir -p "$MNT"
 mount_now >/dev/null
 area=$MNT/pdmount-test/bench-$$
 out=$(mktemp -d)
+trap 'rm -rf "$out"' EXIT
 mkdir -p "$area"
+pids=()
 for i in $(seq 1 "$clients"); do
     python3 -I "$here/ops.py" "$area/c$i" "$iterations" "$out/$i.json" &
+    pids+=($!)
 done
-wait
+# A failed client would leave the report short of its samples.
+for pid in "${pids[@]}"; do wait "$pid" || fail "a benchmark client failed"; done
 python3 -I "$here/report.py" "${clients}x$iterations" "$out"/*.json
-rm -rf "$out"
 wait_queue_empty >/dev/null
 rm -rf "$area"
 wait_queue_empty >/dev/null

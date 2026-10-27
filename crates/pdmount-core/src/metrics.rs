@@ -41,6 +41,9 @@ counters! {
     cache_evictions,
     /// Disk-cache entries that failed authentication and were dropped.
     cache_corrupt,
+    /// Block buffers taken from the heap because the pool had no slot free
+    /// (§6.2).
+    cache_pool_fallbacks,
     /// Blocks fetched by readahead or prefetch.
     prefetched_blocks,
     /// Slow-path requests answered EIO because their deadline expired.

@@ -18,7 +18,7 @@ pub enum RuleSource {
 }
 
 impl RuleSource {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Cli => "cli",
             Self::Config => "config",
@@ -59,12 +59,11 @@ pub fn mode_str(mode: AccessMode) -> &'static str {
     }
 }
 
-fn parse_mode(value: &str) -> AccessMode {
-    if value == "ro" {
-        AccessMode::Ro
-    } else {
-        AccessMode::Rw
-    }
+/// The inverse of [`mode_str`].
+pub fn parse_mode(value: &str) -> Option<AccessMode> {
+    [AccessMode::Ro, AccessMode::Rw]
+        .into_iter()
+        .find(|mode| mode_str(*mode) == value)
 }
 
 impl Rules {
@@ -80,7 +79,8 @@ impl Rules {
                         ino,
                         link: row.get(1)?,
                         path_at_set: row.get(2)?,
-                        mode: parse_mode(&row.get::<_, String>(3)?),
+                        // The table allows only ro and rw.
+                        mode: parse_mode(&row.get::<_, String>(3)?).unwrap_or(AccessMode::Rw),
                         source: if row.get::<_, String>(4)? == "config" {
                             RuleSource::Config
                         } else {

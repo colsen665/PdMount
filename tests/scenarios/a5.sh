@@ -8,7 +8,7 @@
 source "$(dirname "$0")/lib.sh"
 source "$(dirname "$0")/access-lib.sh"
 [[ $BACKEND == fake ]] || { echo "A5 needs a second client; skipped for BACKEND=$BACKEND"; exit 0; }
-[[ $VERIFY_MODE != fresh ]] || { echo "A5: rules are local state; nothing to check in fresh mode"; exit 0; }
+[[ $VERIFY_MODE != fresh && $VERIFY_MODE != second ]] || { echo "A5: rules are local state; nothing to check in $VERIFY_MODE mode"; exit 0; }
 prepare_mount
 scenario_area a5
 mkdir -p "$area/keep" "$area/gone"

@@ -2,11 +2,12 @@
 //! running daemon. Paths are absolute inside the mountpoint, or relative to
 //! the mount root; the path is the last argument (D009).
 
-use crate::control::{self, Request};
+use crate::control::{self, AccessListReply, Request};
 use anyhow::{Context, bail};
 use pdmount_core::ProfilePaths;
+use pdmount_core::access::mode_str;
 use pdmount_core::config::AccessMode;
-use serde_json::Value;
+use serde::de::DeserializeOwned;
 use std::path::{Component, Path};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -15,11 +16,8 @@ use std::time::Duration;
 const ACCESS_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub fn parse_mode(value: &str) -> Result<AccessMode, String> {
-    match value {
-        "ro" => Ok(AccessMode::Ro),
-        "rw" => Ok(AccessMode::Rw),
-        _ => Err(format!("expected ro or rw, got {value:?}")),
-    }
+    pdmount_core::access::parse_mode(value)
+        .ok_or_else(|| format!("expected ro or rw, got {value:?}"))
 }
 
 /// `path` as the daemon expects it: `/a/b` below the mount root.
@@ -54,23 +52,12 @@ pub fn mount_relative(path: &Path, mountpoint: &Path) -> anyhow::Result<String> 
     Ok(format!("/{}", parts.join("/")))
 }
 
-async fn ask(paths: &ProfilePaths, request: Request) -> anyhow::Result<Value> {
-    let reply = control::call(&paths.control_socket(), request, ACCESS_TIMEOUT)
-        .await?
-        .with_context(|| {
-            format!(
-                "profile {} is not mounted; access rules are changed through the running daemon",
-                paths.profile
-            )
-        })?;
-    if reply["ok"] != true {
-        bail!("{}", reply["error"].as_str().unwrap_or("unknown error"));
-    }
-    Ok(reply)
+async fn ask<T: DeserializeOwned>(paths: &ProfilePaths, request: Request) -> anyhow::Result<T> {
+    control::ask(paths, request, ACCESS_TIMEOUT, "access rules are changed").await
 }
 
 pub async fn set(paths: &ProfilePaths, path: String, mode: AccessMode) -> anyhow::Result<ExitCode> {
-    let reply = ask(
+    let reply: control::AccessSetReply = ask(
         paths,
         Request::AccessSet {
             path: path.clone(),
@@ -78,8 +65,8 @@ pub async fn set(paths: &ProfilePaths, path: String, mode: AccessMode) -> anyhow
         },
     )
     .await?;
-    let pending = reply["pending"].as_u64().unwrap_or(0);
-    println!("{} {path}", pdmount_core::access::mode_str(mode));
+    let pending = reply.pending;
+    println!("{} {path}", mode_str(mode));
     if mode == AccessMode::Ro && pending > 0 {
         println!("{pending} pending changes in it were accepted before and still upload.");
     }
@@ -87,7 +74,7 @@ pub async fn set(paths: &ProfilePaths, path: String, mode: AccessMode) -> anyhow
 }
 
 pub async fn unset(paths: &ProfilePaths, path: String) -> anyhow::Result<ExitCode> {
-    ask(paths, Request::AccessUnset { path: path.clone() }).await?;
+    let _: control::Done = ask(paths, Request::AccessUnset { path: path.clone() }).await?;
     println!("removed the rule on {path}");
     Ok(ExitCode::SUCCESS)
 }
@@ -99,35 +86,36 @@ pub async fn list(paths: &ProfilePaths, path: Option<String>) -> anyhow::Result<
 }
 
 pub async fn effective(paths: &ProfilePaths, path: String) -> anyhow::Result<ExitCode> {
-    let reply = ask(paths, Request::AccessEffective { path }).await?;
-    let mode = reply["mode"].as_str().unwrap_or("?");
-    match reply["rule"].as_str() {
+    let reply: control::AccessEffectiveReply =
+        ask(paths, Request::AccessEffective { path }).await?;
+    let mode = mode_str(reply.mode);
+    match reply.rule {
         Some(rule) => println!("{mode}  (rule: {rule})"),
         None => println!("{mode}  (default)"),
     }
     Ok(ExitCode::SUCCESS)
 }
 
-fn format_list(reply: &Value) -> String {
+fn format_list(reply: &AccessListReply) -> String {
     let mut out = format!(
         "{:<5} {:<25} {:<25} {:<7} STATUS\n",
         "MODE", "PATH", "SET AS", "SOURCE"
     );
-    for rule in reply["rules"].as_array().into_iter().flatten() {
-        let path = rule["path"].as_str();
+    for rule in &reply.rules {
         out.push_str(&format!(
             "{:<5} {:<25} {:<25} {:<7} {}\n",
-            rule["mode"].as_str().unwrap_or("?"),
-            path.unwrap_or("-"),
-            rule["set_as"].as_str().unwrap_or("?"),
-            rule["source"].as_str().unwrap_or("?"),
-            if path.is_some() { "active" } else { "orphaned" }
+            mode_str(rule.mode),
+            rule.path.as_deref().unwrap_or("-"),
+            rule.set_as,
+            rule.source,
+            if rule.path.is_some() {
+                "active"
+            } else {
+                "orphaned"
+            }
         ));
     }
-    out.push_str(&format!(
-        "(default: {})",
-        reply["default"].as_str().unwrap_or("rw")
-    ));
+    out.push_str(&format!("(default: {})", mode_str(reply.default)));
     out
 }
 
@@ -156,13 +144,19 @@ mod tests {
 
     #[test]
     fn the_list_shows_orphaned_rules_and_the_default() {
-        let reply = serde_json::json!({
-            "default": "rw",
-            "rules": [
-                { "mode": "ro", "path": "/Archive", "set_as": "/Archive", "source": "cli" },
-                { "mode": "ro", "path": null, "set_as": "/Scratch/tmp", "source": "cli" },
+        let rule = |path: Option<&str>, set_as: &str| control::RuleReply {
+            mode: AccessMode::Ro,
+            path: path.map(str::to_owned),
+            set_as: set_as.to_owned(),
+            source: "cli".to_owned(),
+        };
+        let reply = AccessListReply {
+            default: AccessMode::Rw,
+            rules: vec![
+                rule(Some("/Archive"), "/Archive"),
+                rule(None, "/Scratch/tmp"),
             ],
-        });
+        };
         let text = format_list(&reply);
         assert!(text.contains("ro    /Archive"));
         assert!(text.contains("-                         /Scratch/tmp"));

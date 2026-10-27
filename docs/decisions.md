@@ -68,6 +68,22 @@ Rules for this log:
 | D037 | Visibility SLO for remote changes: `sync.poll_interval` + 10 s | accepted | user | 2026-10-22 |
 | D038 | Fork patch P14: rename/move with a caller-supplied original name hash | accepted | user | 2026-10-22 |
 | D039 | M3 is implemented task by task from `docs/plans/m3.md`, one commit per task | accepted | user | 2026-10-22 |
+| D040 | Conflict engine rules: layers, lazy name clashes, minimal-chain resurrection, listing-time rename/rename | accepted | claude | 2026-10-22 |
+| D041 | Connectivity state machine: one shared failure count, a probe, fast-failing reads, offline mount | accepted | claude | 2026-10-22 |
+| D042 | `needs_login` keeps the daemon up; the daemon runs the web login; `notify-send` notifications | accepted | claude | 2026-10-22 |
+| D043 | No revision post-check: a version restore that lands during our upload is overwritten | accepted | user | 2026-10-22 |
+| D044 | Fork patch P15: read the trash time of v2 link details | accepted | user | 2026-10-22 |
+| D045 | Conflicts are resolved through the namespace operations; xattrs come from RAM | accepted | claude | 2026-10-22 |
+| D046 | Fixes from the two-device property test: trashed folders, freed clash names, renames into deleted folders | accepted | claude | 2026-10-22 |
+| D047 | Two-device scenarios: the marker SLO scales with the number of change pages; catch-up barriers; the fake daemon ends `needs_login` | accepted | claude | 2026-10-22 |
+| D048 | The M3 soak runs 3 h instead of 24 h; the risk is accepted | accepted | user | 2026-10-23 |
+| D049 | RAM cache at working-set size; block memory reserved at startup in a pool, used by the RAM cache, `seed` and reads | accepted | user | 2026-10-24 |
+| D050 | The visibility SLO (D037) is timed from the writer's commit, not its local write | accepted | user | 2026-10-25 |
+| D051 | M3 exit: the M scenarios run on the real account only where no fault injection is needed | accepted | user | 2026-10-25 |
+| D052 | A folder that loses its name to a remote rename keeps only its pending items | accepted | claude | 2026-10-25 |
+| D053 | keep-remote is refused for a local-only conflict copy | accepted | user | 2026-10-26 |
+| D054 | A listing request is answered by a listing that started after it | accepted | user | 2026-10-26 |
+| D055 | A yielded name is recorded before the listing; open conflicts with a missing other copy relist their folder at start | accepted | user | 2026-10-26 |
 
 ---
 
@@ -725,3 +741,454 @@ Rules for this log:
 - **Consequences:** The plan's decisions D040–D043 are created as `proposed` by the tasks that implement them, for the
   user's review.
 - **Refs:** docs/plans/m3.md; AGENTS.md (Git); TODO.md (M3 tasks).
+
+## D040 — Conflict engine rules: layers, lazy name clashes, minimal-chain resurrection, listing-time rename/rename
+- **Status:** accepted
+  Accepted by user 2026-10-26.
+- **Decided by:** claude
+- **Date:** 2026-10-22
+- **Context:** M3 replaces the M2 stopgaps (a remote delete resurrected the whole subtree, rename conflicts retried until
+  local intent won, a remote node on a locally used name was hidden for good) with the policy of DESIGN.md §10.5. The
+  plan (docs/plans/m3.md) fixes the rules; M3.8 implements the listing side, M3.9–M3.11 the upload and namespace side
+  (this entry is extended by them).
+- **Decision (listing side, M3.8):**
+  - **Detection compares revisions and placements, never event kinds.** The listing is the one place remote changes
+    meet local state (`Tree::apply_listing_at`), so events, refreshes and plain listings behave alike.
+  - **Layer 1:** a listing that shows another revision for a file with unuploaded content sets `remote_newer`
+    (persisted) and sends a notice with id 0 (not registered yet; the upload registers the conflict).
+  - **Remote delete, local change:** the listing only reports the node as `vanished`. The engine asks the server
+    (`get_nodes` for the node and its remote parents up to the root: a child of a trashed folder is not reported trashed
+    itself) and resurrects the *minimal chain* (pending items plus the folders that lead to them) below the highest removed
+    ancestor that holds the node locally. A node that only moved follows at the listing of its new folder. A clean local
+    rename loses against the remote delete (`RemoteDeleteLocalRename`).
+  - **Local delete, remote edit:** a tombstone whose remote file shows another revision is unbound; the link returns as a
+    new inode (`LocalDeleteRemoteEdit`, state open). The tombstone is not trashed.
+  - **Rename/rename:** the first committer wins. A node with a pending local rename whose remote placement changed too
+    follows the remote (`RenameRename`); the executor never gets to retry the local name.
+  - **Name clashes are lazy.** A remote node whose name a local node holds is not shown, and the local node is reported as
+    a clash, so identical content never yields (D016). The exception is a `.pdignore`d (`local_only`) occupant, which
+    gives way at once (`NameTaken`). A remote rename onto a used name detaches a clean node (it returns when the name is
+    free) and turns a node with local changes into a new local node.
+  - Conflict kinds and their initial states are those of `conflicts.rs` (`ConflictKind::initial_state`).
+- **Decision (upload side, M3.9):**
+  - **The pre-check runs before the snapshot** (one `get_nodes`, no materialization in the common case). The base is the
+    staging's `base_rev`, else the node's remote revision, because a listing may have advanced the node's remote state
+    while the staging still builds on the old revision.
+  - **A metadata-only race is not a conflict:** a node whose only pending changes are mode or mtime adopts another
+    client's new content (`readopt_remote_content`) and uploads its metadata revision on top. This is what makes official-app
+    edits (M7) safe: they carry no mode and often no SHA-1.
+  - **Identical content never conflicts** (D016), also when the remote revision claims no SHA-1: files of at most 16 MiB
+    (`IDENTICAL_PROBE_MAX`) with the same size are compared by reading the remote revision. Above that limit without a
+    claimed SHA-1 a conflict copy is made.
+  - **Edit/edit** (`split_edit_conflict`): the dirty inode keeps its inode number, open descriptors and content under the
+    conflict name and uploads as a new file; the server's version becomes a new inode at the original name. The staging's
+    `base_rev` is cleared.
+  - **A known conflict is settled promptly:** `remote_newer` bypasses the upload debounce (not an open writer).
+  - **Layer 3:** `RevisionConflict` with the node still at the base revision is another client's open draft (retry); any
+    other fresh revision takes the same decision as the pre-check. `NotFound` means the file is gone.
+  - **Commit guard:** an upload whose node is unbound meanwhile is not recorded and plans again (`UploadError::Replan`),
+    so the content survives as a new file.
+  - **Emptied trash:** content that exists only in a trashed revision that is gone parks with "content only in the emptied
+    trash" instead of retrying.
+- **Decision (create/create, M3.10):**
+  - **One resolver for files and folders** (`name_clash` in `journal.rs`), called when `upload_new` or `create_folder`
+    answers `AlreadyExists`. It replaces the crash-adoption check (same SHA-1 only), which is the "identical file" row
+    now and therefore also covers a holder that claims no SHA-1.
+  - **Identical files bind, they do not yield** (D016): the node takes the remote file's link and the staging builds on its
+    revision; the next plan finds nothing to upload except a differing mode or mtime. Folders always merge.
+  - **Everything else yields at the executor:** the local node takes its conflict name before the remote node is shown, so
+    the first committer keeps the name (§10.5). The parent is listed in the same step; a failing listing is retried, the
+    conflict is recorded either way.
+  - **A parent that vanished** during the create (`NotFound`) goes through `resolve_vanished`, like a vanished file.
+- **Decision (namespace executor, M3.11):**
+  - **Every rename or move looks at the node first** (`get_nodes`, fresh) and carries the hash just read as its
+    precondition; a stale hash plan (`expected` of the plan) is only a fallback when the backend reports no hash. Local
+    intent no longer wins: a node the remote moved or renamed meanwhile follows the remote placement (`RenameRename`);
+    when it cannot follow, the local placement is kept and pushed. Only the placement and hash of the remote state are
+    refreshed, never its content fields, so a newer revision is still found by the upload pre-check (same reason as
+    `with_content_of`, M3.9).
+  - **`InvalidMove`** keeps the server's placement (`MoveCycle`) and parks when the inode cannot follow. **`AlreadyExists`**
+    on a rename makes our node yield (`NameTaken`), the same helper as create/create (`yield_to_remote`).
+  - **Trash looks first, per batch** (one `get_nodes`): a file with another active revision, or marked `remote_newer`,
+    is kept (`LocalDeleteRemoteEdit`); a folder is listed uncached and kept when it holds a child unknown to the tree or
+    a child file that changed (`LocalDeleteRemoteChildren`, detail = the count); a child that is attached elsewhere
+    (moved out locally, not yet remotely) makes the folder wait with a transient error. Child folders that are
+    tombstones count as unchanged (their own entries look at them): a remote child added below a deleted grandchild folder
+    can still go to the trash with it, recoverably.
+  - **Kept nodes come back through a listing** the executor awaits (not spawned) so the conflict record can name the new
+    inode (`other_ino`).
+- **Alternatives:** Resurrect whole subtrees (M2): uploads clean files again and may recreate folders the user deleted
+  elsewhere. Resolve at upload time only: leaves the tree showing a state the server no longer has until the upload.
+- **Consequences:** A listing may now start a `get_nodes` round (`resolve_vanished`) after applying. Nodes flagged
+  `vanished` keep their old remote state until it is resolved, so a failed resolution is retried by the next listing.
+- **Refs:** DESIGN.md §9.3, §10.5; docs/plans/m3.md M3.8; `vfs.rs` `apply_listing_at`, `engine.rs` `resolve_vanished`.
+
+## D043 — No revision post-check: a version restore that lands during our upload is overwritten
+- **Status:** accepted
+- **Decided by:** user
+- **Date:** 2026-10-22
+- **Context:** The M3.1 probe (docs/plans/m3.md, "M3.1 outcomes") found that the server checks `CurrentRevisionID` only
+  when a revision draft is created, not at commit. Revision drafts are exclusive per file: while one client's draft is
+  open, another client's draft creation is refused (HTTP 409, code 2500, `Details.ConflictDraftClientUID`), so two
+  clients' uploads cannot interleave. A version restore by another client (an asynchronous operation, answered with code
+  1002) did land while our draft was open, and our commit then replaced it; the restored revision stayed in the history.
+  The plan's branch B for this case was a post-check (M3.13): list the file's revisions after each commit and keep any
+  foreign revision between the base and ours as a conflict copy.
+- **Decision:** No post-check; M3.13 is skipped. The restore race is recorded as a DESIGN.md §17 risk.
+- **Alternatives:** M3.13 as planned: one more API call (the revision list) per upload, to catch a race that needs a
+  restore of the same file during the seconds of an upload.
+- **Consequences:** A restore made on another device during our upload of the same file is silently superseded by our
+  revision; it can be restored again from the history. Layer 3 of §10.4 is the draft refusal (`RevisionConflict`).
+- **Refs:** DESIGN.md §10.4, §17; TODO.md Q1, Q6; docs/plans/m3.md (M3.1 outcomes, M3.13).
+
+## D044 — Fork patch P15: read the trash time of v2 link details
+- **Status:** accepted
+- **Decided by:** user
+- **Date:** 2026-10-22
+- **Context:** The M3.1 probe found that `get_nodes` reports a just-trashed node as not trashed, also a minute later.
+  The SDK fills its link DTO from `POST v2/volumes/{id}/links`, whose `LinkDto` names the trash timestamp `TrashTime`
+  (`cs/client/js/src/internal/apiService/driveTypes.ts`); the SDK reads `Trashed`, the v1 name, so `trash_time` is always
+  empty. Consequence in PdMount: an event for a node trashed on another device looked like an echo of a known node
+  (`Tree::knows_remote`) and was ignored.
+- **Decision:** Fork patch P15 reads `TrashTime` and keeps `Trashed` as an alias. Pinned in PdMount.
+- **Alternatives:** Work around it in the adapter (e.g. treat `State == 2` as trashed): the SDK does not expose the
+  state, and the fix belongs in the DTO.
+- **Consequences:** Behaviour change for SDK callers: trashed nodes now report their trash time (docs/sdk-patches.md,
+  Behaviour changes). Remote trashes reach PdMount through events as designed (§9.3). Children of a trashed folder are
+  still reported as not trashed, with the trashed folder as parent; detecting them needs the parent chain (M3.8
+  `resolve_vanished`).
+- **Refs:** DESIGN.md F16, §9.3; docs/sdk-patches.md P15; docs/plans/m3.md (M3.1 outcomes).
+
+## D045 — Conflicts are resolved through the namespace operations; xattrs come from RAM
+- **Status:** accepted
+  Accepted by user 2026-10-26.
+- **Decided by:** claude
+- **Date:** 2026-10-22
+- **Context:** M3.14 lets the user settle the conflicts of §10.5 (`conflicts resolve`) and see sync state in the file
+  manager (`user.pdmount.*`). Resolving could edit the registry and the tree directly, or reuse what the kernel's own
+  operations do.
+- **Decision:**
+  - `resolve keep-local` renames the conflict copy over the other copy, `keep-remote` removes the conflict copy once it
+    is uploaded, and the "local delete, remote edit" kind removes the file that came back. They are `Engine::rename`,
+    `unlink` and `rmdir` with current paths, so access rules, the journal, the trash and the atomic-save adoption
+    (§7.6) apply as for any user action. Only the registry state is set by the resolver (durably).
+  - Notices (`rename_rename`, `move_cycle`, …) are dismissed with `keep-both`; `keep-local` and `keep-remote` are
+    refused for them, because there is nothing to choose.
+  - The xattrs are computed from the tree, the journal and the registry in RAM (hot path): no network, no store read.
+    `state` is the first match of `local-only`, `conflict`, `remote-newer`, `parked`, `uploading`, `pending`, `clean`.
+  - `status` counts only conflicts in state `open`; notices show in `conflicts list`.
+- **Alternatives:** A resolver that edits the tree and the remote state itself (a second path to the same results, with its
+  own races); xattrs read from the store (a disk read on the hot path).
+- **Consequences:** `keep-remote` waits up to 120 s for the upload of the copy, so the content is in the trash and not
+  lost; it fails with a timeout when the upload cannot finish (offline), and nothing has changed then. A notice stays in
+  `conflicts list` until it is dismissed.
+- **Refs:** DESIGN.md §8.7, §10.8, §14.2; docs/plans/m3.md M3.14; `crates/pdmount-core/src/engine/surface.rs`.
+
+## D041 — Connectivity state machine: one shared failure count, a probe, fast-failing reads, offline mount
+- **Status:** accepted
+  Accepted by user 2026-10-26.
+- **Decided by:** claude
+- **Date:** 2026-10-22
+- **Context:** §9.6 said the daemon goes offline after 3 connection failures "of the sync engine or the executor", but each
+  component saw only its own failures, nothing probed, and a mount without a connection failed. M3.2 made connection
+  errors `Offline`, so a state can be built on them.
+- **Decision:**
+  - One `Health` per engine (`Online`, `Offline`, `NeedsLogin`), fed by a `Monitored` decorator around the backend: every
+    call's result is observed, so reads, the journal, the event task and the probe share one count. 3 `Offline` results in
+    a row mean `Offline`; any other answer from the server (errors included) means `Online`; `Unauthorized` means
+    `NeedsLogin`, which only a login ends (M3.16). While `NeedsLogin`, the decorator answers `Unauthorized` without a request.
+  - While not `Online`, a task probes `storage_info` every `sync.probe_interval` (30 s, at least 10 s), in a background
+    turn; a rejected session is not probed, except by `Health::kick` after a login (M3.16), whose first answer ends `NeedsLogin`.
+  - The journal and the event task wait for `Online`. On the transition the journal retries every entry that is not parked
+    at once and the event task polls at once. `Offline` and `Unauthorized` failures do not count as attempts of an entry.
+  - FUSE slow-path deadlines drop to `timeouts.offline_read` (2 s) when the state is not `Online`, so uncached reads and the
+    first listing of a directory fail with EIO instead of waiting 20 to 60 s. Local `fsync` keeps its deadline.
+  - A mount without a connection works when the profile was mounted online before: the volume and root are kept in
+    `proton-root.json`, the session is built from the stored tokens, and the daemon starts `Offline`.
+- **Alternatives:** A failure count per component (disagree, slow to notice); probing with a Drive listing (heavier than the
+  quota request); failing reads only by timeout (a user waits 20 s per `ls`).
+- **Consequences:** Reads of cached data and all writes work offline; the queue is bounded only by disk. A slow link that
+  times out is `Transient`, not `Offline`, so it never switches the state. A session mounted offline has not been checked:
+  if its access token has expired by the time the connection returns, the first request answers 401, which M3.16's
+  reactive refresh handles; until then it would show as `NeedsLogin`.
+- **Refs:** DESIGN.md §9.2, §9.6, §13.1, Appendix B; docs/plans/m3.md M3.15; `crates/pdmount-core/src/health.rs`.
+
+## D042 — `needs_login` keeps the daemon up; the daemon runs the web login; `notify-send` notifications
+- **Status:** accepted
+  Accepted by user 2026-10-26.
+- **Decided by:** claude
+- **Date:** 2026-10-22
+- **Context:** A rejected session (expired refresh token, revoked session) used to end the daemon or, at mount, refuse to
+  start, and an expired access token was never refreshed: the drive client sends the token but does not renew it. Work
+  queued offline (D041) must not be lost to a login prompt, and a service has no terminal to run `pdmount login` in.
+- **Decision:**
+  - **Reactive refresh in the adapter.** Every `Backend` call runs through `with_reauth`: on `Unauthorized` (HTTP 401, the
+    body `Code` 401 of M3.2, a block transfer's 401) it asks the credential for a new token once (single-flight, keyed by the
+    rejected token) and repeats the call. A second rejection is `Unauthorized`; a failed refresh is classified like any SDK
+    error (refresh token expired: `Unauthorized`, anything else `Transient`). Uploads reopen their source on the repeat.
+  - **Rotation stored at once.** The daemon subscribes to the credential's token and expiry channels: each rotation is
+    stored in a task of its own (a keyring prompt can take 120 s); an expired refresh token sets `NeedsLogin`. Every 30
+    minutes while online it also checks the session. The 60 s timer stays as a fallback.
+  - **`needs_login` keeps the mount.** A mount whose profile has local state and a known root starts with the stored
+    (rejected) credentials in `NeedsLogin`; local reads of cached data and all writes work, the queue waits (D041). Without
+    local state it fails as before.
+  - **The daemon runs the login.** When the state becomes `NeedsLogin`, and on `pdmount login` while a daemon answers, it
+    starts the web login once at a time: link and code go to the log (WARN), `pdmount status` and a desktop notification.
+    The link lasts 10 minutes; `pdmount login` starts a new one. The new session replaces the backend's connection
+    (`replace_session`) only for the account that is mounted; another account is ended again and reported. `pdmount login`
+    with a daemon prints the link and polls `status` until the daemon's login is over.
+  - **`mount` without a session** runs the foreground login first; `--no-login` fails instead.
+  - **Notifications** are `notify-send --app-name=PdMount`, spawned without waiting, only with a session bus and the tool on
+    `PATH`; at most one per 30 s, conflict notices in between are announced together ("N new conflicts").
+- **Alternatives:** Exiting the daemon on a rejected session (loses the offline queue's context, forces a restart);
+  the login only through the CLI (useless for services); a notification library over D-Bus (a dependency for one message).
+- **Consequences:** A session is stored under the same D029 modes as `pdmount login`. A second 401 right after a refresh is
+  taken as a rejected session, so a server that revokes tokens without a refresh token error ends in `needs_login` too. A
+  login that is never completed leaves the mount in `needs_login` with no further notifications until `pdmount login`.
+- **Refs:** DESIGN.md §12.2, §12.3, §13.1, §14.2; docs/plans/m3.md M3.16; `crates/pdmount-backend/src/proton.rs`
+  (`with_reauth`), `crates/pdmount/src/{auth,notify,daemon,session}.rs`.
+
+## D046 — Fixes from the two-device property test: trashed folders, freed clash names, renames into deleted folders
+- **Status:** accepted
+  Accepted by user 2026-10-26. Superseded in part by D054 (the second bullet and the generation alternative).
+- **Decided by:** claude
+- **Date:** 2026-10-22
+- **Context:** `two_devices_and_an_app_converge` (M3.17, DESIGN.md §15.1) found five faults of the M3 engine within 2000
+  cases. All five are in paths the scenario tests do not reach because they need a second device and a particular order.
+- **Decision:**
+  - **A trashed folder is not a failed event page.** The fake (and the server) answer a listing of a trashed folder with
+    NotFound. `apply_events` treated `Backend(NotFound)` as an error, so the page failed, the cursor stayed, and the same
+    page failed again for good. It now skips that directory; the pass after the listings (§10.5) settles what it held.
+  - **A shared listing is not fresh.** `yield_to_remote` frees a name and lists the folder to show the remote node. The
+    listing that found the clash wakes this upload while it is still in flight, so the new request joined it and got a
+    result fetched before the name was free. It now lists again (at most three times) until the remote node shows.
+  - **A hidden remote node comes back when its occupant leaves.** A local node that holds the name of a remote one keeps it
+    out of the tree (D040). When that node is unlinked or renamed away before it uploads, nothing listed the folder again.
+    `Node::clashed` (memory only; after a restart it is set for every created, not yet uploaded node) makes
+    `remove_entry` and `rename` queue a listing of the folder (`Tree::take_relist`, `Journal::list_later`, run by
+    `run_journal`).
+  - **A rename into a deleted folder loses, not the node.** `resurrect_minimal` removed every clean node below the deleted
+    folder, including a node that was only renamed into it and still lives at its old place on the drive; the local tree
+    then lacked a node the drive had. Such nodes (remote parent outside the removed folder, placement pending) first go
+    back to their remote placement. A `move_node` step whose call answers NotFound settles the destination folder when the
+    moved node is still live, instead of the node.
+  - **No hot replan loop.** The step above looped without delay: `vanished` returned `Replan`, the same step was planned
+    again at once, with no state change. After 16 `Replan`s in a row an entry backs off like a failing step
+    (1 s doubling up to 300 s; `Journal::replanned`; a flat second until the M3.21 review).
+- **Alternatives:** Persisting hidden clashes (a table for a rare case; a listing after a restart finds them anyway);
+  listing the folder after every unlink of a created file (an API call per temp file of rsync or git, too many); making the
+  single-flight listing take a generation (every caller would need one; only this caller needs a fresh result).
+- **Consequences:** An unlink of a clashed node costs one extra listing, in the background. After a restart, unlinking a
+  created, not yet uploaded node in a listed folder also costs one listing. The replan guard only slows a wrong state down;
+  it does not make a wrong state right.
+- **Refs:** `crates/pdmount-core/src/{events,journal,vfs,engine}.rs`; `engine/proptests.rs` (`concurrent_regression_cases`).
+
+## D047 — Two-device scenarios: the marker SLO scales with the number of change pages; catch-up barriers; the fake daemon ends `needs_login`
+- **Status:** accepted
+  Accepted by user 2026-10-26.
+- **Decided by:** claude
+- **Date:** 2026-10-22
+- **Context:** M3.18 runs the existing scenarios with a second device (`second` mode) and adds the M scenarios. D037 sets
+  the visibility SLO at `poll_interval` + 10 s (40 s) for a remote change. Measured on the fake with two daemons: a single
+  change shows within 26–36 s, but a scenario that makes hundreds of changes (a git repository, 200 rsync'd files) needs more
+  than one event page of 50, and the daemon applies a page in about 12 s because listings and lookups are paced (D027); the
+  fake's trash purges (events in pages of 50) and the previous scenario's backlog add to it. Separately, nothing ended
+  `needs_login` on the fake: no sign-in exists, and `fault clear` did not kick the probe (M3.16 left the kick to the login).
+- **Decision:**
+  - The marker check keeps D037's 40 s for the first page of changes and adds 15 s per further page of 50 changes the
+    scenario made (counted in the fake's change log; the real account gets no allowance until M3.20 has data).
+  - Before a `second` run (and before E1) the devices wait for each other's earlier events with a marker each way, so the
+    check times the scenario's own changes and A has applied what checks on B wrote (`git status` refreshes the index; A then
+    deleting that file would revive it, M4).
+  - A fake-backend daemon in `needs_login` kicks the probe every 2 s (`watch_fake_session`), standing in for the user
+    signing in again; the first answer after `fake fault clear` ends the state.
+  - E1's limit goes from 75 s to D037's 40 s.
+- **Alternatives:** A flat 40 s (fails on big scenarios for reasons of pacing, not of the sync); a flat 120 s (hides a
+  regression of the poll loop); no check outside the dedicated visibility tests (the plan wants it in every `second` run).
+- **Consequences:** `second` runs take as long as the daemons need to digest the changes: the CI set (r1, r3, g3 with 30
+  commits, a1) takes about 5 minutes. On the real account the check may need an allowance too; M3.20 decides.
+- **Refs:** DESIGN.md §15.1, §15.3; `tests/scenarios/lib.sh` (`second_marker`, `send_marker`, `event_barrier`),
+  `crates/pdmount/src/daemon.rs` (`watch_fake_session`).
+
+## D048 — The M3 soak runs 3 h instead of 24 h; the risk is accepted
+- **Status:** accepted
+- **Decided by:** user
+- **Date:** 2026-10-23
+- **Context:** The M3 exit criteria (DESIGN.md §16) and task M3.19 asked for a 24 h soak on the fake. The user cut it to
+  3 h and accepted the risk.
+- **Decision:**
+  - The soak runs 3 h (`SOAK_DURATION=10800`), still on the fake only (D030).
+  - Its loops are rescheduled so that each fault recurs within 3 h: network flaps every 40 ± 10 min (was 2 h ± 20 min),
+    token expiry every 60 min from minute 30 (was every 6 h, which a 3 h run would never reach).
+  - The RSS check compares the last third of the run with the window from 1/6 to 1/3 of the run (at 3 h: the last hour
+    against minutes 30–60), instead of fixed hours.
+- **Alternatives:** The 24 h run as planned: not wanted by the user.
+- **Consequences:** Faults that take many hours to show can pass the M3 exit unseen: slow memory or disk growth (an RSS
+  increase below 25 % over the run, store or cache growth), rare races that need more loop iterations, and timers longer
+  than the run. A longer run needs only a larger `SOAK_DURATION`.
+- **Refs:** DESIGN.md §15.1, §16, §17; docs/plans/m3.md (M3.19); TODO.md M3.19.
+
+## D049 — RAM cache at working-set size; block memory reserved at startup in a pool, used by the RAM cache, `seed` and reads
+- **Status:** accepted
+- **Decided by:** user (the three points); the sizes, classes and fallback rules are Claude's (docs/plans/m3.md M3.19.1–M3.19.3)
+- **Date:** 2026-10-24
+- **Context:** The M3.19 soak failed its RSS check (c). heaptrack found no leak and little live-heap growth. The growth
+  is freed memory that glibc malloc keeps: with `glibc.malloc.mmap_threshold=1048576:glibc.malloc.arena_max=4`, RSS
+  halved and device B stayed flat.
+  - The churn comes from 4 MiB block buffers: one per `BlockCache::seed` (even for tiny files), two per disk-cache hit,
+    and one per assembled reply.
+  - The 256 MiB RAM cache also duplicated what the kernel page cache already holds.
+- **Decision:**
+  1. The RAM cache is sized to the working set of blocks being read (default 32 MiB, was 256 MiB). Long-term caching
+     is left to the kernel page cache. This is also gentler on workstations with less memory.
+  2. RAM-cache block memory is reserved at startup in a pool of fixed size classes and stays resident. The RAM cache and
+     the `seed` buffer use it, and after startup no block-sized allocation is made for them. How many allocations happen
+     at startup does not matter; that they all happen there, deterministically, does.
+  3. Reads use the pool too, where possible: disk hits are read and decrypted in place in a slot, downloads are copied
+     into a slot, and replies are sent from the slot without assembling.
+- **Alternatives:**
+  - Tune glibc malloc only (`mallopt` at startup): it halves RSS, but the allocations stay, and every reused block
+    costs page faults.
+  - jemalloc or mimalloc: a new dependency, and it does not bound the cache's memory.
+  - Change check (c) to measure live heap: it would hide the problem instead of fixing it.
+  - Keep 256 MiB: duplicates the page cache and costs fixed memory.
+- **Consequences:**
+  - The daemon's RSS includes `ram_bytes` from the start, and a smaller default lowers it.
+  - A hot-path read whose class has no free slot falls back to a heap allocation, counted in `cache_pool_fallbacks`.
+  - Proton downloads still allocate inside the SDK; avoiding that needs a fork patch (M4 option).
+  - Reads of dirty inodes from staging are unchanged.
+- **Refs:** DESIGN.md §3.4, §6.2, App. B (updated by the tasks); docs/plans/m3.md (M3.19 outcome, M3.19.1–M3.19.3);
+  TODO.md M3.19.
+
+## D050 — The visibility SLO (D037) is timed from the writer's commit, not its local write
+- **Status:** accepted
+- **Decided by:** user
+- **Date:** 2026-10-25
+- **Context:** M3.20's first real-account run (m1, live) failed the 40 s marker check: B's marker showed on A after about
+  39 s. The time splits into B's upload debounce and upload (about 6 s), A's wait for the next poll (30 s after the end of
+  the previous poll, as the official event manager does, `cs/client/js/src/internal/events/eventManager.ts:114-123`) and
+  A's paced poll, `get_nodes` and listing (about 9 s). D037 budgeted only the receiving side; `send_marker` started the
+  clock at the local write, although docs/plans/m3.md M3.18 already said to wait for the writer's queue first.
+- **Decision:** The marker clock starts when the writer's queue is empty (`Queue: 0 pending`; debounced files count as
+  pending), i.e. when the change is committed on the server. The bound stays `sync.poll_interval` + 10 s.
+- **Alternatives:** Raise the bound to `poll_interval` + 20 s, timed from the local write. Both (+15 s, from the commit).
+  Poll at a fixed rate instead of a fixed delay (more often than the official clients; against D033).
+- **Consequences:** The upload debounce is outside the SLO. A slow poll on the receiver (listings paced by D027) can still
+  exceed it; that would show in the M3.20 runs.
+- **Refs:** D037, D033, D027; DESIGN.md §15.3; `tests/scenarios/lib.sh` `send_marker`.
+
+## D051 — M3 exit: the M scenarios run on the real account only where no fault injection is needed
+- **Status:** accepted
+- **Decided by:** user (confirmed at M3.20)
+- **Date:** 2026-10-25
+- **Context:** DESIGN.md §16 asked for "M1–M7 … on two real profiles", while §15.3 marks only some M cases as real. M2
+  needs a pause at the commit, M4 and M5 an offline device, and the folder and app parts of M7 an offline device and an
+  official-app writer; a daemon on the real account cannot be given those.
+- **Decision:** The M3 exit runs M1–M7 on the fake (M2 as the engine test `m2_edit_edit_interleaved_at_commit`) and M1,
+  M3, M6 and the file part of M7 on two real profiles of one account.
+- **Alternatives:** Fault injection against the real account (a proxy that drops connections): more machinery and load on
+  the service for cases the fake already models.
+- **Consequences:** The real-account evidence for M2, M4, M5 and the M7 folder and app parts is indirect: the server
+  behaviour they depend on was verified in M3.1 (§10.4).
+- **Refs:** DESIGN.md §15.3, §16; docs/plans/m3.md M3.20; TODO.md M3.20.
+
+## D052 — A folder that loses its name to a remote rename keeps only its pending items
+- **Status:** accepted
+  Accepted by user 2026-10-26.
+- **Decided by:** claude
+- **Date:** 2026-10-25
+- **Context:** The M3.21 run of `two_devices_and_an_app_converge` at 10 000 cases found a divergence: device B had a
+  pending file in folder `d` and a pending file `a`; device A renamed `d` to `a`. B's listing applied the rename onto its
+  used name (`Tree::lose_name`, D040): `d` has pending items, so it became a new local folder, and its whole subtree went
+  with it, clean child `b` included. `b` stayed bound to its link, whose remote parent is the renamed folder, and nothing
+  moved it back, so B showed `/d/b` while the drive had `/a/b`. Replay: `concurrent_regression_cases`.
+- **Decision:** Such a folder goes through the same minimal re-creation as a folder trashed remotely
+  (`Tree::keep_pending`, shared with `resurrect_minimal`): pending items and the folders that lead to them become nodes to
+  create again, and the clean rest is removed locally; it is still in the remote folder and returns with it once the name
+  is free. Unlike the trash case, a node moved into the folder from outside keeps its link and its pending move, which
+  now goes to the new folder; its subtree stays as it is (still bound, in the moved node's remote folder). Renames inside
+  the folder that are the only pending change lose, as for a clean folder, and each is recorded as `RenameRename`.
+- **Alternatives:** Keep the whole subtree and move the clean children on the drive into the new folder (takes the other
+  device's files out of the folder it renamed); move the clean children back under the remote folder's later inode (the
+  folder is not in the tree until the name is free).
+- **Consequences:** Clean files of such a folder disappear locally until the name is free (B's own pending `a` yields when
+  it uploads, §10.6), then return under the folder's new name. A pending content edit of a clean-bound file is uploaded as
+  a new file in the new folder, as before.
+- **Refs:** DESIGN.md §9.3; `crates/pdmount-core/src/vfs.rs` (`lose_name`, `keep_pending`); D040, D046.
+
+## D053 — keep-remote is refused for a local-only conflict copy
+- **Status:** accepted
+- **Decided by:** user
+- **Date:** 2026-10-26
+- **Context:** The pre-M4 review (B9) found that `conflicts resolve keep-remote` on a `name_taken` conflict whose copy is
+  local-only (`.pdignore`, §7.7) waited for an upload that never happens, and timed out after 120 s every time.
+  keep-remote removes the copy only once it is uploaded, so the removed content stays recoverable from the trash; a
+  local-only copy never gets there.
+- **Decision:** keep-remote is refused at once for a local-only copy, with a message that names the cause and the two ways
+  out: delete the copy by hand, or use keep-both.
+- **Alternatives:** Remove the copy directly: the user asked to drop it, but its content would be gone for good, with no
+  copy in the trash.
+- **Consequences:** Dropping a local-only copy is the user's own `rm`; keep-remote keeps its guarantee that nothing it
+  removes is lost.
+- **Refs:** DESIGN.md §10.8; `crates/pdmount-core/src/engine/surface.rs` (`resolve_keep_remote`);
+  `target/pre-m4-review/report.md` B9.
+
+## D054 — A listing request is answered by a listing that started after it
+- **Status:** accepted
+- **Decided by:** user
+- **Date:** 2026-10-26
+- **Context:** Concurrent listings of a folder share one request (`SingleFlight`, §6.4). Joining a listing that is
+  already in flight returns data fetched before the call. D046 worked around this for `yield_to_remote` alone, with up
+  to three listings. The pre-M4 review (B2) found the same problem in the event stream: `apply_events` can join a
+  listing started before the event, apply it, and store the cursor past the event, so the change stays invisible until
+  the folder is listed again. `revalidate`, `keep_remote`, the relist after a freed clash name, the merged-folder relist
+  and the relist in `resolve_vanished` all need a listing that started after they asked, too.
+- **Decision:**
+  - Each listing takes a number when it starts (`listing_epoch`, an engine counter). `Engine::list(dir)` notes the
+    counter before it joins. If the listing it joined started earlier, it waits for that listing and lists again. At most
+    two rounds: the second listing has started after the call.
+  - `ensure_listed` keeps joining any listing (it only needs the folder listed once). It is the only caller that does.
+  - `yield_to_remote` lists once.
+  - Unchanged: concurrent fresh requests still share one listing; a request costs one extra listing only when it joined
+    one that started before it.
+- **Alternatives:**
+  - A fresh/any flag per caller: every caller has to choose, and all but one choose fresh.
+  - A generation argument: callers would have to know which generation they need.
+  - No sharing for event and refresh listings: each event page of a busy folder would list it again even when a fresh
+    listing is already running (D027 pacing, 429 risk).
+- **Consequences:**
+  - An event for a folder whose listing is in flight costs one more listing of that folder (the joined one, then its
+    own).
+  - The cursor moves past an event only after a listing that started after the event was applied.
+  - Supersedes D046's second bullet and its rejected alternative about a generation.
+- **Refs:** DESIGN.md §9.3; `crates/pdmount-core/src/{engine,events,journal,singleflight}.rs`; D046;
+  `target/pre-m4-review/report.md` B2.
+
+## D055 — A yielded name is recorded before the listing; open conflicts with a missing other copy relist their folder at start
+- **Status:** accepted
+- **Decided by:** user
+- **Date:** 2026-10-26
+- **Context:** The 10 000-case run of `two_devices_and_an_app_converge` during fix group G3 failed: device B did not
+  show the app's `/b` although the drive had it. It reproduces on the code before G3 (the M3.21 run's lost failure was
+  probably this). B's own `/b` yielded its name (`yield_to_remote`, §10.6); the rename was persisted, then the listing
+  that shows the remote node ran. A restart aborted the step during that listing, before the conflict was recorded.
+  The event that announced the app's `/b` had been applied while the name was taken, and a mount with a cursor does not
+  list folders again at start, so nothing showed `/b` until a refresh. A failed listing after a yield was not retried
+  either.
+- **Decision:**
+  - `yield_to_remote` records the conflict right after the rename and before the listing; once the listing shows the
+    remote node, the record names it as the other copy (`Conflicts::set_other_ino`).
+  - At start (`Engine::start_background`), every open `CreateCreate` or `NameTaken` conflict whose other copy is not in
+    the tree (`other_copy_in` finds neither `other_ino` nor the link) has its folder listed again, if that folder is
+    listed (`Journal::list_later`).
+  - A listing after a yield that fails goes to the relist queue.
+- **Alternatives:**
+  - Persisting the pending relists in a table: a second durable trace of what the open conflict already says.
+  - Listing every listed folder at start: the D027 budget for one rare case.
+- **Consequences:**
+  - A start costs one listing per folder holding such a conflict; once a listing has shown the other copy, the record
+    names it and the folder is not listed again.
+  - A crash before the group commit still loses the record (§17), and with it this trace.
+  - Regression case in `concurrent_regression_cases`.
+- **Refs:** DESIGN.md §10.6; `crates/pdmount-core/src/{journal,engine,engine/surface,conflicts}.rs`;
+  `target/g3/proptests.out` (the failing run).

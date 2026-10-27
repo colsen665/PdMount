@@ -2,32 +2,22 @@
 //! account's trash for good. Only while no daemon runs for the profile: a
 //! second session resume could rotate the daemon's refresh token.
 
-use crate::control::{self, Request};
 use crate::session::{self, Resumed};
 use anyhow::bail;
 use pdmount_backend::Backend;
 use pdmount_core::units::ByteSize;
 use pdmount_core::{Config, ProfilePaths};
 use std::process::ExitCode;
-use std::time::Duration;
 
 pub async fn empty(paths: &ProfilePaths, config: &Config) -> anyhow::Result<ExitCode> {
-    let daemon = control::call(
-        &paths.control_socket(),
-        Request::Status,
-        Duration::from_secs(5),
-    )
-    .await?;
-    if daemon.is_some() {
-        bail!(
-            "profile {} is mounted; unmount it first (the daemon holds the session)",
-            paths.profile
-        );
-    }
+    crate::daemon::refuse_while_running(paths).await?;
     let logged_in = match session::resume(paths).await? {
         Resumed::Active(logged_in) => logged_in,
         Resumed::NotLoggedIn => bail!("profile {} is not logged in", paths.profile),
-        Resumed::NeedsLogin(error) => {
+        Resumed::Offline { error, .. } => {
+            return Err(error.context("cannot reach Proton to check the session"));
+        }
+        Resumed::NeedsLogin { error, .. } => {
             bail!("the session expired, run `pdmount login` ({error:#})")
         }
     };

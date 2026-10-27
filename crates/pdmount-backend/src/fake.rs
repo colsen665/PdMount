@@ -17,6 +17,14 @@
 //! - `lock`: every operation holds an exclusive `flock` and first applies
 //!   what other processes appended.
 //!
+//! Clones share one drive but can act as different clients
+//! ([`FakeBackend::with_client`]): a client has a UID, and may leave out the
+//! SHA-1 and the mode the way the official apps do. Tests can stop the next
+//! upload, folder creation, rename or trash of a client just before its
+//! commit ([`FakeBackend::pause_at`]) and switch the server's commit-time
+//! checks off. For a daemon running in another process, `faults.json` in
+//! the fake's directory makes calls fail as if offline or signed out.
+//!
 //! Growth is bounded for long runs (fsx, the scenario matrix): files keep
 //! their last revisions (`PDMOUNT_FAKE_KEEP_REVISIONS`, default 16), the
 //! most recent trashed nodes are kept, and the event and change logs are
@@ -25,21 +33,23 @@
 
 use crate::{
     AccountInfo, Backend, BackendError, BlockInfo, EventId, EventKind, EventPage, FileMeta, LinkId,
-    NameHash, NodeKind, RemoteEvent, RemoteNode, Result, RevisionId, StorageInfo, UploadSource,
+    NameHash, NodeKind, RemoteEvent, RemoteNode, Result, RevisionId, RevisionMeta, StorageInfo,
+    UploadSource,
 };
 use bytes::Bytes;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha1::Digest;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::watch;
 
 /// Revisions kept per file unless configured otherwise.
-pub const DEFAULT_KEEP_REVISIONS: usize = 16;
+const DEFAULT_KEEP_REVISIONS: usize = 16;
 /// Trashed nodes kept (their content stays readable, as in Proton's trash).
 const KEEP_TRASHED: usize = 1024;
 /// Events and changes kept; older ones are trimmed in batches.
@@ -62,9 +72,146 @@ pub enum FakeOp {
     CreateFolder,
     Rename,
     Trash,
+    Revisions,
     LatestEventId,
     PollEvents,
     StorageInfo,
+}
+
+/// Who is calling: handles made by [`FakeBackend::with_client`] differ in
+/// what their uploads record, like the daemon and the official apps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FakeClient {
+    /// The SDK client UID (`pdmount-<device id>`); `None` for tests that
+    /// do not care.
+    pub uid: Option<String>,
+    /// Uploads carry a SHA-1 that reads report.
+    pub claims_sha1: bool,
+    /// Uploads carry `pdmount.mode` (the official apps leave it out).
+    pub claims_mode: bool,
+}
+
+impl Default for FakeClient {
+    fn default() -> Self {
+        Self {
+            uid: None,
+            claims_sha1: true,
+            claims_mode: true,
+        }
+    }
+}
+
+/// Where a call can be stopped, just before the server applies it (or,
+/// for a listing, reads the folder).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FakePoint {
+    NewBeforeCommit,
+    RevisionBeforeCommit,
+    CreateFolderBeforeCommit,
+    RenameBeforeCommit,
+    TrashBeforeCommit,
+    ListBeforeRead,
+}
+
+#[derive(Debug)]
+struct PauseChannels {
+    reached: watch::Sender<bool>,
+    release: watch::Sender<bool>,
+}
+
+/// A stopped call, as seen by the test: wait for `reached`, change the
+/// drive meanwhile, then `release`.
+#[derive(Debug, Clone)]
+pub struct FakePause(Arc<PauseChannels>);
+
+impl FakePause {
+    /// Returns once the call is stopped at its point.
+    pub async fn reached(&self) {
+        let mut reached = self.0.reached.subscribe();
+        let _ = reached.wait_for(|reached| *reached).await;
+    }
+
+    /// Lets the call go on (also if it has not arrived yet).
+    pub fn release(&self) {
+        self.0.release.send_replace(true);
+    }
+}
+
+struct PendingPause {
+    point: FakePoint,
+    client: Option<String>,
+    channels: Arc<PauseChannels>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FaultKind {
+    /// Every call fails with `Offline("injected")`.
+    Offline,
+    /// Every call fails with `Unauthorized`.
+    Unauthorized,
+}
+
+/// One rule of `faults.json`, for daemons in other processes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FaultRule {
+    pub kind: FaultKind,
+    /// Unix milliseconds; `None` = until cleared.
+    #[serde(default)]
+    pub until_ms: Option<u64>,
+    /// Client UID the rule applies to; `None` = all clients.
+    #[serde(default)]
+    pub client: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct FaultFile {
+    #[serde(default)]
+    rules: Vec<FaultRule>,
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+fn read_fault_file(path: &Path) -> Vec<FaultRule> {
+    match std::fs::read(path) {
+        Ok(json) => serde_json::from_slice::<FaultFile>(&json)
+            .map(|file| file.rules)
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "fake backend: ignoring a malformed faults.json");
+                Vec::new()
+            }),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Adds a rule to `dir/faults.json`; daemons on this fake pick it up on
+/// their next call. Rules that have expired are dropped.
+pub fn add_fault(dir: &Path, rule: FaultRule) -> Result<()> {
+    edit_faults(dir, |rules| rules.push(rule))
+}
+
+/// Removes the rules for `client`, or all rules.
+pub fn clear_faults(dir: &Path, client: Option<&str>) -> Result<()> {
+    edit_faults(dir, |rules| {
+        rules.retain(|rule| client.is_some_and(|uid| rule.client.as_deref() != Some(uid)));
+    })
+}
+
+fn edit_faults(dir: &Path, edit: impl FnOnce(&mut Vec<FaultRule>)) -> Result<()> {
+    std::fs::create_dir_all(dir).map_err(|e| io_error("create dir", e))?;
+    let _lock = lock_dir(dir)?;
+    let path = dir.join("faults.json");
+    let mut rules = read_fault_file(&path);
+    let now = unix_ms();
+    rules.retain(|rule| rule.until_ms.is_none_or(|until| until > now));
+    edit(&mut rules);
+    let json = serde_json::to_vec(&FaultFile { rules })
+        .map_err(|e| BackendError::Other(format!("fake backend: encode faults: {e}")))?;
+    write_replace(&path, &json).map_err(|e| io_error("save faults", e))
 }
 
 /// A remote change applied by the fake, in order.
@@ -84,6 +231,15 @@ struct Revision {
     sha1: [u8; 20],
     mtime: SystemTime,
     mode: Option<u32>,
+    /// The uploading client's UID, when it had one.
+    #[serde(default)]
+    client_uid: Option<String>,
+    /// Whether the uploader claimed the SHA-1 (the official apps may not).
+    #[serde(default = "yes")]
+    sha1_claimed: bool,
+    /// Creation order (the id counter at creation).
+    #[serde(default)]
+    seq: u64,
     /// Held in memory by in-memory fakes; persisted fakes read
     /// `blobs/<id>` instead.
     #[serde(skip)]
@@ -127,11 +283,15 @@ impl Node {
             size: active.map(|r| r.size),
             mtime: active.map(|r| r.mtime).or(self.folder_mtime),
             mode: active.and_then(|r| r.mode),
-            sha1: active.map(|r| r.sha1),
+            sha1: active.filter(|r| r.sha1_claimed).map(|r| r.sha1),
             name_hash: Some(name_hash(&self.name)),
             trashed: self.trashed,
         }
     }
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn name_hash(name: &str) -> NameHash {
@@ -234,6 +394,17 @@ struct State {
     #[serde(skip)]
     latency: Duration,
     #[serde(skip)]
+    pauses: Vec<PendingPause>,
+    /// The server refuses a commit whose base revision is no longer active.
+    #[serde(skip, default = "yes")]
+    commit_checks_revision: bool,
+    /// The server refuses a rename whose name hash is stale.
+    #[serde(skip, default = "yes")]
+    name_hash_enforced: bool,
+    /// `faults.json` as last read: (modified, length) and its rules.
+    #[serde(skip)]
+    fault_cache: Option<((SystemTime, u64), Vec<FaultRule>)>,
+    #[serde(skip)]
     delta: Delta,
 }
 
@@ -274,6 +445,10 @@ impl State {
             refresh_pending: false,
             faults: VecDeque::new(),
             latency: Duration::ZERO,
+            pauses: Vec::new(),
+            commit_checks_revision: true,
+            name_hash_enforced: true,
+            fault_cache: None,
             delta: Delta::default(),
         }
     }
@@ -290,6 +465,38 @@ impl State {
             Some((_, error)) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// Fails like the rules of `faults.json` say, for the calling client.
+    fn check_fault_file(&mut self, client: Option<&str>) -> Result<()> {
+        let Some(dir) = &self.dir else {
+            return Ok(());
+        };
+        let path = dir.join("faults.json");
+        let stamp = std::fs::metadata(&path)
+            .and_then(|m| Ok((m.modified()?, m.len())))
+            .ok();
+        match (stamp, &self.fault_cache) {
+            (None, _) => {
+                self.fault_cache = None;
+                return Ok(());
+            }
+            (Some(stamp), Some((cached, _))) if *cached == stamp => {}
+            (Some(stamp), _) => self.fault_cache = Some((stamp, read_fault_file(&path))),
+        }
+        let now = unix_ms();
+        let rules = self.fault_cache.iter().flat_map(|(_, rules)| rules);
+        for rule in rules {
+            let applies = rule.until_ms.is_none_or(|until| until > now)
+                && rule.client.as_deref().is_none_or(|uid| Some(uid) == client);
+            if applies {
+                return Err(match rule.kind {
+                    FaultKind::Offline => BackendError::Offline("injected".into()),
+                    FaultKind::Unauthorized => BackendError::Unauthorized,
+                });
+            }
+        }
+        Ok(())
     }
 
     fn node(&self, link: &LinkId) -> Result<&Node> {
@@ -399,6 +606,35 @@ impl State {
         Ok(Bytes::from(out))
     }
 
+    /// [`State::read_range`] into `buf`, without allocating.
+    fn read_range_into(
+        &self,
+        revision: &Revision,
+        start: u64,
+        len: u64,
+        buf: &mut [u8],
+    ) -> Result<usize> {
+        let capacity = buf.len();
+        let target = buf.get_mut(..len as usize).ok_or_else(|| {
+            BackendError::Integrity(format!(
+                "block has {len} bytes, more than the {capacity} expected"
+            ))
+        })?;
+        if let Some(content) = &revision.content {
+            let end = (start + len).min(content.len() as u64);
+            let source = &content[start as usize..end as usize];
+            target[..source.len()].copy_from_slice(source);
+            return Ok(source.len());
+        }
+        let path = self
+            .blob(&revision.id)
+            .ok_or_else(|| BackendError::Other(format!("no content for {}", revision.id)))?;
+        let file = std::fs::File::open(&path).map_err(|e| io_error("open blob", e))?;
+        std::os::unix::fs::FileExt::read_exact_at(&file, target, start)
+            .map_err(|e| io_error("read blob", e))?;
+        Ok(target.len())
+    }
+
     fn content(&self, revision: &Revision) -> Result<Bytes> {
         self.read_range(revision, 0, revision.size)
     }
@@ -407,6 +643,7 @@ impl State {
         &mut self,
         mut staged: Staged,
         meta: &FileMeta,
+        client: &FakeClient,
     ) -> Result<(RevisionId, Revision)> {
         if meta.sha1.is_some_and(|sha1| sha1 != staged.sha1) {
             return Err(BackendError::Integrity("content SHA-1 mismatch".into()));
@@ -428,7 +665,10 @@ impl State {
             size: staged.size,
             sha1: staged.sha1,
             mtime: meta.mtime,
-            mode: meta.mode,
+            mode: meta.mode.filter(|_| client.claims_mode),
+            client_uid: client.uid.clone(),
+            sha1_claimed: client.claims_sha1,
+            seq: self.next_id,
             content,
         };
         Ok((id, revision))
@@ -647,9 +887,16 @@ impl State {
             return Ok(());
         }
         if journal_len > self.journal_offset {
-            let journal = std::fs::read(dir.join("journal.jsonl"))
+            // Only the lines after ours: rereading the whole journal makes
+            // buffers of growing size, which glibc keeps (D049).
+            let mut tail = Vec::new();
+            std::fs::File::open(dir.join("journal.jsonl"))
+                .and_then(|mut file| {
+                    file.seek(SeekFrom::Start(self.journal_offset))?;
+                    file.read_to_end(&mut tail)
+                })
                 .map_err(|e| io_error("read journal", e))?;
-            self.journal_offset = self.replay(&journal, self.journal_offset);
+            self.journal_offset += self.replay(&tail, 0);
         }
         Ok(())
     }
@@ -702,7 +949,7 @@ fn read_epoch(dir: &Path) -> Result<u64> {
     }
 }
 
-/// The snapshot (or the old one-file format) plus the journal.
+/// The snapshot plus the journal.
 fn load_state(dir: &Path) -> Result<State> {
     let parse = |path: PathBuf| -> Result<State> {
         let json = std::fs::read(&path).map_err(|e| io_error("read state", e))?;
@@ -712,8 +959,6 @@ fn load_state(dir: &Path) -> Result<State> {
     };
     let mut state = if dir.join("snapshot.json").exists() {
         parse(dir.join("snapshot.json"))?
-    } else if dir.join("state.json").exists() {
-        parse(dir.join("state.json"))?
     } else {
         State::empty()
     };
@@ -776,6 +1021,7 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone)]
 pub struct FakeBackend {
     state: Arc<Mutex<State>>,
+    client: Arc<FakeClient>,
 }
 
 impl Default for FakeBackend {
@@ -785,11 +1031,20 @@ impl Default for FakeBackend {
 }
 
 impl FakeBackend {
-    pub const DEFAULT_BLOCK_SIZE: usize = 4 << 20;
+    const DEFAULT_BLOCK_SIZE: usize = 4 << 20;
 
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(State::empty())),
+            client: Arc::default(),
+        }
+    }
+
+    /// A handle on the same drive that acts as another client.
+    pub fn with_client(&self, client: FakeClient) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+            client: Arc::new(client),
         }
     }
 
@@ -801,11 +1056,8 @@ impl FakeBackend {
         let _lock = lock_dir(dir)?;
         let mut state = load_state(dir)?;
         if !dir.join("snapshot.json").exists() {
-            // New, or the old format: start the snapshot and journal.
+            // New: start the snapshot and journal.
             state.compact()?;
-            for old in ["state.json", "generation"] {
-                let _ = std::fs::remove_file(dir.join(old));
-            }
         }
         if let Some(keep) = std::env::var("PDMOUNT_FAKE_KEEP_REVISIONS")
             .ok()
@@ -818,6 +1070,7 @@ impl FakeBackend {
         }
         Ok(Self {
             state: Arc::new(Mutex::new(state)),
+            client: Arc::default(),
         })
     }
 
@@ -856,6 +1109,61 @@ impl FakeBackend {
             s.delta.meta = true;
             Ok(())
         });
+    }
+
+    /// Stops the next call at `point` made through a handle with this
+    /// handle's client UID, until the returned pause is released.
+    pub fn pause_at(&self, point: FakePoint) -> FakePause {
+        let channels = Arc::new(PauseChannels {
+            reached: watch::channel(false).0,
+            release: watch::channel(false).0,
+        });
+        self.state.lock().pauses.push(PendingPause {
+            point,
+            client: self.client.uid.clone(),
+            channels: Arc::clone(&channels),
+        });
+        FakePause(channels)
+    }
+
+    async fn checkpoint(&self, point: FakePoint) {
+        let pause = {
+            let mut state = self.state.lock();
+            let position = state
+                .pauses
+                .iter()
+                .position(|p| p.point == point && p.client == self.client.uid);
+            position.map(|i| state.pauses.remove(i))
+        };
+        if let Some(pause) = pause {
+            pause.channels.reached.send_replace(true);
+            let mut release = pause.channels.release.subscribe();
+            let _ = release.wait_for(|released| *released).await;
+        }
+    }
+
+    /// Whether commits check that the base revision is still active (the
+    /// real server checks it only when the draft is created, M3.1).
+    pub fn set_commit_checks(&self, enforced: bool) {
+        self.state.lock().commit_checks_revision = enforced;
+    }
+
+    /// Whether renames check the name hash (the real server does, M3.1).
+    pub fn set_name_hash_enforced(&self, enforced: bool) {
+        self.state.lock().name_hash_enforced = enforced;
+    }
+
+    /// SHA-1 of every kept revision of every node, trashed ones included:
+    /// what is still reachable on the server.
+    pub fn all_revision_sha1s(&self) -> HashSet<[u8; 20]> {
+        self.with_state(None, |s| {
+            Ok(s.nodes
+                .values()
+                .flat_map(|n| &n.revisions)
+                .map(|r| r.sha1)
+                .collect())
+        })
+        .unwrap_or_default()
     }
 
     /// Delays every read call (root, listings, blocks) by `latency`.
@@ -959,6 +1267,7 @@ impl FakeBackend {
         let _lock = state.dir.as_deref().map(lock_dir).transpose()?;
         state.refresh()?;
         if let Some(op) = op {
+            state.check_fault_file(self.client.uid.as_deref())?;
             state.take_fault(op)?;
         }
         let result = f(&mut state);
@@ -1013,7 +1322,9 @@ fn stage_blocking(source: UploadSource, blobs: Option<PathBuf>) -> Result<Staged
         UploadSource::File(path) => {
             let mut input = std::fs::File::open(&path)
                 .map_err(|e| BackendError::Other(format!("cannot read {}: {e}", path.display())))?;
-            let mut buffer = vec![0u8; 1 << 20];
+            // On the stack, so the soak's RSS check measures the daemon, not
+            // the fake (D049).
+            let mut buffer = [0u8; 64 << 10];
             loop {
                 let n = input
                     .read(&mut buffer)
@@ -1051,6 +1362,7 @@ impl Backend for FakeBackend {
 
     async fn list_children(&self, folder: &LinkId) -> Result<Vec<RemoteNode>> {
         self.delay().await;
+        self.checkpoint(FakePoint::ListBeforeRead).await;
         self.with_state(Some(FakeOp::ListChildren), |s| {
             s.folder(folder)?;
             let mut children: Vec<_> = s
@@ -1104,6 +1416,27 @@ impl Backend for FakeBackend {
         })
     }
 
+    async fn fetch_block_into(
+        &self,
+        file: &LinkId,
+        revision: &RevisionId,
+        index: u32,
+        buf: &mut [u8],
+    ) -> Result<usize> {
+        self.delay().await;
+        self.with_state(Some(FakeOp::FetchBlock), |s| {
+            let node = s.nodes.get(file).ok_or(BackendError::NotFound)?;
+            let rev = node.revision(revision)?;
+            let block = s.block_size as u64;
+            let start = u64::from(index)
+                .checked_sub(1)
+                .map(|i| i * block)
+                .filter(|&start| start < rev.size)
+                .ok_or(BackendError::NotFound)?;
+            s.read_range_into(rev, start, block.min(rev.size - start), buf)
+        })
+    }
+
     async fn upload_new(
         &self,
         parent: &LinkId,
@@ -1112,12 +1445,19 @@ impl Backend for FakeBackend {
         meta: FileMeta,
     ) -> Result<(LinkId, RevisionId)> {
         let staged = self.stage(source).await?;
+        // Draft: the server checks the name when the draft is created ...
         self.with_state(Some(FakeOp::UploadNew), |s| {
+            s.folder(parent)?;
+            s.ensure_name_free(parent, name, None)
+        })?;
+        self.checkpoint(FakePoint::NewBeforeCommit).await;
+        // ... and again when the file is committed.
+        self.with_state(None, |s| {
             s.folder(parent)?;
             s.ensure_name_free(parent, name, None)?;
             s.ensure_quota(staged.size)?;
             let link = LinkId::new(s.new_id("link-"));
-            let (revision, rev) = s.new_revision(staged, &meta)?;
+            let (revision, rev) = s.new_revision(staged, &meta, &self.client)?;
             s.nodes.insert(
                 link.clone(),
                 Node {
@@ -1149,6 +1489,7 @@ impl Backend for FakeBackend {
         meta: FileMeta,
     ) -> Result<RevisionId> {
         let staged = self.stage(source).await?;
+        // Draft: the base must be the active revision.
         self.with_state(Some(FakeOp::UploadRevision), |s| {
             let node = s.node(file)?;
             if node.kind != NodeKind::File {
@@ -1158,8 +1499,16 @@ impl Backend for FakeBackend {
             if current.as_ref() != Some(base) {
                 return Err(BackendError::RevisionConflict { current });
             }
+            Ok(())
+        })?;
+        self.checkpoint(FakePoint::RevisionBeforeCommit).await;
+        self.with_state(None, |s| {
+            let current = s.node(file)?.active().map(|r| r.id.clone());
+            if s.commit_checks_revision && current.as_ref() != Some(base) {
+                return Err(BackendError::RevisionConflict { current });
+            }
             s.ensure_quota(staged.size)?;
-            let (revision, rev) = s.new_revision(staged, &meta)?;
+            let (revision, rev) = s.new_revision(staged, &meta, &self.client)?;
             if let Some(node) = s.nodes.get_mut(file) {
                 node.revisions.push(rev);
             }
@@ -1179,6 +1528,7 @@ impl Backend for FakeBackend {
         name: &str,
         mtime: SystemTime,
     ) -> Result<LinkId> {
+        self.checkpoint(FakePoint::CreateFolderBeforeCommit).await;
         self.with_state(Some(FakeOp::CreateFolder), |s| {
             s.folder(parent)?;
             s.ensure_name_free(parent, name, None)?;
@@ -1213,12 +1563,15 @@ impl Backend for FakeBackend {
         new_name: &str,
         expected: Option<&NameHash>,
     ) -> Result<()> {
+        self.checkpoint(FakePoint::RenameBeforeCommit).await;
         self.with_state(Some(FakeOp::Rename), |s| {
             if node == &s.root {
                 return Err(BackendError::PermissionDenied);
             }
             let current = s.node(node)?;
-            if expected.is_some_and(|hash| *hash != name_hash(&current.name)) {
+            if s.name_hash_enforced
+                && expected.is_some_and(|hash| *hash != name_hash(&current.name))
+            {
                 return Err(BackendError::NameConflict);
             }
             let parent = match new_parent {
@@ -1230,9 +1583,7 @@ impl Backend for FakeBackend {
             };
             s.folder(&parent)?;
             if s.is_descendant(&parent, node) {
-                return Err(BackendError::Other(
-                    "cannot move a folder into itself".into(),
-                ));
+                return Err(BackendError::InvalidMove);
             }
             s.ensure_name_free(&parent, new_name, Some(node))?;
             if let Some(entry) = s.nodes.get_mut(node) {
@@ -1250,6 +1601,7 @@ impl Backend for FakeBackend {
     }
 
     async fn trash(&self, nodes: &[LinkId]) -> Result<Vec<Result<()>>> {
+        self.checkpoint(FakePoint::TrashBeforeCommit).await;
         self.with_state(Some(FakeOp::Trash), |s| {
             Ok(nodes
                 .iter()
@@ -1268,6 +1620,29 @@ impl Backend for FakeBackend {
                     s.push_event(EventKind::Delete, link);
                     s.push_change(FakeChange::Trashed { link: link.clone() });
                     Ok(())
+                })
+                .collect())
+        })
+    }
+
+    async fn revisions(&self, file: &LinkId) -> Result<Vec<RevisionMeta>> {
+        self.with_state(Some(FakeOp::Revisions), |s| {
+            let node = s.nodes.get(file).ok_or(BackendError::NotFound)?;
+            if node.kind != NodeKind::File {
+                return Err(BackendError::Other(format!("{file} is not a file")));
+            }
+            let last = node.revisions.len().saturating_sub(1);
+            Ok(node
+                .revisions
+                .iter()
+                .enumerate()
+                .map(|(i, r)| RevisionMeta {
+                    id: r.id.clone(),
+                    created: UNIX_EPOCH + Duration::from_secs(r.seq),
+                    size: Some(r.size),
+                    sha1: r.sha1_claimed.then_some(r.sha1),
+                    client_uid: r.client_uid.clone(),
+                    active: i == last,
                 })
                 .collect())
         })
@@ -1546,6 +1921,14 @@ mod tests {
             fake.fetch_block(&file, &rev, 0).await,
             Err(BackendError::NotFound)
         );
+        let mut buf = [0u8; 4];
+        assert_eq!(fake.fetch_block_into(&file, &rev, 2, &mut buf).await, Ok(4));
+        assert_eq!(&buf, b"4567");
+        assert_eq!(fake.fetch_block_into(&file, &rev, 3, &mut buf).await, Ok(2));
+        assert!(matches!(
+            fake.fetch_block_into(&file, &rev, 1, &mut buf[..3]).await,
+            Err(BackendError::Integrity(_))
+        ));
     }
 
     #[tokio::test]
@@ -1622,6 +2005,10 @@ mod tests {
             fake.fetch_block(&file, &rev, 3).await.expect("block"),
             &b"89"[..]
         );
+        // From the blob file.
+        let mut buf = [0u8; 4];
+        assert_eq!(fake.fetch_block_into(&file, &rev, 2, &mut buf).await, Ok(4));
+        assert_eq!(&buf, b"4567");
         let listed = fake
             .list_children(&LinkId::new("link-1"))
             .await
@@ -1842,34 +2229,334 @@ mod tests {
         assert_eq!(again.list_children(&root).await.expect("list").len(), 2);
     }
 
+    fn client(uid: &str) -> FakeClient {
+        FakeClient {
+            uid: Some(uid.into()),
+            ..FakeClient::default()
+        }
+    }
+
+    async fn revision_ids(fake: &FakeBackend, file: &LinkId) -> Vec<RevisionId> {
+        let revisions = fake.revisions(file).await.expect("revisions");
+        revisions.into_iter().map(|r| r.id).collect()
+    }
+
     #[tokio::test]
-    async fn the_old_one_file_format_is_migrated() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut state = State::empty();
-        state.next_id = 7;
-        state.changes.push(FakeChange::Trashed {
-            link: LinkId::new("x"),
-        });
-        std::fs::create_dir_all(dir.path().join("blobs")).expect("blobs");
-        std::fs::write(
-            dir.path().join("state.json"),
-            serde_json::to_vec(&state).expect("encode"),
-        )
-        .expect("write");
-        std::fs::write(dir.path().join("generation"), b"3").expect("write");
-        let fake = FakeBackend::open(dir.path()).expect("open");
-        assert_eq!(fake.changes().len(), 1);
-        assert!(dir.path().join("snapshot.json").exists());
-        assert!(!dir.path().join("state.json").exists());
+    async fn a_paused_revision_lets_another_client_commit_first() {
+        let fake = FakeBackend::new();
+        let a = fake.with_client(client("a"));
+        let b = fake.with_client(client("b"));
+        fake.set_commit_checks(false);
         let root = root(&fake).await;
-        let (link, _) = fake
+        let (file, r1) = a
+            .upload_new(&root, "f", bytes(b"v1"), meta())
+            .await
+            .expect("upload");
+        let pause = a.pause_at(FakePoint::RevisionBeforeCommit);
+        let upload = tokio::spawn({
+            let (a, file, r1) = (a.clone(), file.clone(), r1.clone());
+            async move {
+                a.upload_revision(&file, &r1, bytes(b"from a"), meta())
+                    .await
+            }
+        });
+        pause.reached().await;
+        let rb = b
+            .upload_revision(&file, &r1, bytes(b"from b"), meta())
+            .await
+            .expect("b commits first");
+        pause.release();
+        let ra = upload.await.expect("task").expect("a commits last");
+        assert_eq!(revision_ids(&fake, &file).await, [r1, rb, ra.clone()]);
+        let revisions = fake.revisions(&file).await.expect("revisions");
+        assert_eq!(
+            revisions.iter().map(|r| r.active).collect::<Vec<_>>(),
+            [false, false, true]
+        );
+        assert_eq!(revisions[1].client_uid.as_deref(), Some("b"));
+        assert_eq!(revisions[2].id, ra);
+        assert_eq!(fake.content(&file).as_deref(), Some(&b"from a"[..]));
+    }
+
+    #[tokio::test]
+    async fn commit_checks_reject_a_stale_base_by_default() {
+        let fake = FakeBackend::new();
+        let a = fake.with_client(client("a"));
+        let b = fake.with_client(client("b"));
+        let root = root(&fake).await;
+        let (file, r1) = a
+            .upload_new(&root, "f", bytes(b"v1"), meta())
+            .await
+            .expect("upload");
+        let pause = a.pause_at(FakePoint::RevisionBeforeCommit);
+        let upload = tokio::spawn({
+            let (a, file, r1) = (a.clone(), file.clone(), r1.clone());
+            async move {
+                a.upload_revision(&file, &r1, bytes(b"from a"), meta())
+                    .await
+            }
+        });
+        pause.reached().await;
+        let rb = b
+            .upload_revision(&file, &r1, bytes(b"from b"), meta())
+            .await
+            .expect("b commits first");
+        pause.release();
+        assert_eq!(
+            upload.await.expect("task").unwrap_err(),
+            BackendError::RevisionConflict { current: Some(rb) }
+        );
+        assert_eq!(fake.revision_count(&file), 2);
+    }
+
+    #[tokio::test]
+    async fn pauses_apply_only_to_their_client() {
+        let fake = FakeBackend::new();
+        let a = fake.with_client(client("a"));
+        let b = fake.with_client(client("b"));
+        let root = root(&fake).await;
+        let pause = a.pause_at(FakePoint::CreateFolderBeforeCommit);
+        let other = tokio::time::timeout(
+            Duration::from_secs(5),
+            b.create_folder(&root, "b", SystemTime::UNIX_EPOCH),
+        )
+        .await
+        .expect("b is not paused")
+        .expect("mkdir");
+        assert_eq!(fake.list_children(&root).await.expect("list").len(), 1);
+        let paused = tokio::spawn({
+            let (a, root) = (a.clone(), root.clone());
+            async move { a.create_folder(&root, "a", SystemTime::UNIX_EPOCH).await }
+        });
+        pause.reached().await;
+        assert!(!paused.is_finished());
+        assert_eq!(
+            fake.list_children(&root).await.expect("list").len(),
+            1,
+            "nothing is applied while paused"
+        );
+        pause.release();
+        let created = paused.await.expect("task").expect("mkdir");
+        assert_ne!(created, other);
+        assert_eq!(fake.list_children(&root).await.expect("list").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rename_hash_check_can_be_disabled() {
+        let fake = FakeBackend::new();
+        let root = root(&fake).await;
+        let (file, _) = fake
             .upload_new(&root, "f", bytes(b"x"), meta())
             .await
             .expect("upload");
+        let stale = NameHash::new("fake:other");
         assert_eq!(
-            link,
-            LinkId::new("link-8"),
-            "ids continue after the stored ones"
+            fake.rename(&file, None, "g", Some(&stale)).await,
+            Err(BackendError::NameConflict)
         );
+        fake.set_name_hash_enforced(false);
+        fake.rename(&file, None, "g", Some(&stale))
+            .await
+            .expect("not enforced");
+        let renamed = fake.get_nodes(&[file]).await.expect("get").remove(0);
+        assert_eq!(renamed.expect("node").name, "g");
+    }
+
+    #[tokio::test]
+    async fn moving_a_folder_into_itself_is_invalid_move() {
+        let fake = FakeBackend::new();
+        let root = root(&fake).await;
+        let top = fake
+            .create_folder(&root, "top", SystemTime::UNIX_EPOCH)
+            .await
+            .expect("mkdir");
+        let inner = fake
+            .create_folder(&top, "inner", SystemTime::UNIX_EPOCH)
+            .await
+            .expect("mkdir");
+        assert_eq!(
+            fake.rename(&top, Some(&inner), "top", None).await,
+            Err(BackendError::InvalidMove)
+        );
+        assert_eq!(
+            fake.rename(&top, Some(&top), "top", None).await,
+            Err(BackendError::InvalidMove)
+        );
+        assert!(!BackendError::InvalidMove.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn official_app_revisions_carry_no_mode_and_optionally_no_sha1() {
+        let fake = FakeBackend::new();
+        let app = fake.with_client(FakeClient {
+            uid: Some("web".into()),
+            claims_sha1: false,
+            claims_mode: false,
+        });
+        let half = fake.with_client(FakeClient {
+            claims_sha1: true,
+            claims_mode: false,
+            ..FakeClient::default()
+        });
+        let root = root(&fake).await;
+        let (plain, _) = fake
+            .upload_new(&root, "plain", bytes(b"x"), meta())
+            .await
+            .expect("upload");
+        let (web, _) = app
+            .upload_new(&root, "web", bytes(b"y"), meta())
+            .await
+            .expect("upload");
+        let (partial, _) = half
+            .upload_new(&root, "half", bytes(b"z"), meta())
+            .await
+            .expect("upload");
+        let node = |link: LinkId| {
+            let fake = fake.clone();
+            async move {
+                fake.get_nodes(&[link])
+                    .await
+                    .expect("get")
+                    .remove(0)
+                    .expect("node")
+            }
+        };
+        let plain = node(plain).await;
+        assert_eq!((plain.mode, plain.sha1.is_some()), (Some(0o644), true));
+        let web_node = node(web.clone()).await;
+        assert_eq!((web_node.mode, web_node.sha1), (None, None));
+        let partial = node(partial).await;
+        assert_eq!((partial.mode, partial.sha1.is_some()), (None, true));
+        let revisions = fake.revisions(&web).await.expect("revisions");
+        assert_eq!(revisions[0].sha1, None);
+        assert_eq!(revisions[0].client_uid.as_deref(), Some("web"));
+        assert!(
+            fake.all_revision_sha1s()
+                .contains(&<[u8; 20]>::from(sha1::Sha1::digest(b"y"))),
+            "the server still has the content hash"
+        );
+    }
+
+    /// Removes the fields M3.3 added from every revision in `value`.
+    fn strip_new_revision_fields(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.contains_key("sha1") && map.contains_key("size") {
+                    for key in ["client_uid", "sha1_claimed", "seq"] {
+                        map.remove(key);
+                    }
+                }
+                map.values_mut().for_each(strip_new_revision_fields);
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(strip_new_revision_fields),
+            _ => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn persisted_revisions_without_new_fields_still_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = {
+            let fake = FakeBackend::open(dir.path()).expect("open");
+            let root = root(&fake).await;
+            let (file, r1) = fake
+                .upload_new(&root, "f", bytes(b"v1"), meta())
+                .await
+                .expect("upload");
+            fake.upload_revision(&file, &r1, bytes(b"v2"), meta())
+                .await
+                .expect("revision");
+            file
+        };
+        let path = dir.path().join("journal.jsonl");
+        let journal = std::fs::read_to_string(&path).expect("journal");
+        assert!(
+            journal.contains("sha1_claimed"),
+            "the new format is written"
+        );
+        let old: Vec<String> = journal
+            .lines()
+            .map(|line| {
+                let mut value: serde_json::Value = serde_json::from_str(line).expect("line");
+                strip_new_revision_fields(&mut value);
+                value.to_string()
+            })
+            .collect();
+        assert!(!old.join("\n").contains("sha1_claimed"));
+        std::fs::write(&path, old.join("\n") + "\n").expect("rewrite");
+        let fake = FakeBackend::open(dir.path()).expect("reopen");
+        assert_eq!(fake.content(&file).as_deref(), Some(&b"v2"[..]));
+        let revisions = fake.revisions(&file).await.expect("revisions");
+        assert_eq!(revisions.len(), 2);
+        assert!(
+            revisions.iter().all(|r| r.sha1.is_some()),
+            "claimed by default"
+        );
+        assert!(revisions.iter().all(|r| r.client_uid.is_none()));
+        let node = fake.get_nodes(&[file]).await.expect("get").remove(0);
+        assert_eq!(node.expect("node").mode, Some(0o644));
+    }
+
+    #[tokio::test]
+    async fn fault_rules_apply_per_client_and_expire() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = FakeBackend::open(dir.path()).expect("open");
+        let a = fake.with_client(client("a"));
+        let b = fake.with_client(client("b"));
+        let now = unix_ms();
+        add_fault(
+            dir.path(),
+            FaultRule {
+                kind: FaultKind::Offline,
+                until_ms: None,
+                client: Some("a".into()),
+            },
+        )
+        .expect("rule");
+        assert_eq!(
+            a.root().await.unwrap_err(),
+            BackendError::Offline("injected".into())
+        );
+        b.root().await.expect("b is not affected");
+        fake.root()
+            .await
+            .expect("a client without a uid is not affected");
+        add_fault(
+            dir.path(),
+            FaultRule {
+                kind: FaultKind::Unauthorized,
+                until_ms: Some(now + 300),
+                client: Some("b".into()),
+            },
+        )
+        .expect("rule");
+        assert_eq!(b.root().await.unwrap_err(), BackendError::Unauthorized);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        b.root().await.expect("the rule expired");
+        assert!(a.storage_info().await.is_err(), "every call is covered");
+        clear_faults(dir.path(), Some("a")).expect("clear");
+        a.root().await.expect("cleared");
+    }
+
+    #[tokio::test]
+    async fn a_changed_fault_file_is_picked_up() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let daemon = FakeBackend::open(dir.path()).expect("open");
+        daemon.root().await.expect("no file, no faults");
+        let rule = |kind| FaultRule {
+            kind,
+            until_ms: None,
+            client: None,
+        };
+        add_fault(dir.path(), rule(FaultKind::Offline)).expect("rule");
+        assert!(matches!(daemon.root().await, Err(BackendError::Offline(_))));
+        clear_faults(dir.path(), None).expect("clear");
+        daemon.root().await.expect("cleared");
+        add_fault(dir.path(), rule(FaultKind::Unauthorized)).expect("rule");
+        assert_eq!(daemon.root().await.unwrap_err(), BackendError::Unauthorized);
+        std::fs::remove_file(dir.path().join("faults.json")).expect("remove");
+        daemon.root().await.expect("a missing file is no faults");
+        std::fs::write(dir.path().join("faults.json"), b"not json").expect("write");
+        daemon.root().await.expect("a malformed file is ignored");
     }
 }

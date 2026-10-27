@@ -26,12 +26,15 @@
 
 use crate::cache::Priority;
 use crate::config::{MetaRevisionPolicy, UploadConfig};
+use crate::conflicts::{ConflictKind, ConflictNote};
 use crate::engine::Engine;
 use crate::errors::{CoreError, Result};
+use crate::lock_order::{self, Rank};
 use crate::metrics::{Metrics, check_not_hot};
-use crate::vfs::{Content, DEFAULT_FILE_MODE, Ino, ROOT_INO, RemoteState};
+use crate::staging::Base;
+use crate::vfs::{Changes, Content, DEFAULT_FILE_MODE, Ino, Invalidation, ROOT_INO, RemoteState};
 use pdmount_backend::{
-    BackendError, FileMeta, LinkId, NameHash, NodeKind, RevisionId, UploadSource,
+    BackendError, FileMeta, LinkId, NameHash, NodeKind, RemoteNode, RevisionId, UploadSource,
 };
 use sha1::Digest;
 use std::collections::BTreeMap;
@@ -47,7 +50,13 @@ const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
 /// Attempts after which a non-retryable error parks an entry.
 const PARK_AFTER: u32 = 5;
+/// Steps in a row that end in `Replan` before the entry waits a second
+/// between plans: the tree and the drive disagree in a way no step settles.
+const REPLAN_BURST: u32 = 16;
 const TRASH_BATCH: usize = 50;
+/// Largest file whose remote content is read to compare it with a local one
+/// when the remote revision claims no SHA-1 (D040).
+const IDENTICAL_PROBE_MAX: u64 = 16 << 20;
 const MAX_WAKE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
@@ -65,6 +74,8 @@ struct Entry {
     blocked_on: Option<Ino>,
     /// The last failure, for `status` and diagnostics.
     last_error: Option<String>,
+    /// Steps in a row that ended in `Replan`.
+    replans: u32,
     /// Bumped by every change and force: a plan made from an older
     /// generation must not defer, block or remove the entry.
     generation: u64,
@@ -82,6 +93,7 @@ impl Entry {
             forced: false,
             blocked_on: None,
             last_error: None,
+            replans: 0,
             generation: 0,
         }
     }
@@ -99,19 +111,21 @@ pub struct QueueCounts {
 #[derive(Default)]
 struct State {
     entries: BTreeMap<Ino, Entry>,
-    uploads_running: usize,
     /// Every entry is forced (draining before an unmount).
     draining: bool,
 }
 
 pub(crate) struct Journal {
-    state: parking_lot::Mutex<State>,
+    state: lock_order::Mutex<State>,
     wake: tokio::sync::Notify,
+    /// Directories to list again (see `Node::clashed`).
+    listings: parking_lot::Mutex<Vec<Ino>>,
     /// Signalled whenever an entry finishes, fails or leaves.
     progress: tokio::sync::Notify,
+    /// One permit per running upload (`upload.concurrency`).
+    uploads: Arc<tokio::sync::Semaphore>,
     debounce: Duration,
     max_dirty_age: Duration,
-    concurrency: usize,
     meta_revision: MetaRevisionPolicy,
 }
 
@@ -126,12 +140,15 @@ struct Timing {
 impl Journal {
     pub(crate) fn new(config: &UploadConfig) -> Self {
         Self {
-            state: parking_lot::Mutex::default(),
+            state: lock_order::Mutex::new(Rank::Leaf, State::default()),
             wake: tokio::sync::Notify::new(),
+            listings: parking_lot::Mutex::default(),
             progress: tokio::sync::Notify::new(),
+            uploads: Arc::new(tokio::sync::Semaphore::new(
+                config.concurrency.max(1) as usize
+            )),
             debounce: config.debounce.0,
             max_dirty_age: config.max_dirty_age.0,
-            concurrency: config.concurrency.max(1) as usize,
             meta_revision: config.meta_revision,
         }
     }
@@ -141,6 +158,12 @@ impl Journal {
         let entry = state.entries.entry(ino).or_insert_with(|| Entry::new(now));
         entry.forced |= draining;
         entry
+    }
+
+    /// Asks for `dirs` to be listed again; `run_journal` does it.
+    pub(crate) fn list_later(&self, dirs: Vec<Ino>) {
+        self.listings.lock().extend(dirs);
+        self.wake.notify_one();
     }
 
     /// A namespace change: re-plan at once.
@@ -188,6 +211,13 @@ impl Journal {
             .entries
             .get(&ino)
             .is_some_and(|e| e.in_flight)
+    }
+
+    /// `(parked, in flight)` of a queued inode; `None` when it is not queued.
+    pub(crate) fn entry_state(&self, ino: Ino) -> Option<(bool, bool)> {
+        let state = self.state.lock();
+        let entry = state.entries.get(&ino)?;
+        Some((entry.parked.is_some(), entry.in_flight))
     }
 
     pub(crate) fn counts(&self) -> QueueCounts {
@@ -323,30 +353,24 @@ impl Journal {
         }
     }
 
-    fn try_start_upload(&self, ino: Ino) -> bool {
+    /// Starts an upload if fewer than `upload.concurrency` run; it runs
+    /// while the permit is held.
+    fn try_start_upload(&self, ino: Ino) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let permit = Arc::clone(&self.uploads).try_acquire_owned().ok()?;
         let mut state = self.state.lock();
-        if state.uploads_running >= self.concurrency {
-            return false;
-        }
-        let Some(entry) = state.entries.get_mut(&ino) else {
-            return false;
-        };
-        entry.in_flight = true;
-        state.uploads_running += 1;
-        true
+        state.entries.get_mut(&ino)?.in_flight = true;
+        Some(permit)
     }
 
     /// A step succeeded: re-plan the entry at once (it may need more).
-    fn succeeded(&self, ino: Ino, upload: bool) {
+    fn succeeded(&self, ino: Ino) {
         let now = Instant::now();
         {
             let mut state = self.state.lock();
-            if upload {
-                state.uploads_running = state.uploads_running.saturating_sub(1);
-            }
             if let Some(entry) = state.entries.get_mut(&ino) {
                 entry.in_flight = false;
                 entry.attempts = 0;
+                entry.replans = 0;
                 entry.not_before = now;
             }
             Self::unblock(&mut state, ino);
@@ -355,31 +379,54 @@ impl Journal {
         self.progress.notify_waiters();
     }
 
+    /// A step ended in `Replan`: the entry is planned again at once, unless
+    /// it keeps doing so without a step ever working; then it backs off like
+    /// a failing step, so a stuck cycle costs few API calls.
+    fn replanned(&self, ino: Ino) {
+        let now = Instant::now();
+        {
+            let mut state = self.state.lock();
+            if let Some(entry) = state.entries.get_mut(&ino) {
+                entry.in_flight = false;
+                entry.attempts = 0;
+                entry.replans += 1;
+                entry.not_before = if entry.replans > REPLAN_BURST {
+                    tracing::warn!(ino, "planning the same step again and again");
+                    now + backoff(entry.replans - REPLAN_BURST)
+                } else {
+                    now
+                };
+            }
+            Self::unblock(&mut state, ino);
+        }
+        self.wake.notify_one();
+        self.progress.notify_waiters();
+    }
+
     /// A step failed: back off, or park after too many attempts.
-    fn failed(&self, ino: Ino, upload: bool, error: &BackendError) -> bool {
+    fn failed(&self, ino: Ino, error: &BackendError) -> bool {
         let now = Instant::now();
         let parked = {
             let mut state = self.state.lock();
-            if upload {
-                state.uploads_running = state.uploads_running.saturating_sub(1);
-            }
             let Some(entry) = state.entries.get_mut(&ino) else {
                 return false;
             };
             entry.in_flight = false;
-            entry.attempts += 1;
+            // Without a connection or a session the entry is not at fault.
+            let unreachable = error.is_unreachable();
+            if !unreachable {
+                entry.attempts += 1;
+            }
             entry.last_error = Some(error.to_string());
-            let permanent = permanent_reason(error);
-            if let Some(reason) = permanent.filter(|_| !error.is_retryable())
-                && (entry.attempts >= PARK_AFTER || parks_at_once(error))
-            {
-                entry.parked = Some(reason);
+            if error.is_permanent() && (entry.attempts >= PARK_AFTER || error.needs_the_user()) {
+                entry.parked = Some(error.to_string());
                 true
             } else {
                 let mut delay = match error {
                     BackendError::RateLimited {
                         retry_after: Some(after),
                     } => *after,
+                    _ if unreachable => BACKOFF_MIN,
                     _ => backoff(entry.attempts),
                 };
                 delay = delay.min(BACKOFF_MAX);
@@ -392,11 +439,8 @@ impl Journal {
         parked
     }
 
-    fn park(&self, ino: Ino, upload: bool, reason: String) {
+    fn park(&self, ino: Ino, reason: String) {
         let mut state = self.state.lock();
-        if upload {
-            state.uploads_running = state.uploads_running.saturating_sub(1);
-        }
         if let Some(entry) = state.entries.get_mut(&ino) {
             entry.in_flight = false;
             entry.parked = Some(reason);
@@ -408,6 +452,18 @@ impl Journal {
     pub(crate) fn wake(&self) {
         self.wake.notify_one();
     }
+
+    /// The connection is back: every entry that is not parked retries now.
+    pub(crate) fn wake_all(&self) {
+        let now = Instant::now();
+        {
+            let mut state = self.state.lock();
+            for entry in state.entries.values_mut().filter(|e| e.parked.is_none()) {
+                entry.not_before = entry.not_before.min(now);
+            }
+        }
+        self.wake.notify_one();
+    }
 }
 
 fn backoff(attempts: u32) -> Duration {
@@ -417,28 +473,6 @@ fn backoff(attempts: u32) -> Duration {
 }
 
 /// Errors retrying cannot fix soon. `None`: keep retrying.
-fn permanent_reason(error: &BackendError) -> Option<String> {
-    match error {
-        BackendError::RateLimited { .. }
-        | BackendError::Transient(_)
-        | BackendError::Offline(_)
-        | BackendError::Unauthorized => None,
-        other => Some(other.to_string()),
-    }
-}
-
-fn parks_at_once(error: &BackendError) -> bool {
-    matches!(
-        error,
-        BackendError::QuotaExceeded
-            | BackendError::FileTooLarge
-            | BackendError::Unsupported(_)
-            | BackendError::PermissionDenied
-            | BackendError::TooManyChildren
-            | BackendError::NestingTooDeep
-    )
-}
-
 /// The next remote step for an inode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Plan {
@@ -491,6 +525,16 @@ impl Engine {
     /// The executor loop; runs until the engine shuts down.
     pub(crate) async fn run_journal(self: Arc<Self>) {
         loop {
+            self.health.wait_online().await;
+            let relist = std::mem::take(&mut *self.journal.listings.lock());
+            for dir in relist {
+                let this = Arc::clone(&self);
+                self.runtime().spawn(async move {
+                    if let Err(error) = this.list(dir).await {
+                        tracing::debug!(dir, %error, "listing after a freed name failed");
+                    }
+                });
+            }
             let now = Instant::now();
             let (ready, next) = self.journal.ready(now);
             let mut trash: Vec<(Ino, LinkId)> = Vec::new();
@@ -507,10 +551,10 @@ impl Engine {
                         trash.push((ino, link));
                     }
                     Plan::Work(Work::Upload(target)) => {
-                        if self.journal.try_start_upload(ino) {
+                        if let Some(permit) = self.journal.try_start_upload(ino) {
                             let this = Arc::clone(&self);
                             self.runtime().spawn(async move {
-                                this.upload(ino, target).await;
+                                this.upload(ino, target, permit).await;
                             });
                         } else {
                             self.journal.defer(
@@ -606,14 +650,15 @@ impl Engine {
                 }))
             }
             (NodeKind::Folder, Some(_)) => Plan::Done,
-            (NodeKind::File, None) => match self.upload_wait(node.open_writers, timing, now, false)
-            {
-                Some(until) => Plan::Wait(until),
-                None => reserve(Plan::Work(Work::Upload(Target::New {
-                    parent: parent.clone(),
-                    name: node.name.clone(),
-                }))),
-            },
+            (NodeKind::File, None) => {
+                match self.upload_wait(node.open_writers, timing, now, false, false) {
+                    Some(until) => Plan::Wait(until),
+                    None => reserve(Plan::Work(Work::Upload(Target::New {
+                        parent: parent.clone(),
+                        name: node.name.clone(),
+                    }))),
+                }
+            }
             (NodeKind::File, Some(remote)) => {
                 let content = node.content_pending();
                 if !content && !node.meta_pending() {
@@ -629,7 +674,8 @@ impl Engine {
                         return Plan::SkipMeta;
                     }
                 }
-                match self.upload_wait(node.open_writers, timing, now, !content) {
+                match self.upload_wait(node.open_writers, timing, now, !content, node.remote_newer)
+                {
                     Some(until) => Plan::Wait(until),
                     None => Plan::Work(Work::Upload(Target::Revision {
                         link: remote.link.clone(),
@@ -646,8 +692,14 @@ impl Engine {
         timing: Timing,
         now: Instant,
         meta_only: bool,
+        remote_newer: bool,
     ) -> Option<Instant> {
         if timing.forced {
+            return None;
+        }
+        if remote_newer && writers == 0 {
+            // The conflict is known: settle it now instead of after the
+            // debounce (§10.4).
             return None;
         }
         if now.saturating_duration_since(timing.dirty_since) >= self.journal.max_dirty_age {
@@ -690,12 +742,18 @@ impl Engine {
             Work::Upload(_) | Work::Trash { .. } => unreachable!("handled by the loop"),
         };
         match result {
-            Ok(()) => self.journal.succeeded(ino, false),
-            Err(error) => self.step_failed(ino, false, &error),
+            // `Replan`: the tree changed under the step; look at the node again.
+            Ok(()) => self.journal.succeeded(ino),
+            Err(UploadError::Replan) => self.journal.replanned(ino),
+            Err(UploadError::Backend(error)) => self.step_failed(ino, &error),
+            Err(UploadError::Park(reason)) => {
+                tracing::warn!(ino, reason, "step parked");
+                self.journal.park(ino, reason);
+            }
         }
     }
 
-    fn step_failed(&self, ino: Ino, upload: bool, error: &BackendError) {
+    fn step_failed(&self, ino: Ino, error: &BackendError) {
         tracing::warn!(ino, %error, "journal step failed");
         let deferred = match error {
             BackendError::QuotaExceeded => Some(nix::libc::ENOSPC),
@@ -708,7 +766,7 @@ impl Engine {
             }
             self.persist(&[ino]);
         }
-        if self.journal.failed(ino, upload, error) {
+        if self.journal.failed(ino, error) {
             tracing::warn!(ino, %error, "journal entry parked");
         }
     }
@@ -719,44 +777,38 @@ impl Engine {
         parent: LinkId,
         name: String,
         mtime: SystemTime,
-    ) -> std::result::Result<(), BackendError> {
+    ) -> std::result::Result<(), UploadError> {
         check_not_hot(&self.metrics, "create_folder");
-        let mut adopted = false;
-        let remote = match self.backend.create_folder(&parent, &name, mtime).await {
-            Ok(link) => RemoteState {
-                link,
-                parent_link: Some(parent),
-                name,
-                rev: None,
-                size: 0,
-                mtime,
-                mode: None,
-                sha1: None,
-                name_hash: None,
-            },
-            // A folder of that name exists remotely and nothing local knows
-            // it: merge into it (§15.3 M7).
-            Err(BackendError::AlreadyExists {
-                existing: Some(existing),
-            }) if self.tree.read().by_link(&existing).is_none() => {
-                let node = self
-                    .backend
-                    .get_nodes(std::slice::from_ref(&existing))
-                    .await?;
-                match node.into_iter().next().flatten() {
-                    Some(node) if node.kind == NodeKind::Folder => {
-                        adopted = true;
-                        RemoteState::from_remote(&node)
-                    }
-                    _ => {
-                        return Err(BackendError::AlreadyExists {
-                            existing: Some(existing),
-                        });
-                    }
-                }
+        match self.backend.create_folder(&parent, &name, mtime).await {
+            Ok(link) => {
+                self.bind_folder(
+                    ino,
+                    RemoteState {
+                        link,
+                        parent_link: Some(parent),
+                        name,
+                        rev: None,
+                        size: 0,
+                        mtime,
+                        mode: None,
+                        sha1: None,
+                        name_hash: None,
+                    },
+                );
+                Ok(())
             }
-            Err(error) => return Err(error),
-        };
+            // A node of that name exists remotely: merge into a folder, give
+            // way to anything else (§15.3 M7).
+            Err(BackendError::AlreadyExists { existing }) => {
+                Err(self.name_clash(ino, &parent, &name, existing, None).await)
+            }
+            Err(BackendError::NotFound) => Err(self.parent_vanished(&parent).await),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Records the remote folder behind a folder created locally.
+    fn bind_folder(&self, ino: Ino, remote: RemoteState) {
         {
             let stamp = self.stamp();
             let mut tree = self.tree.write();
@@ -771,44 +823,93 @@ impl Engine {
             }
         }
         self.persist(&[ino]);
-        if adopted {
-            // Pick up children the existing folder may have.
-            let this = Arc::clone(self);
-            self.runtime().spawn(async move {
-                if let Err(error) = this.list(ino).await {
-                    tracing::debug!(ino, %error, "listing a merged folder failed");
-                }
-            });
-        }
-        Ok(())
     }
 
+    /// A rename or move, after a fresh look at the node (§8.3, §10.5): the
+    /// remote may have moved it, or trashed it, since the plan was made.
     async fn move_node(
-        &self,
+        self: &Arc<Self>,
         ino: Ino,
         link: LinkId,
         new_parent: Option<LinkId>,
         name: String,
         expected: Option<NameHash>,
-    ) -> std::result::Result<(), BackendError> {
+    ) -> std::result::Result<(), UploadError> {
         check_not_hot(&self.metrics, "rename");
+        let fresh = self.fresh_or_vanished(ino, &link).await?;
+        let known = self
+            .tree
+            .read()
+            .get(ino)
+            .and_then(|node| node.remote.clone())
+            .filter(|remote| remote.link == link)
+            .ok_or_else(|| UploadError::retry("the remote node changed before the rename"))?;
+        let target = new_parent.clone().or_else(|| known.parent_link.clone());
+        let placement = (known.parent_link.clone(), known.name.clone());
+        if (&fresh.parent_link_id, &fresh.name) != (&placement.0, &placement.1) {
+            // The remote committed first.
+            return Err(self.remote_moved_first(ino, &fresh, target.as_ref(), &name));
+        }
+        // The precondition is the hash read just now, never an older one.
+        let hash = fresh.name_hash.clone().or(expected);
+        if hash != known.name_hash {
+            let stamp = self.stamp();
+            let mut tree = self.tree.write();
+            tree.set_remote_at(
+                ino,
+                Some(RemoteState {
+                    name_hash: hash.clone(),
+                    ..known
+                }),
+                stamp,
+            );
+            drop(tree);
+            self.persist(&[ino]);
+        }
         match self
             .backend
-            .rename(&link, new_parent.as_ref(), &name, expected.as_ref())
+            .rename(&link, new_parent.as_ref(), &name, hash.as_ref())
             .await
         {
             Ok(()) => {}
             Err(BackendError::NameConflict) => {
-                // The name changed remotely since it was read: refresh the
-                // precondition and try again.
-                let fresh = self.backend.get_nodes(std::slice::from_ref(&link)).await?;
-                if let Some(node) = fresh.into_iter().next().flatten() {
-                    let mut tree = self.tree.write();
-                    tree.set_remote(ino, Some(RemoteState::from_remote(&node)));
+                // The hash went stale between the look and the rename.
+                let fresh = self.fresh_or_vanished(ino, &link).await?;
+                if (&fresh.parent_link_id, &fresh.name) == (&placement.0, &placement.1) {
+                    return Err(UploadError::Park(
+                        "the server refused the name hash of an unchanged node".into(),
+                    ));
                 }
-                return Err(BackendError::Transient("name hash refreshed".into()));
+                return Err(self.remote_moved_first(ino, &fresh, target.as_ref(), &name));
             }
-            Err(error) => return Err(error),
+            Err(BackendError::InvalidMove) => {
+                let fresh = self.fresh_or_vanished(ino, &link).await?;
+                return Err(self.keep_server_placement(ino, &fresh));
+            }
+            Err(BackendError::AlreadyExists { .. }) => {
+                let Some(parent) = target else {
+                    return Err(UploadError::Park(
+                        "the folder of the rename is unknown".into(),
+                    ));
+                };
+                return Err(
+                    match self
+                        .yield_to_remote(ino, &parent, ConflictKind::NameTaken, Some(link), None)
+                        .await
+                    {
+                        Ok(()) => UploadError::Replan,
+                        Err(error) => error,
+                    },
+                );
+            }
+            Err(BackendError::NotFound) => {
+                // The node, or the folder it moves into, is gone.
+                return Err(match (&new_parent, self.fresh_live(&link).await?) {
+                    (Some(parent), Some(_)) => self.parent_vanished(parent).await,
+                    _ => self.vanished(ino).await,
+                });
+            }
+            Err(error) => return Err(error.into()),
         }
         {
             let stamp = self.stamp();
@@ -831,60 +932,333 @@ impl Engine {
         Ok(())
     }
 
-    async fn trash(&self, batch: &[(Ino, LinkId)]) {
+    /// The remote node `fresh` was moved or renamed before our rename ran.
+    /// The one that committed first wins (§10.5): the inode follows the
+    /// remote placement, unless that is impossible (an unlisted folder, a
+    /// taken name), when the local placement is kept and pushed afterwards.
+    /// Always `Replan`.
+    fn remote_moved_first(
+        &self,
+        ino: Ino,
+        fresh: &RemoteNode,
+        target: Option<&LinkId>,
+        name: &str,
+    ) -> UploadError {
+        let Some((orig_name, adopted)) = self.take_remote_placement(ino, fresh) else {
+            return UploadError::Replan;
+        };
+        if fresh.parent_link_id.as_ref() == target && fresh.name == name {
+            // The other device made the very same move.
+            if let Some(changes) = adopted {
+                self.apply_changes(changes);
+            }
+            return UploadError::Replan;
+        }
+        let detail = match adopted {
+            Some(changes) => {
+                self.apply_changes(changes);
+                format!("kept {} from another device", fresh.name)
+            }
+            None => {
+                tracing::warn!(ino, name = fresh.name, "local placement kept");
+                format!(
+                    "moved remotely to {} but the folder is not shown here; local placement kept",
+                    fresh.name
+                )
+            }
+        };
+        self.record_conflict(ConflictNote {
+            link: Some(fresh.link_id.clone()),
+            remote_rev: fresh.active_revision.clone(),
+            detail: Some(detail),
+            ..ConflictNote::new(ConflictKind::RenameRename, ino, orig_name)
+        });
+        UploadError::Replan
+    }
+
+    /// The server refused a move into the node's own subtree (another device
+    /// moved things meanwhile): its placement stays (§10.5).
+    fn keep_server_placement(&self, ino: Ino, fresh: &RemoteNode) -> UploadError {
+        let Some((orig_name, adopted)) = self.take_remote_placement(ino, fresh) else {
+            return UploadError::Replan;
+        };
+        let Some(changes) = adopted else {
+            return UploadError::Park(format!(
+                "move cycle: the server keeps {} in place and its folder is not shown here",
+                fresh.name
+            ));
+        };
+        self.apply_changes(changes);
+        self.record_conflict(ConflictNote {
+            link: Some(fresh.link_id.clone()),
+            detail: Some("the server refused a move into the folder's own subtree".to_owned()),
+            ..ConflictNote::new(ConflictKind::MoveCycle, ino, orig_name)
+        });
+        UploadError::Replan
+    }
+
+    /// Records the remote placement of `fresh` as the node's and moves the
+    /// inode there if it can. Returns its local name from before, and the
+    /// changes (`None`: it cannot follow).
+    fn take_remote_placement(
+        &self,
+        ino: Ino,
+        fresh: &RemoteNode,
+    ) -> Option<(String, Option<Changes>)> {
+        let stamp = self.stamp();
+        let (orig_name, adopted) = {
+            let mut tree = self.tree.write();
+            let node = tree.get(ino)?;
+            let known = node
+                .remote
+                .clone()
+                .filter(|remote| remote.link == fresh.link_id)?;
+            let orig_name = node.name.clone();
+            tree.set_remote_at(ino, Some(known.with_placement_of(fresh)), stamp);
+            (orig_name, tree.adopt_remote_placement(ino))
+        };
+        self.persist(&[ino]);
+        Some((orig_name, adopted))
+    }
+
+    /// Trashes remote nodes after a fresh look (§8.4, §10.5): what changed
+    /// remotely since the local delete is not trashed but comes back.
+    async fn trash(self: &Arc<Self>, batch: &[(Ino, LinkId)]) {
         check_not_hot(&self.metrics, "trash");
         let links: Vec<LinkId> = batch.iter().map(|(_, link)| link.clone()).collect();
-        let results = match self.backend.trash(&links).await {
-            Ok(results) => results,
+        check_not_hot(&self.metrics, "get_nodes");
+        let fresh = match self.backend.get_nodes(&links).await {
+            Ok(fresh) => fresh,
             Err(error) => {
                 for (ino, _) in batch {
-                    self.step_failed(*ino, false, &error);
+                    self.step_failed(*ino, &error);
                 }
                 return;
             }
         };
-        for ((ino, link), result) in batch.iter().zip(results) {
+        let mut send: Vec<(Ino, LinkId)> = Vec::new();
+        for ((ino, link), node) in batch.iter().zip(fresh) {
+            // Gone already (e.g. trashed with its folder) counts as done.
+            let Some(node) = node.filter(|node| !node.trashed) else {
+                self.trash_finished(*ino, link);
+                continue;
+            };
+            match self.trash_check(*ino, &node).await {
+                Ok(true) => send.push((*ino, link.clone())),
+                Ok(false) => {}
+                Err(error) => self.step_failed(*ino, &error),
+            }
+        }
+        if send.is_empty() {
+            return;
+        }
+        let links: Vec<LinkId> = send.iter().map(|(_, link)| link.clone()).collect();
+        let results = match self.backend.trash(&links).await {
+            Ok(results) => results,
+            Err(error) => {
+                for (ino, _) in &send {
+                    self.step_failed(*ino, &error);
+                }
+                return;
+            }
+        };
+        for ((ino, link), result) in send.iter().zip(results) {
             match result {
-                // Already gone (e.g. trashed with its folder) counts as done.
-                Ok(()) | Err(BackendError::NotFound) => {
-                    let droppable = {
-                        let stamp = self.stamp();
-                        let mut tree = self.tree.write();
-                        tree.note_trashed(link.clone(), stamp);
-                        if tree.link_of(*ino) == Some(link) {
-                            tree.set_remote(*ino, None);
-                        }
-                        if let Some(node) = tree.get_mut(*ino) {
-                            node.deleted = false;
-                        }
-                        tree.is_droppable(*ino)
+                Ok(()) | Err(BackendError::NotFound) => self.trash_finished(*ino, link),
+                Err(error) => self.step_failed(*ino, &error),
+            }
+        }
+    }
+
+    fn trash_finished(&self, ino: Ino, link: &LinkId) {
+        {
+            let stamp = self.stamp();
+            let mut tree = self.tree.write();
+            tree.note_trashed(link.clone(), stamp);
+            if tree.link_of(ino) == Some(link) {
+                tree.set_remote(ino, None);
+            }
+            if let Some(node) = tree.get_mut(ino) {
+                node.deleted = false;
+            }
+        }
+        self.persist(&[ino]);
+        self.journal.succeeded(ino);
+        self.drop_detached(ino);
+    }
+
+    /// The revision a node's content builds on, and whether a newer remote
+    /// revision is known. `None` for an unknown node.
+    fn base_of(&self, ino: Ino) -> Option<(Option<RevisionId>, bool)> {
+        let staged_base = self
+            .staged_entry(ino)
+            .and_then(|staged| staged.lock().base_rev().cloned());
+        let tree = self.tree.read();
+        let node = tree.get(ino)?;
+        let base = staged_base.or_else(|| node.remote.as_ref().and_then(|r| r.rev.clone()));
+        Some((base, node.remote_newer))
+    }
+
+    /// Whether the tombstone `ino` may be trashed: `false` when the remote
+    /// node has something the local delete did not know about, in which case
+    /// the node is kept and shown again.
+    async fn trash_check(
+        self: &Arc<Self>,
+        ino: Ino,
+        fresh: &RemoteNode,
+    ) -> std::result::Result<bool, BackendError> {
+        let Some((base, remote_newer)) = self.base_of(ino) else {
+            return Ok(true);
+        };
+        let (kind, detail, local_rev) = match fresh.kind {
+            NodeKind::File => {
+                if fresh.active_revision == base && !remote_newer {
+                    return Ok(true);
+                }
+                (ConflictKind::LocalDeleteRemoteEdit, None, base)
+            }
+            NodeKind::Folder => {
+                check_not_hot(&self.metrics, "list_children");
+                let kids = match self.backend.list_children(&fresh.link_id).await {
+                    Ok(kids) => kids,
+                    // The folder is gone; the trash call says so.
+                    Err(BackendError::NotFound) => return Ok(true),
+                    Err(error) => return Err(error),
+                };
+                // Kids the local tree knows: moved elsewhere (wait for the
+                // move), or deleted too (their own entries trash them; wait
+                // for deleted folders).
+                let known: Vec<Option<Ino>> = {
+                    let tree = self.tree.read();
+                    kids.iter().map(|kid| tree.by_link(&kid.link_id)).collect()
+                };
+                let mut foreign = 0usize;
+                for (kid, held) in kids.iter().zip(known) {
+                    let Some(held) = held else {
+                        foreign += 1;
+                        continue;
                     };
-                    self.persist(&[*ino]);
-                    self.journal.succeeded(*ino, false);
-                    if droppable {
-                        self.tree.write().drop_node(*ino);
-                        self.unstage(*ino);
-                        self.persist(&[*ino]);
-                        self.remove_staging_after_commit(*ino);
+                    let (attached, deleted) = {
+                        let tree = self.tree.read();
+                        let node = tree.get(held);
+                        (
+                            node.is_some_and(|n| n.attached),
+                            node.is_some_and(|n| n.deleted),
+                        )
+                    };
+                    if attached {
+                        return Err(BackendError::Transient(
+                            "waiting for moves out of the folder".into(),
+                        ));
+                    }
+                    if deleted && kid.kind == NodeKind::Folder {
+                        // Its own check lists it; until then something new
+                        // inside it would go to the trash with this folder.
+                        return Err(BackendError::Transient(
+                            "waiting for the folders deleted inside it".into(),
+                        ));
+                    }
+                    let changed = match self.base_of(held) {
+                        Some((base, newer)) if deleted => {
+                            kid.kind == NodeKind::File && (kid.active_revision != base || newer)
+                        }
+                        _ => true,
+                    };
+                    if changed {
+                        foreign += 1;
                     }
                 }
-                Err(error) => self.step_failed(*ino, false, &error),
+                if foreign == 0 {
+                    return Ok(true);
+                }
+                (
+                    ConflictKind::LocalDeleteRemoteChildren,
+                    Some(foreign.to_string()),
+                    None,
+                )
             }
-        }
+        };
+        self.keep_remote(ino, fresh, kind, detail, local_rev).await;
+        Ok(false)
     }
 
-    async fn upload(self: Arc<Self>, ino: Ino, target: Target) {
-        match self.upload_now(ino, &target).await {
-            Ok(()) => self.journal.succeeded(ino, true),
-            Err(UploadError::Backend(error)) => self.step_failed(ino, true, &error),
+    /// Does not trash the tombstone `ino`: forgets it and lists the remote
+    /// parent, so that the remote node (with whatever is new in it) appears
+    /// again, and records why.
+    async fn keep_remote(
+        self: &Arc<Self>,
+        ino: Ino,
+        fresh: &RemoteNode,
+        kind: ConflictKind,
+        detail: Option<String>,
+        local_rev: Option<RevisionId>,
+    ) {
+        let orig_name = self
+            .tree
+            .read()
+            .get(ino)
+            .map(|node| node.name.clone())
+            .unwrap_or_else(|| fresh.name.clone());
+        let unbound = self.tree.write().unbind_tombstone(ino);
+        if let Some(changes) = unbound {
+            self.apply_changes(changes);
+        }
+        self.journal.succeeded(ino);
+        let parent = fresh
+            .parent_link_id
+            .as_ref()
+            .and_then(|link| self.tree.read().by_link(link));
+        if let Some(dir) = parent
+            && let Err(error) = self.list(dir).await
+        {
+            tracing::warn!(dir, %error, "listing a folder that kept a deleted node failed");
+        }
+        let other_ino = self.tree.read().by_link(&fresh.link_id);
+        self.record_conflict(ConflictNote {
+            other_ino,
+            link: Some(fresh.link_id.clone()),
+            local_rev,
+            remote_rev: fresh.active_revision.clone(),
+            detail,
+            ..ConflictNote::new(kind, ino, orig_name)
+        });
+    }
+
+    async fn upload(
+        self: Arc<Self>,
+        ino: Ino,
+        target: Target,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
+        let result = self.upload_now(ino, &target).await;
+        // Before the outcome wakes the loop, so the next upload can start.
+        drop(permit);
+        match result {
+            Ok(()) => self.journal.succeeded(ino),
+            Err(UploadError::Backend(error)) => self.step_failed(ino, &error),
             Err(UploadError::Park(reason)) => {
                 tracing::warn!(ino, reason, "upload parked");
-                self.journal.park(ino, true, reason);
+                self.journal.park(ino, reason);
             }
+            // The tree changed under the upload: look at the node again.
+            Err(UploadError::Replan) => self.journal.replanned(ino),
         }
     }
 
-    async fn upload_now(&self, ino: Ino, target: &Target) -> std::result::Result<(), UploadError> {
+    async fn upload_now(
+        self: &Arc<Self>,
+        ino: Ino,
+        target: &Target,
+    ) -> std::result::Result<(), UploadError> {
+        if let Target::Revision { link } = target
+            && let Some(fresh) = self.precheck_revision(ino, link).await?
+        {
+            // Only the content can tell whether the two versions differ.
+            let snapshot = self.snapshot(ino).await?;
+            let outcome = self.settle_with_snapshot(ino, &fresh, &snapshot).await;
+            let _ = std::fs::remove_file(&snapshot.path);
+            return Err(outcome);
+        }
         let snapshot = self.snapshot(ino).await?;
         let result = self.upload_snapshot(ino, target, &snapshot).await;
         if result.is_err() {
@@ -901,16 +1275,21 @@ impl Engine {
             if missing.is_empty() {
                 break;
             }
-            self.materialize(ino, &missing, Priority::Readahead)
-                .await
-                .map_err(UploadError::core)?;
+            match self.materialize(ino, &missing, Priority::Readahead).await {
+                Ok(()) => {}
+                // A resurrected file reads its old revision from the trash.
+                Err(CoreError::Backend(BackendError::NotFound) | CoreError::NotFound) => {
+                    return Err(UploadError::Park(
+                        "content only in the emptied trash".into(),
+                    ));
+                }
+                Err(error) => return Err(UploadError::core(error)),
+            }
         }
         let (path, base_rev, gens, mtime, mode) = {
             let staged = staged.lock();
             if !staged.fully_materialized() {
-                return Err(UploadError::Backend(BackendError::Transient(
-                    "staging changed while materializing".into(),
-                )));
+                return Err(UploadError::retry("staging changed while materializing"));
             }
             let path = staged.snapshot().map_err(|e| UploadError::core(e.into()))?;
             let tree = self.tree.read();
@@ -943,7 +1322,7 @@ impl Engine {
     }
 
     async fn upload_snapshot(
-        &self,
+        self: &Arc<Self>,
         ino: Ino,
         target: &Target,
         snapshot: &Snapshot,
@@ -967,36 +1346,19 @@ impl Engine {
                         name: name.clone(),
                         name_hash: None,
                     },
-                    Err(BackendError::AlreadyExists {
-                        existing: Some(existing),
-                    }) => {
-                        // Our own earlier upload, if the daemon died before
-                        // recording it (same content).
-                        let adopted = self.same_content(&existing, snapshot.sha1).await?;
-                        match adopted {
-                            Some(rev) => Uploaded {
-                                link: existing,
-                                rev,
-                                parent: Some(parent.clone()),
-                                name: name.clone(),
-                                name_hash: None,
-                            },
-                            None => {
-                                return Err(UploadError::Park(format!(
-                                    "a different file named {name:?} exists remotely (conflict handling: M3)"
-                                )));
-                            }
-                        }
+                    Err(BackendError::AlreadyExists { existing }) => {
+                        return Err(self
+                            .name_clash(ino, parent, name, existing, Some(snapshot))
+                            .await);
                     }
+                    Err(BackendError::NotFound) => return Err(self.parent_vanished(parent).await),
                     Err(error) => return Err(error.into()),
                 }
             }
             Target::Revision { link } => {
-                let remote = remote
-                    .filter(|r| &r.link == link)
-                    .ok_or(UploadError::Backend(BackendError::Transient(
-                        "the remote node changed before the upload".into(),
-                    )))?;
+                let remote = remote.filter(|r| &r.link == link).ok_or_else(|| {
+                    UploadError::retry("the remote node changed before the upload")
+                })?;
                 let base = snapshot.base_rev.clone().or_else(|| remote.rev.clone());
                 let unchanged = remote.sha1 == Some(snapshot.sha1)
                     && remote.size == snapshot.size
@@ -1017,16 +1379,19 @@ impl Engine {
                         .await
                     {
                         Ok(rev) => Some(rev),
+                        // Layer 3 of §10.4: the revision moved on after the
+                        // pre-check, or another client's draft is open.
                         Err(BackendError::RevisionConflict { .. }) => {
-                            match self.same_content(link, snapshot.sha1).await? {
-                                Some(rev) => Some(rev),
-                                None => {
-                                    return Err(UploadError::Park(
-                                        "the file changed remotely (conflict handling: M3)".into(),
-                                    ));
-                                }
+                            let fresh = self.fresh_or_vanished(ino, link).await?;
+                            if Some(&base) == fresh.active_revision.as_ref() {
+                                return Err(UploadError::retry("another draft is open"));
                             }
+                            if let Some(settled) = self.settle_cheap(ino, &fresh).await {
+                                return Err(settled);
+                            }
+                            return Err(self.settle_with_snapshot(ino, &fresh, snapshot).await);
                         }
+                        Err(BackendError::NotFound) => return Err(self.vanished(ino).await),
                         Err(error) => return Err(error.into()),
                     }
                 };
@@ -1042,35 +1407,524 @@ impl Engine {
                 }
             }
         };
-        self.commit_upload(ino, &uploaded, snapshot);
-        Ok(())
+        let revision = matches!(target, Target::Revision { .. });
+        if self.commit_upload(ino, &uploaded, snapshot, revision).await {
+            Ok(())
+        } else {
+            Err(UploadError::Replan)
+        }
     }
 
-    /// The active revision of `link` if its content has `sha1`.
-    async fn same_content(
+    /// The name of a new file or folder is held remotely, by `existing` or
+    /// by a node the server did not name (§10.6, D016). Always ends in
+    /// `Replan` (the node is bound to the remote node, or has a new name),
+    /// unless something failed. `snapshot` is the new file's content.
+    async fn name_clash(
+        self: &Arc<Self>,
+        ino: Ino,
+        parent: &LinkId,
+        name: &str,
+        existing: Option<LinkId>,
+        snapshot: Option<&Snapshot>,
+    ) -> UploadError {
+        match self
+            .settle_name_clash(ino, parent, name, existing, snapshot)
+            .await
+        {
+            Ok(()) => UploadError::Replan,
+            Err(error) => error,
+        }
+    }
+
+    async fn settle_name_clash(
+        self: &Arc<Self>,
+        ino: Ino,
+        parent: &LinkId,
+        name: &str,
+        existing: Option<LinkId>,
+        snapshot: Option<&Snapshot>,
+    ) -> std::result::Result<(), UploadError> {
+        let retry = UploadError::retry;
+        let existing = match existing {
+            Some(link) => link,
+            None => {
+                check_not_hot(&self.metrics, "list_children");
+                let children = match self.backend.list_children(parent).await {
+                    Ok(children) => children,
+                    Err(BackendError::NotFound) => return Err(self.parent_vanished(parent).await),
+                    Err(error) => return Err(error.into()),
+                };
+                children
+                    .into_iter()
+                    .find(|node| node.name == name)
+                    .ok_or_else(|| retry("the name is free again"))?
+                    .link_id
+            }
+        };
+        let fresh = self
+            .fresh_live(&existing)
+            .await?
+            .filter(|node| node.kind == NodeKind::Folder || node.active_revision.is_some())
+            .ok_or_else(|| retry("a draft holds the name"))?;
+
+        // Another node knows the remote node already.
+        let holder = self.tree.read().by_link(&existing).filter(|&z| z != ino);
+        if let Some(z) = holder {
+            let (attached, deleted) = {
+                let tree = self.tree.read();
+                let node = tree.get(z);
+                (
+                    node.is_some_and(|n| n.attached),
+                    node.is_some_and(|n| n.deleted),
+                )
+            };
+            if attached {
+                // The next plan blocks on it.
+                return Err(retry("the remote node is known under another name"));
+            }
+            let changes = {
+                let mut tree = self.tree.write();
+                if deleted {
+                    tree.unbind_tombstone(z)
+                } else {
+                    tree.set_remote(z, None);
+                    Some(Changes {
+                        changed: vec![z],
+                        ..Changes::default()
+                    })
+                }
+            };
+            if let Some(changes) = changes {
+                self.apply_changes(changes);
+            }
+        }
+
+        // Identical files and folders never conflict (D016).
+        let local_kind = self.tree.read().get(ino).map(|node| node.kind);
+        if local_kind == Some(fresh.kind) {
+            match (fresh.kind, snapshot) {
+                (NodeKind::Folder, _) => {
+                    self.bind_folder(ino, RemoteState::from_remote(&fresh));
+                    // Pick up children the existing folder may have.
+                    let this = Arc::clone(self);
+                    self.runtime().spawn(async move {
+                        if let Err(error) = this.list(ino).await {
+                            tracing::debug!(ino, %error, "listing a merged folder failed");
+                        }
+                    });
+                    return Ok(());
+                }
+                (NodeKind::File, Some(snapshot))
+                    if self.remote_matches(&fresh, snapshot).await? =>
+                {
+                    self.adopt_identical_file(ino, &fresh);
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
+        // Different things: the local node gives way (§10.6).
+        self.yield_to_remote(
+            ino,
+            parent,
+            ConflictKind::CreateCreate,
+            Some(existing),
+            fresh.active_revision.clone(),
+        )
+        .await
+    }
+
+    /// The local node `ino`, placed in the folder `parent`, loses its name
+    /// to a remote node: it is renamed to its conflict name (open
+    /// descriptors follow), the folder is listed so that the remote node
+    /// appears at the original name, and the conflict is recorded (§10.6).
+    /// A failed listing goes to the relist queue (and, after a restart,
+    /// comes back through the open conflict, D055); the record is made
+    /// either way.
+    async fn yield_to_remote(
+        self: &Arc<Self>,
+        ino: Ino,
+        parent: &LinkId,
+        kind: ConflictKind,
+        link: Option<LinkId>,
+        remote_rev: Option<RevisionId>,
+    ) -> std::result::Result<(), UploadError> {
+        let retry = UploadError::retry;
+        let dir = self
+            .tree
+            .read()
+            .by_link(parent)
+            .ok_or_else(|| retry("the parent folder is not known"))?;
+        let now = self.clock()();
+        let yielded = self.tree.write().yield_name(ino, now);
+        let Some((changes, orig_name, conflict_name)) = yielded else {
+            return Err(retry("the node is not in place"));
+        };
+        self.apply_changes(changes);
+        // Recorded before the listing: a stop while it runs aborts this
+        // step, and the open conflict is what lists the folder again at the
+        // next start (D055).
+        let id = self.record_conflict(ConflictNote {
+            link,
+            conflict_name: Some(conflict_name),
+            remote_rev,
+            ..ConflictNote::new(kind, ino, orig_name.clone())
+        });
+        // A listing that started after the name was freed (D054) shows the
+        // remote node at its name.
+        let listed = self.list(dir).await;
+        if listed.is_err() {
+            self.journal.list_later(vec![dir]);
+        }
+        if let Some(other) = self.tree.read().child(dir, &orig_name).ok().flatten() {
+            self.set_conflict_other(id, other);
+        }
+        listed.map_err(UploadError::core)
+    }
+
+    /// The parent folder of a new node is gone remotely: settle it (§10.5).
+    async fn parent_vanished(self: &Arc<Self>, parent: &LinkId) -> UploadError {
+        let dir = self.tree.read().by_link(parent);
+        match dir {
+            Some(dir) => self.vanished(dir).await,
+            None => UploadError::Backend(BackendError::NotFound),
+        }
+    }
+
+    /// A new file takes over an existing remote file with the same content:
+    /// it builds on that revision and uploads nothing (unless the mode or
+    /// mtime differ).
+    fn adopt_identical_file(&self, ino: Ino, fresh: &RemoteNode) {
+        let staged = self.staged_entry(ino);
+        let mut staged_guard = staged.as_ref().map(|s| s.lock());
+        if let Some(guard) = staged_guard.as_mut()
+            && let Err(error) = guard.set_base_rev(fresh.active_revision.clone())
+        {
+            tracing::error!(ino, %error, "cannot record the base revision");
+        }
+        {
+            let stamp = self.stamp();
+            let mut tree = self.tree.write();
+            tree.set_remote(ino, Some(RemoteState::from_remote(fresh)));
+            if let Some(node) = tree.get_mut(ino) {
+                node.remote_stamp = stamp;
+                if !node.attached {
+                    node.deleted = true;
+                }
+            }
+        }
+        drop(staged_guard);
+        self.persist(&[ino]);
+        tracing::info!(
+            ino,
+            "a remote file of that name has the same content; adopted"
+        );
+    }
+
+    /// The live (not trashed) node behind `link`, fetched fresh.
+    /// [`Engine::fresh_live`], or the node settled as vanished (§10.5).
+    async fn fresh_or_vanished(
+        self: &Arc<Self>,
+        ino: Ino,
+        link: &LinkId,
+    ) -> std::result::Result<RemoteNode, UploadError> {
+        match self.fresh_live(link).await? {
+            Some(fresh) => Ok(fresh),
+            None => Err(self.vanished(ino).await),
+        }
+    }
+
+    async fn fresh_live(
         &self,
         link: &LinkId,
-        sha1: [u8; 20],
-    ) -> std::result::Result<Option<RevisionId>, UploadError> {
+    ) -> std::result::Result<Option<RemoteNode>, UploadError> {
         check_not_hot(&self.metrics, "get_nodes");
         let nodes = self.backend.get_nodes(std::slice::from_ref(link)).await?;
         Ok(nodes
             .into_iter()
             .next()
             .flatten()
-            .filter(|n| n.kind == NodeKind::File && n.sha1 == Some(sha1) && !n.trashed)
-            .and_then(|n| n.active_revision))
+            .filter(|node| !node.trashed))
     }
 
-    /// Records an upload (§7.4 7–8): the node is clean only if nothing
-    /// changed since the snapshot. A clean node's staging goes once the row
-    /// naming the uploaded revision is durable.
-    fn commit_upload(&self, ino: Ino, uploaded: &Uploaded, snapshot: &Snapshot) {
+    /// The remote file of `ino` is gone: settle the node (§10.5), then plan
+    /// again.
+    async fn vanished(self: &Arc<Self>, ino: Ino) -> UploadError {
+        match self.resolve_vanished(vec![ino]).await {
+            Ok(()) => UploadError::Replan,
+            Err(error) => UploadError::core(error),
+        }
+    }
+
+    /// Layer 2 of §10.4, before the snapshot: is the revision this upload
+    /// builds on still the active one? `Ok(None)`: yes, go on. `Ok(Some)`:
+    /// the file changed remotely and only the content can tell whether the
+    /// two versions differ. `Err`: settled (`Replan`) or failed.
+    async fn precheck_revision(
+        self: &Arc<Self>,
+        ino: Ino,
+        link: &LinkId,
+    ) -> std::result::Result<Option<RemoteNode>, UploadError> {
+        let staged_base = self
+            .staged_entry(ino)
+            .and_then(|staged| staged.lock().base_rev().cloned());
+        let known = self
+            .tree
+            .read()
+            .get(ino)
+            .and_then(|node| node.remote.clone())
+            .filter(|remote| &remote.link == link)
+            .ok_or_else(|| UploadError::retry("the remote node changed before the upload"))?;
+        let base = staged_base.or_else(|| known.rev.clone());
+        let fresh = self.fresh_or_vanished(ino, link).await?;
+        if fresh.active_revision == base {
+            // Refreshes the name hash for the rename pre-check.
+            let refreshed = known.with_content_of(&fresh);
+            if refreshed != known {
+                let stamp = self.stamp();
+                let mut tree = self.tree.write();
+                if tree.get(ino).and_then(|node| node.link()) == Some(link) {
+                    tree.set_remote_at(ino, Some(refreshed), stamp);
+                    drop(tree);
+                    self.persist(&[ino]);
+                }
+            }
+            return Ok(None);
+        }
+        if let Some(settled) = self.settle_cheap(ino, &fresh).await {
+            return Err(settled);
+        }
+        Ok(Some(fresh))
+    }
+
+    /// The remote file has a revision this upload is not based on: the cases
+    /// that need no content comparison. `None` when the content decides.
+    async fn settle_cheap(self: &Arc<Self>, ino: Ino, fresh: &RemoteNode) -> Option<UploadError> {
+        let (metadata_only, local_size) = {
+            let tree = self.tree.read();
+            let node = tree.get(ino)?;
+            (node.gens.content == node.gens.uploaded_content, node.size)
+        };
+        if metadata_only {
+            // Not a conflict: another client's content wins, the local mode
+            // and mtime stay pending (M7).
+            self.readopt_remote_content(ino, fresh);
+            return Some(UploadError::Replan);
+        }
+        if fresh.size.is_some_and(|size| size != local_size) {
+            return Some(self.split_outcome(ino, fresh).await);
+        }
+        None
+    }
+
+    /// The remote file has a revision this upload is not based on, and the
+    /// snapshot is the local content: identical content only moves the base
+    /// (D016), different content is an edit/edit conflict. Always ends in
+    /// `Replan`, unless something failed.
+    async fn settle_with_snapshot(
+        self: &Arc<Self>,
+        ino: Ino,
+        fresh: &RemoteNode,
+        snapshot: &Snapshot,
+    ) -> UploadError {
+        match self.remote_matches(fresh, snapshot).await {
+            Ok(true) => {
+                self.adopt_base(ino, fresh);
+                UploadError::Replan
+            }
+            Ok(false) => self.split_outcome(ino, fresh).await,
+            Err(error) => error,
+        }
+    }
+
+    async fn split_outcome(self: &Arc<Self>, ino: Ino, fresh: &RemoteNode) -> UploadError {
+        match self.split_edit_conflict(ino, fresh).await {
+            Ok(()) => UploadError::Replan,
+            Err(error) => error,
+        }
+    }
+
+    /// Whether the active revision of `fresh` has the snapshot's content:
+    /// by the SHA-1 it claims or, when it claims none (official apps), by
+    /// reading it, up to [`IDENTICAL_PROBE_MAX`] (D040).
+    async fn remote_matches(
+        &self,
+        fresh: &RemoteNode,
+        snapshot: &Snapshot,
+    ) -> std::result::Result<bool, UploadError> {
+        if let Some(sha1) = fresh.sha1 {
+            return Ok(sha1 == snapshot.sha1);
+        }
+        let (Some(size), Some(rev)) = (fresh.size, fresh.active_revision.clone()) else {
+            return Ok(false);
+        };
+        if size != snapshot.size || size > IDENTICAL_PROBE_MAX {
+            return Ok(false);
+        }
+        if size == 0 {
+            return Ok(true);
+        }
+        let base = Base {
+            link: fresh.link_id.clone(),
+            rev,
+            rev_size: size,
+            size,
+        };
+        let data = self
+            .read_revision(&base, 0, size, Priority::Readahead)
+            .await
+            .map_err(UploadError::core)?;
+        let sha1: [u8; 20] = sha1::Sha1::digest(&data[..]).into();
+        Ok(sha1 == snapshot.sha1)
+    }
+
+    /// Another client's new content replaces the node's remote content: the
+    /// node has no content change of its own (§10.4). The staging, if any,
+    /// goes; the kernel drops what it cached.
+    fn readopt_remote_content(&self, ino: Ino, fresh: &RemoteNode) {
+        let staged = self.staged_entry(ino);
+        let staged_guard = staged.as_ref().map(|s| s.lock());
+        {
+            let mut tree = self.tree.write();
+            let Some(node) = tree.get(ino) else {
+                return;
+            };
+            // A write may have landed since the caller looked.
+            if node.link() != Some(&fresh.link_id)
+                || node.gens.content != node.gens.uploaded_content
+            {
+                return;
+            }
+            let known = node.remote.clone().expect("linked");
+            let remote = known.with_content_of(fresh);
+            let node = tree.get_mut(ino).expect("checked");
+            node.content = Content::Remote {
+                link: fresh.link_id.clone(),
+                rev: fresh.active_revision.clone(),
+            };
+            node.size = remote.size;
+            node.content_epoch += 1;
+            node.remote_newer = false;
+            tree.set_remote_at(ino, Some(remote), self.stamp());
+        }
+        let unstaged = staged.as_ref().and_then(|staged| {
+            let mut map = self.staged.lock();
+            map.get(&ino)
+                .is_some_and(|entry| Arc::ptr_eq(entry, staged))
+                .then(|| map.remove(&ino))
+                .flatten()
+        });
+        drop(staged_guard);
+        drop(unstaged);
+        self.apply_changes(Changes {
+            changed: vec![ino],
+            invalidations: vec![Invalidation::Inode { ino }],
+            ..Changes::default()
+        });
+        self.remove_staging_after_commit(ino);
+        tracing::info!(
+            ino,
+            "adopted a newer remote revision of a file with only metadata changes"
+        );
+    }
+
+    /// The remote revision has the local content: the upload builds on it
+    /// from now on (nothing is conflicting).
+    fn adopt_base(&self, ino: Ino, fresh: &RemoteNode) {
+        let staged = self.staged_entry(ino);
+        let mut staged_guard = staged.as_ref().map(|s| s.lock());
+        if let Some(guard) = staged_guard.as_mut()
+            && let Err(error) = guard.set_base_rev(fresh.active_revision.clone())
+        {
+            tracing::error!(ino, %error, "cannot record the new base revision");
+        }
+        {
+            let stamp = self.stamp();
+            let mut tree = self.tree.write();
+            let Some(node) = tree.get_mut(ino) else {
+                return;
+            };
+            node.remote_newer = false;
+            if let Some(known) = node.remote.clone()
+                && known.link == fresh.link_id
+            {
+                tree.set_remote_at(ino, Some(known.with_content_of(fresh)), stamp);
+            }
+        }
+        drop(staged_guard);
+        self.persist(&[ino]);
+        tracing::info!(
+            ino,
+            "the remote revision has the local content; building on it"
+        );
+    }
+
+    /// Edit/edit (§10.5): the local file becomes the conflict copy and the
+    /// server's version takes its name.
+    async fn split_edit_conflict(
+        self: &Arc<Self>,
+        ino: Ino,
+        fresh: &RemoteNode,
+    ) -> std::result::Result<(), UploadError> {
+        let new_ino = self
+            .allocate_inos(1)
+            .await
+            .map_err(UploadError::core)?
+            .pop()
+            .ok_or_else(|| UploadError::retry("no inode number to spare"))?;
+        let staged = self.staged_entry(ino);
+        let mut staged_guard = staged.as_ref().map(|s| s.lock());
+        let split = self.tree.write().split_conflict(
+            ino,
+            RemoteState::from_remote(fresh),
+            new_ino,
+            self.clock()(),
+        );
+        let Some((changes, note)) = split else {
+            return Ok(());
+        };
+        if let Some(guard) = staged_guard.as_mut()
+            && let Err(error) = guard.set_base_rev(None)
+        {
+            tracing::error!(ino, %error, "cannot clear the base revision");
+        }
+        drop(staged_guard);
+        self.apply_changes(changes);
+        self.record_conflict(note);
+        Ok(())
+    }
+
+    /// The synchronous part of [`Self::commit_upload`], under the staging
+    /// and tree locks: whether the node is clean, or `Err` with what
+    /// `commit_upload` returns at once.
+    fn record_upload(
+        &self,
+        ino: Ino,
+        uploaded: &Uploaded,
+        snapshot: &Snapshot,
+        revision: bool,
+    ) -> std::result::Result<bool, bool> {
         let staged = self.staged_entry(ino);
         let mut staged_guard = staged.as_ref().map(|s| s.lock());
         let stamp = self.stamp();
         let clean = {
             let mut tree = self.tree.write();
+            if revision
+                && tree
+                    .get(ino)
+                    .is_some_and(|node| node.link() != Some(&uploaded.link))
+            {
+                tracing::info!(
+                    ino,
+                    link = %uploaded.link,
+                    "the node left the remote file during its upload; not recorded"
+                );
+                drop(tree);
+                drop(staged_guard);
+                let _ = std::fs::remove_file(&snapshot.path);
+                return Err(false);
+            }
             tree.set_remote(
                 ino,
                 Some(RemoteState {
@@ -1086,9 +1940,10 @@ impl Engine {
                 }),
             );
             let Some(node) = tree.get_mut(ino) else {
-                return;
+                return Err(true);
             };
             node.remote_stamp = stamp;
+            node.remote_newer = false;
             node.gens.uploaded_content = node.gens.uploaded_content.max(snapshot.content_gen);
             node.gens.uploaded_meta = node.gens.uploaded_meta.max(snapshot.meta_gen);
             if !node.attached {
@@ -1128,12 +1983,37 @@ impl Engine {
         drop(staged_guard);
         // Closed outside the map lock (see `Engine::unstage`).
         drop(unstaged);
-        if let Err(error) = self.cache.seed(
-            &uploaded.link,
-            &uploaded.rev,
-            &snapshot.path,
-            self.backend.upload_block_size(),
-        ) {
+        Ok(clean)
+    }
+
+    /// Records an upload (§7.4 7–8): the node is clean only if nothing
+    /// changed since the snapshot. A clean node's staging goes once the row
+    /// naming the uploaded revision is durable.
+    ///
+    /// `false` when the node is bound to another remote node by now (a split
+    /// or a resurrection while the revision went up): nothing is recorded,
+    /// and the caller plans again.
+    async fn commit_upload(
+        &self,
+        ino: Ino,
+        uploaded: &Uploaded,
+        snapshot: &Snapshot,
+        revision: bool,
+    ) -> bool {
+        let clean = match self.record_upload(ino, uploaded, snapshot, revision) {
+            Ok(clean) => clean,
+            Err(done) => return done,
+        };
+        if let Err(error) = self
+            .cache
+            .seed(
+                &uploaded.link,
+                &uploaded.rev,
+                &snapshot.path,
+                self.backend.upload_block_size(),
+            )
+            .await
+        {
             tracing::debug!(%error, "could not seed the cache from the snapshot");
         }
         let _ = std::fs::remove_file(&snapshot.path);
@@ -1150,6 +2030,7 @@ impl Engine {
         if clean {
             self.remove_staging_after_commit(ino);
         }
+        true
     }
 
     /// Pending entries with what the planner says about them (tests).
@@ -1286,9 +2167,17 @@ struct Uploaded {
 enum UploadError {
     Backend(BackendError),
     Park(String),
+    /// The node changed under the upload (a conflict was settled, the
+    /// remote file moved on): nothing failed, look at the node again.
+    Replan,
 }
 
 impl UploadError {
+    /// A temporary failure: the step is planned again after a backoff.
+    fn retry(why: &str) -> Self {
+        Self::Backend(BackendError::Transient(why.to_owned()))
+    }
+
     fn core(error: CoreError) -> Self {
         match error {
             CoreError::Backend(error) => Self::Backend(error),
@@ -1307,7 +2196,8 @@ fn hash_file(path: &std::path::Path) -> std::io::Result<(u64, [u8; 20])> {
     use std::io::Read;
     let mut file = std::fs::File::open(path)?;
     let mut hasher = sha1::Sha1::new();
-    let mut buffer = vec![0u8; 1 << 20];
+    // On the stack: a heap buffer per upload is churn that glibc keeps (D049).
+    let mut buffer = [0u8; 64 << 10];
     let mut size = 0u64;
     loop {
         let n = file.read(&mut buffer)?;

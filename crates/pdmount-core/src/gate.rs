@@ -59,7 +59,7 @@ impl Gate {
         Foreground(self)
     }
 
-    pub fn foreground_in_flight(&self) -> usize {
+    fn foreground_in_flight(&self) -> usize {
         self.foreground.load(Ordering::Acquire)
     }
 

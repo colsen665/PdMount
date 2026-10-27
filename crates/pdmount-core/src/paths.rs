@@ -105,6 +105,15 @@ pub struct ProfilePaths {
 
 const APP_DIR: &str = "pdmount";
 
+/// A SQLite database and its WAL side files.
+pub fn sqlite_files(db: &Path) -> [PathBuf; 3] {
+    ["", "-wal", "-shm"].map(|suffix| {
+        let mut path = db.as_os_str().to_owned();
+        path.push(suffix);
+        PathBuf::from(path)
+    })
+}
+
 impl ProfilePaths {
     pub fn new(profile: Profile, base: &BaseDirs) -> Self {
         Self {
@@ -148,6 +157,12 @@ impl ProfilePaths {
     /// Device identity (DESIGN.md §10.2).
     pub fn device_id_file(&self) -> PathBuf {
         self.data_dir.join("device-id")
+    }
+
+    /// Volume, root folder and account of the drive as last seen online, so
+    /// a mount without a connection needs no request (§9.6, §13.1).
+    pub fn proton_root_file(&self) -> PathBuf {
+        self.data_dir.join("proton-root.json")
     }
 
     /// Encrypted SDK secret cache. Losing it requires a new login, so it

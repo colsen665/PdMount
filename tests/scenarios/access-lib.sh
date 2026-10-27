@@ -1,7 +1,8 @@
 # shellcheck shell=bash
 # Helpers for the access-rule scenarios A1-A6 (DESIGN.md §11, §15.3).
 # Rules are local state: `reset --keep-login` removes them, so in fresh mode
-# the scenarios check only what reached the backend.
+# the scenarios check only what reached the backend. Device B of the `second`
+# mode never had the rules, so it is checked like a fresh mount.
 
 # Runs a command that must fail with "Read-only file system" (EROFS, D019).
 expect_erofs() { # <what> <command...>
@@ -18,4 +19,4 @@ expect_ok() { # <what> <command...>
     err=$("$@" 2>&1) || fail "$what failed: $err"
 }
 
-rules_kept() { [[ $VERIFY_MODE != fresh ]]; }
+rules_kept() { [[ $VERIFY_MODE != fresh && $VERIFY_MODE != second ]]; }

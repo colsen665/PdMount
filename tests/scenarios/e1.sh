@@ -7,6 +7,7 @@
 # fake's own CLI (BACKEND=fake only).
 source "$(dirname "$0")/lib.sh"
 [[ $BACKEND == fake ]] || { echo "E1 needs a second client; skipped for BACKEND=$BACKEND"; exit 0; }
+[[ $VERIFY_MODE != second ]] || { echo "E1 has one device; skipped in second mode"; exit 0; }
 prepare_mount
 make_workdir
 scenario_area e1
@@ -15,6 +16,7 @@ printf old >"$area/dir/f"
 printf gone >"$area/g"
 printf before >"$area/c"
 wait_queue_empty
+event_barrier
 # Into the kernel's caches: dentries, attributes, pages.
 ls -l "$area" "$area/dir" >/dev/null
 [[ "$(cat "$area/c")" == before ]] || fail "c does not read back"
@@ -25,9 +27,9 @@ printf after >"$work/c"
 "$PDMOUNT" fake trash --path /pdmount-test/e1/g "$FAKE_DIR"
 "$PDMOUNT" fake write --path /pdmount-test/e1/c --from "$work/c" "$FAKE_DIR"
 start=$SECONDS
-# Two poll intervals and the pacing of the listings (D027).
+# poll_interval + 10 s (D037).
 until [[ -d "$area/moved" && ! -e "$area/dir" && ! -e "$area/g" && "$(cat "$area/c")" == after ]]; do
-    ((SECONDS - start < 75)) || fail "remote changes not visible after 75 s: $(ls "$area")"
+    ((SECONDS - start < 40)) || fail "remote changes not visible after 40 s: $(ls "$area")"
     sleep 1
 done
 echo "visible after $((SECONDS - start)) s"

@@ -238,6 +238,14 @@ enum Secret {
     CacheKey,
 }
 
+/// A secret read: found, missing, or unknown because the keyring did not
+/// answer and no file holds it (allow mode only; D029).
+enum Lookup {
+    Found(String, Storage),
+    Missing,
+    Unavailable(String),
+}
+
 pub struct Credentials<'a, S: SecretStore> {
     paths: &'a ProfilePaths,
     store: S,
@@ -308,34 +316,35 @@ impl<'a, S: SecretStore> Credentials<'a, S> {
 
     /// The file, if present, is the newest copy: every keyring write deletes
     /// it. Outside force mode it is moved into the keyring.
-    fn read(&self, secret: Secret) -> anyhow::Result<Option<(String, Storage)>> {
+    fn read(&self, secret: Secret) -> anyhow::Result<Lookup> {
         let path = self.file(secret);
         match std::fs::read(&path) {
             Ok(bytes) => {
                 let value = Self::from_file(secret, &path, bytes)?;
                 if self.mode == SecretsMode::ForceFile || self.other_daemon {
-                    return Ok(Some((value, Storage::File)));
+                    return Ok(Lookup::Found(value, Storage::File));
                 }
                 match self.store.set(&self.key_name(secret), &value) {
                     Ok(()) => {
                         let _ = std::fs::remove_file(&path);
                         tracing::info!(file = %path.display(), "moved secret from file to keyring");
-                        Ok(Some((value, Storage::Keyring)))
+                        Ok(Lookup::Found(value, Storage::Keyring))
                     }
                     Err(error) if self.mode == SecretsMode::Keyring => Err(error.into()),
-                    Err(_) => Ok(Some((value, Storage::File))),
+                    Err(_) => Ok(Lookup::Found(value, Storage::File)),
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if self.mode == SecretsMode::ForceFile {
-                    return Ok(None);
+                    return Ok(Lookup::Missing);
                 }
                 match self.store.get(&self.key_name(secret)) {
-                    Ok(value) => Ok(value.map(|value| (value, Storage::Keyring))),
+                    Ok(Some(value)) => Ok(Lookup::Found(value, Storage::Keyring)),
+                    Ok(None) => Ok(Lookup::Missing),
                     Err(error) if self.mode == SecretsMode::Keyring => Err(error.into()),
-                    Err(error) => {
-                        tracing::warn!(%error, "reading secrets from files only");
-                        Ok(None)
+                    Err(Unavailable(reason)) => {
+                        tracing::warn!(error = reason, "reading secrets from files only");
+                        Ok(Lookup::Unavailable(reason))
                     }
                 }
             }
@@ -363,9 +372,10 @@ impl<'a, S: SecretStore> Credentials<'a, S> {
 
     /// Stored session, if any.
     pub fn load(&self) -> anyhow::Result<Option<(StoredCredentials, Storage)>> {
-        self.read(Secret::Session)?
-            .map(|(data, storage)| Ok((parse(&data)?, storage)))
-            .transpose()
+        match self.read(Secret::Session)? {
+            Lookup::Found(data, storage) => Ok(Some((parse(&data)?, storage))),
+            Lookup::Missing | Lookup::Unavailable(_) => Ok(None),
+        }
     }
 
     pub fn save(&self, credentials: &StoredCredentials) -> anyhow::Result<Storage> {
@@ -387,10 +397,16 @@ impl<'a, S: SecretStore> Credentials<'a, S> {
 
     /// 32-byte key encrypting the SDK caches and the block cache; created on
     /// first use. A new key makes the existing caches unreadable, so they are
-    /// deleted.
+    /// deleted. An unavailable keyring is not a missing key (D029): while
+    /// caches exist, the key that encrypted them may be in the keyring.
     pub fn cache_master_key(&self) -> anyhow::Result<Vec<u8>> {
-        if let Some((encoded, _)) = self.read(Secret::CacheKey)? {
-            return decode_key(&encoded);
+        match self.read(Secret::CacheKey)? {
+            Lookup::Found(encoded, _) => return decode_key(&encoded),
+            Lookup::Unavailable(reason) if self.caches_exist() => anyhow::bail!(
+                "the cache key is not in a file and the keyring is unavailable ({reason}); \
+                 unlock the keyring and retry (a new key would delete the existing caches)"
+            ),
+            Lookup::Missing | Lookup::Unavailable(_) => {}
         }
         let mut key = vec![0u8; CACHE_KEY_LEN];
         rand::rng().fill_bytes(&mut key);
@@ -399,20 +415,35 @@ impl<'a, S: SecretStore> Credentials<'a, S> {
         Ok(key)
     }
 
+    /// The SDK cache files and the block cache directory (encrypted with the
+    /// cache key).
+    fn cache_paths(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> =
+            [self.paths.sdk_secret_cache(), self.paths.sdk_entity_cache()]
+                .iter()
+                .flat_map(|cache| pdmount_core::paths::sqlite_files(cache))
+                .collect();
+        paths.push(self.paths.blocks_dir());
+        paths
+    }
+
+    fn caches_exist(&self) -> bool {
+        self.cache_paths().iter().any(|path| path.exists())
+    }
+
     fn delete_caches(&self) {
         if self.other_daemon {
             tracing::warn!("new cache key while another daemon runs; its caches are kept");
             return;
         }
         let mut deleted = false;
-        for cache in [self.paths.sdk_secret_cache(), self.paths.sdk_entity_cache()] {
-            for suffix in ["", "-wal", "-shm"] {
-                let mut path = cache.clone().into_os_string();
-                path.push(suffix);
-                deleted |= std::fs::remove_file(path).is_ok();
-            }
+        for path in self.cache_paths() {
+            deleted |= if path.is_dir() {
+                std::fs::remove_dir_all(&path).is_ok()
+            } else {
+                std::fs::remove_file(&path).is_ok()
+            };
         }
-        deleted |= std::fs::remove_dir_all(self.paths.blocks_dir()).is_ok();
         if deleted {
             tracing::warn!("new cache key: deleted the caches encrypted with the old one");
         }
@@ -424,7 +455,7 @@ fn parse(data: &str) -> anyhow::Result<StoredCredentials> {
 }
 
 fn encode_key(key: &[u8]) -> String {
-    key.iter().map(|b| format!("{b:02x}")).collect()
+    hex::encode(key)
 }
 
 fn decode_key(encoded: &str) -> anyhow::Result<Vec<u8>> {
@@ -694,6 +725,36 @@ mod tests {
         std::fs::write(paths.sdk_secret_cache(), b"sealed").expect("write");
         assert_eq!(credentials.cache_master_key().expect("read"), key);
         assert!(paths.sdk_secret_cache().exists());
+    }
+
+    #[test]
+    fn an_unavailable_keyring_is_not_a_missing_cache_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fresh = tempfile::tempdir().expect("tempdir");
+        let fresh_paths = paths(fresh.path());
+        let paths = paths(dir.path());
+        let store = MemoryStore::available();
+        let key = Credentials::with_store(&paths, &store, SecretsMode::Keyring)
+            .cache_master_key()
+            .expect("create");
+        std::fs::create_dir_all(&paths.data_dir).expect("mkdir");
+        std::fs::write(paths.sdk_secret_cache(), b"sealed").expect("write");
+
+        // Allow mode with the keyring down: the key may be there, so neither a
+        // new key nor deleted caches.
+        let unavailable = MemoryStore::default();
+        let credentials = Credentials::with_store(&paths, &unavailable, SecretsMode::AllowFile);
+        assert!(credentials.cache_master_key().is_err());
+        assert!(paths.sdk_secret_cache().exists());
+        assert!(!paths.cache_key_file().exists());
+        let back = Credentials::with_store(&paths, &store, SecretsMode::Keyring);
+        assert_eq!(back.cache_master_key().expect("read"), key);
+
+        // Without caches there is nothing to lose: the key goes to a file.
+        let credentials =
+            Credentials::with_store(&fresh_paths, &unavailable, SecretsMode::AllowFile);
+        credentials.cache_master_key().expect("create");
+        assert!(fresh_paths.cache_key_file().exists());
     }
 
     #[test]

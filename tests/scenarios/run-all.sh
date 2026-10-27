@@ -2,11 +2,13 @@
 # Runs scenarios in verify modes and prints one line per run (DESIGN.md §15.3).
 #
 # Usage: tests/scenarios/run-all.sh [scenario ...]
-#   SCENARIOS  default when no arguments: every M2 scenario
-#   MODES      verify modes (default: live remount crash fresh)
+#   SCENARIOS  default when no arguments: every scenario (the M scenarios m1..m7 and e2 run in
+#              live mode only and skip the others)
+#   MODES      verify modes (default: live remount crash fresh; `second` adds device B, lib.sh)
 #   STOP_ON    comma-separated stop conditions (default: 429,fail for the real account, none
 #              for BACKEND=fake): 429 stops the matrix after a run whose daemon log lines
-#              show an HTTP 429 (the SDK retries 429s, so a run can pass with one; D030);
+#              show an HTTP 429 (the SDK retries 429s, so a run can pass with one; D030).
+#              Both profiles' logs are read, since device B may call the API too;
 #              fail stops it after the first failed run
 #   DAEMON_LOG the daemon log the 429 check reads (default: the profile's log, as lib.sh
 #              sets it up)
@@ -21,7 +23,7 @@ if [[ -n "${LOG_DIR:-}" ]]; then
     LOG_DIR=$(cd "$LOG_DIR" && pwd)
 fi
 cd "$(dirname "$0")"
-default="r1 r2 r3 r4 r5 r6 r7 g1 g2 g3 g4 g5 g6 g6_read g7 n1 a1 a2 a3 a4 a5 a6 e1 sha"
+default="r1 r2 r3 r4 r5 r6 r7 g1 g2 g3 g4 g5 g6 g6_read g7 n1 a1 a2 a3 a4 a5 a6 e1 e2 m1 m3 m4 m5 m6 m7 sha"
 scenarios=("$@")
 ((${#scenarios[@]})) || read -ra scenarios <<<"${SCENARIOS:-$default}"
 read -ra modes <<<"${MODES:-live remount crash fresh}"
@@ -30,9 +32,12 @@ stops() { [[ ",$stop_on," == *",$1,"* ]]; }
 if stops 429; then
     # lib.sh decides the profile and XDG directories; the daemon appends to this log.
     daemon_log=${DAEMON_LOG:-$(source ./lib.sh && echo "${XDG_STATE_HOME:-$HOME/.local/state}/pdmount/$PROFILE.log")}
-    echo "stop on: $stop_on (429 check reads $daemon_log)"
+    daemon_log2=${DAEMON_LOG2:-$(source ./lib.sh && echo "${XDG_STATE_HOME:-$HOME/.local/state}/pdmount/$PROFILE2.log")}
+    echo "stop on: $stop_on (429 check reads $daemon_log and $daemon_log2)"
 fi
-log_size() { stat -c %s "$daemon_log" 2>/dev/null || echo 0; }
+log_size() { stat -c %s "$1" 2>/dev/null || echo 0; }
+# This run's lines of a log that match a 429; the first argument is the log, the second its offset.
+log_hits() { tail -c +"$(($2 + 1))" "$1" 2>/dev/null | grep -E 'status: 429|RateLimited' || true; }
 if [[ ${BACKEND:-proton} == fake ]]; then trash_min_free=0; else trash_min_free=${TRASH_MIN_FREE:-1073741824}; fi
 pd_() { (source ./lib.sh && pd "$@"); }
 # Free storage in bytes from `pdmount status` (one decimal of its unit), or
@@ -64,7 +69,7 @@ for scenario in "${scenarios[@]}"; do
         check_storage || { stopped=1; break 2; }
         start=$SECONDS
         log=$logs/$scenario-$mode.log
-        stops 429 && offset=$(log_size)
+        if stops 429; then offset=$(log_size "$daemon_log"); offset2=$(log_size "$daemon_log2"); fi
         if VERIFY_MODE=$mode "./$scenario.sh" >"$log" 2>&1; then
             echo "$scenario [$mode]: PASS ($((SECONDS - start)) s)"
             ok=1
@@ -75,7 +80,7 @@ for scenario in "${scenarios[@]}"; do
         fi
         if stops 429; then
             # Only this run's lines; `grep 429` alone would match revision ids and sizes.
-            hits=$(tail -c +"$((offset + 1))" "$daemon_log" 2>/dev/null | grep -E 'status: 429|RateLimited' || true)
+            hits=$(log_hits "$daemon_log" "$offset"; log_hits "$daemon_log2" "$offset2")
             if [[ -n "$hits" ]]; then
                 echo "STOP: HTTP 429 during $scenario [$mode] ($(wc -l <<<"$hits") lines), first:"
                 echo "  $(head -1 <<<"$hits" | cut -c1-300)"

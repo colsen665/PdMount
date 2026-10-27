@@ -8,7 +8,8 @@
 use pdmount_backend::Backend;
 use pdmount_backend::fake::FakeBackend;
 use pdmount_core::Config;
-use pdmount_core::cache::CacheOptions;
+use pdmount_core::conflicts::system_clock;
+use pdmount_core::device::{DeviceIdentity, Uuid};
 use pdmount_core::engine::{Engine, EngineOptions};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -42,6 +43,23 @@ fn run(command: &mut Command) -> String {
 
 /// Local tree: small files, nested directories, a multi-block file, modes,
 /// and a bare git repository with a few commits.
+/// A runtime, a temporary directory and an empty mountpoint in it; `None`
+/// (the test is skipped) without FUSE.
+fn setup() -> Option<(tokio::runtime::Runtime, tempfile::TempDir, PathBuf)> {
+    if !fuse_available() {
+        eprintln!("skipped: FUSE is not available");
+        return None;
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mnt = temp.path().join("mnt");
+    std::fs::create_dir_all(&mnt).expect("mkdir");
+    Some((runtime, temp, mnt))
+}
+
 fn make_source(root: &Path) {
     let tree = root.join("tree");
     for (path, size) in [
@@ -64,16 +82,7 @@ fn make_source(root: &Path) {
     .expect("chmod");
 
     let work = root.join("work");
-    let git = |args: &[&str]| {
-        run(Command::new("git")
-            .args(args)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t"))
-    };
+    let git = |args: &[&str]| run(git_command().args(args));
     git(&["init", "-q", "-b", "main", work.to_str().expect("utf8")]);
     for i in 0..5 {
         std::fs::write(
@@ -114,18 +123,15 @@ fn mount(
     let (engine, invalidations) = runtime
         .block_on(Engine::open(
             Arc::new(backend.clone()),
-            EngineOptions {
-                state_db: state.join("state.db"),
-                staging_dir: state.join("staging"),
-                local_ignore: None,
-                cache: CacheOptions {
-                    dir: state.join("blocks"),
-                    master_key: [9; 32],
-                    ram_bytes: 1 << 20,
-                    disk_bytes: 64 << 20,
+            EngineOptions::in_dir(
+                state,
+                Config::default(),
+                DeviceIdentity {
+                    id: Uuid::from_u128(1),
+                    name: "mounted-test".into(),
                 },
-                config: Config::default(),
-            },
+                system_clock(),
+            ),
         ))
         .expect("engine");
     engine.start_background();
@@ -147,15 +153,9 @@ fn unmount(runtime: &tokio::runtime::Runtime, mount: Mount) {
 
 #[test]
 fn mount_serves_rsync_and_git_reads() {
-    if !fuse_available() {
-        eprintln!("skipped: FUSE is not available");
+    let Some((runtime, temp, mnt)) = setup() else {
         return;
-    }
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    let temp = tempfile::tempdir().expect("tempdir");
+    };
     let source = temp.path().join("source");
     make_source(&source);
     let backend = FakeBackend::new();
@@ -167,8 +167,6 @@ fn mount_serves_rsync_and_git_reads() {
     });
 
     let state = temp.path().join("state");
-    let mnt: PathBuf = temp.path().join("mnt");
-    std::fs::create_dir_all(&mnt).expect("mkdir");
     let m = mount(&runtime, &backend, &state, &mnt);
 
     // Content, modes and mtimes match the source.
@@ -253,17 +251,21 @@ fn mount_serves_rsync_and_git_reads() {
     unmount(&runtime, m);
 }
 
-fn git(dir: &Path, args: &[&str]) -> String {
-    run(Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
+/// git without the user's or the system's configuration.
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    command
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_AUTHOR_NAME", "t")
         .env("GIT_AUTHOR_EMAIL", "t@t")
         .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t"))
+        .env("GIT_COMMITTER_EMAIL", "t@t");
+    command
+}
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    run(git_command().arg("-C").arg(dir).args(args))
 }
 
 fn rsync_itemize(args: &[&str], from: &Path, to: &Path) -> String {
@@ -278,23 +280,15 @@ fn rsync_itemize(args: &[&str], from: &Path, to: &Path) -> String {
 /// on a fresh state that sees only what reached the fake.
 #[test]
 fn mount_takes_rsync_and_git_writes() {
-    if !fuse_available() {
-        eprintln!("skipped: FUSE is not available");
+    let Some((runtime, temp, mnt)) = setup() else {
         return;
-    }
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    let temp = tempfile::tempdir().expect("tempdir");
+    };
     let source = temp.path().join("source");
     make_source(&source);
     let tree = source.join("tree");
     let backend = FakeBackend::new();
     backend.set_block_size(64 * 1024);
     let state = temp.path().join("state");
-    let mnt: PathBuf = temp.path().join("mnt");
-    std::fs::create_dir_all(&mnt).expect("mkdir");
     let m = mount(&runtime, &backend, &state, &mnt);
     let dst = mnt.join("dst");
 
@@ -375,5 +369,72 @@ fn mount_takes_rsync_and_git_writes() {
     git(&repo, &["fsck", "--full", "--strict"]);
     assert_eq!(git(&repo, &["rev-parse", "HEAD"]), head);
     assert_eq!(git(&repo, &["status", "--porcelain"]), "");
+    unmount(&runtime, m);
+}
+
+/// `getfattr` output of one attribute, or `None` when it does not exist.
+fn xattr(path: &Path, name: &str) -> Option<String> {
+    let output = Command::new("getfattr")
+        .args(["--only-values", "-n", name])
+        .arg(path)
+        .output()
+        .expect("spawn getfattr");
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[test]
+fn mount_reports_state_in_xattrs() {
+    if Command::new("getfattr").arg("--version").output().is_err() {
+        eprintln!("skipped: getfattr is not available");
+        return;
+    }
+    let Some((runtime, temp, mnt)) = setup() else {
+        return;
+    };
+    let backend = FakeBackend::new();
+    let m = mount(&runtime, &backend, &temp.path().join("state"), &mnt);
+    let file = mnt.join("file.txt");
+    std::fs::write(&file, b"content").expect("write");
+
+    let state = xattr(&file, "user.pdmount.state").expect("state");
+    assert!(
+        ["pending", "uploading", "clean"].contains(&state.as_str()),
+        "{state}"
+    );
+    assert_eq!(xattr(&file, "user.pdmount.access").as_deref(), Some("rw"));
+    assert_eq!(xattr(&file, "user.pdmount.conflict"), None);
+    assert_eq!(xattr(&file, "user.other"), None);
+
+    let counts = runtime.block_on(m.engine.drain(std::time::Duration::from_secs(60)));
+    assert_eq!(counts.pending + counts.parked, 0);
+    assert_eq!(xattr(&file, "user.pdmount.state").as_deref(), Some("clean"));
+    assert!(
+        xattr(&file, "user.pdmount.link_id").is_some_and(|link| !link.is_empty()),
+        "an uploaded file has a link"
+    );
+    assert!(xattr(&file, "user.pdmount.rev").is_some());
+
+    // The list holds our names, with the size protocol (a probe, then data).
+    let listed = run(Command::new("getfattr")
+        .args(["-d", "-m", "^user.pdmount."])
+        .arg(&file));
+    for name in [
+        "user.pdmount.state",
+        "user.pdmount.link_id",
+        "user.pdmount.access",
+    ] {
+        assert!(listed.contains(name), "{listed}");
+    }
+    // Setting stays unsupported.
+    let set = Command::new("setfattr")
+        .args(["-n", "user.pdmount.state", "-v", "x"])
+        .arg(&file)
+        .output();
+    if let Ok(set) = set {
+        assert!(!set.status.success());
+    }
     unmount(&runtime, m);
 }

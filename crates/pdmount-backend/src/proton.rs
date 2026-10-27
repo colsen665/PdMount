@@ -3,8 +3,10 @@
 //!
 //! Uploads commit with the content's SHA-1 checked by the server. Renames
 //! go through `rename_node`, moves with an optional new name through
-//! `move_node` (P10), one call each; the SDK reads the current name hash
-//! itself, so `expected` is not used.
+//! `move_node` (P10), one call each. With an `expected` name hash (the hex
+//! digest that `get_nodes` reports, P14) they use the `_with_original_hash`
+//! variants, so the server refuses a rename that raced another device's;
+//! without one they send no precondition.
 
 use crate::{
     AccountInfo, Backend, BackendError, BlockInfo, EventId, EventKind, EventPage, FileMeta, LinkId,
@@ -13,7 +15,7 @@ use crate::{
 use bytes::Bytes;
 use parking_lot::Mutex;
 use proton_drive_sdk::client::ProtonDriveClient;
-use proton_drive_sdk::error::ApiError;
+use proton_drive_sdk::error::{ApiError, HttpTransferError, TooManyRequestsException};
 use proton_drive_sdk::node::download::{
     CompletedDownloadManifestVerificationException, DataIntegrityException,
 };
@@ -21,7 +23,7 @@ use proton_drive_sdk::node::draft::{NodeWithSameNameExistsError, RevisionDraftCo
 use proton_drive_sdk::node::file::block_map::BlockMap;
 use proton_drive_sdk::node::revision::RevisionUid;
 use proton_drive_sdk::node::{Node, NodeUid};
-use proton_drive_sdk::proton_sdk_rs2::auth::TokenRefreshError;
+use proton_drive_sdk::proton_sdk_rs2::auth::{TokenCredential, TokenRefreshError};
 use proton_drive_sdk::utils::PotentialObject;
 use proton_drive_sdk::volume::VolumeId;
 use std::collections::HashMap;
@@ -30,7 +32,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 /// Key of the additional revision metadata holding POSIX permission bits,
 /// written as an octal string such as `"644"`.
-pub const MODE_METADATA_KEY: &str = "pdmount.mode";
+const MODE_METADATA_KEY: &str = "pdmount.mode";
 
 /// Block URLs expire; maps older than this are fetched again.
 const BLOCK_MAP_TTL: Duration = Duration::from_secs(600);
@@ -42,35 +44,132 @@ type BlockMapKey = (LinkId, RevisionId);
 /// single fetch: a large file's map takes one API call per 10 blocks.
 type BlockMapSlot = Arc<tokio::sync::Mutex<Option<(Instant, Arc<BlockMap>)>>>;
 
-pub struct ProtonBackend {
+/// The authenticated connection, replaced as a whole by a new login (M3.16).
+#[derive(Clone)]
+struct Live {
     client: ProtonDriveClient,
+    credential: TokenCredential,
+}
+
+pub struct ProtonBackend {
+    live: parking_lot::RwLock<Live>,
     username: String,
     volume: VolumeId,
     root: LinkId,
     block_maps: Mutex<HashMap<BlockMapKey, BlockMapSlot>>,
 }
 
+/// Access tokens for [`with_reauth`].
+#[async_trait::async_trait]
+trait Reauth {
+    /// The access token a call is about to use.
+    async fn access_token(&self) -> anyhow::Result<String>;
+    /// A token that replaces `rejected`; one refresh serves every caller that
+    /// was rejected with the same token.
+    async fn refreshed(&self, rejected: String) -> anyhow::Result<String>;
+}
+
+#[async_trait::async_trait]
+impl Reauth for TokenCredential {
+    async fn access_token(&self) -> anyhow::Result<String> {
+        self.get_tokens().await.map(|(access, _)| access)
+    }
+
+    async fn refreshed(&self, rejected: String) -> anyhow::Result<String> {
+        self.get_refreshed_access_token(rejected).await
+    }
+}
+
+/// Runs `call`; when the server rejects the access token, refreshes it and
+/// runs `call` once more. The drive API client sends the token but does not
+/// refresh it, so this is the only place an expired token is renewed between
+/// the daemon's proactive checks. A failed refresh is classified as any SDK
+/// error: an expired refresh token is `Unauthorized`, anything else transient.
+async fn with_reauth<T, F, Fut>(reauth: &impl Reauth, call: F) -> Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let token = reauth.access_token().await.map_err(map_error)?;
+    match call().await {
+        Err(BackendError::Unauthorized) => {
+            reauth.refreshed(token).await.map_err(map_error)?;
+            call().await
+        }
+        other => other,
+    }
+}
+
 impl ProtonBackend {
     /// Resolves the My Files root; fails if the drive is not reachable.
-    pub async fn new(client: ProtonDriveClient, username: String) -> Result<Self> {
-        let root = client.get_my_files_folder().await.map_err(map_error)?;
+    pub async fn new(
+        client: ProtonDriveClient,
+        credential: TokenCredential,
+        username: String,
+    ) -> Result<Self> {
+        let root = with_reauth(&credential, || async {
+            client.get_my_files_folder().await.map_err(map_error)
+        })
+        .await?;
         Ok(Self {
             volume: root.base.uid.volume_id.clone(),
             root: LinkId::new(root.base.uid.link_id.raw()),
-            client,
+            live: parking_lot::RwLock::new(Live { client, credential }),
             username,
             block_maps: Mutex::new(HashMap::new()),
         })
     }
 
-    pub fn client(&self) -> &ProtonDriveClient {
-        &self.client
+    /// A backend for a drive whose volume and root are known from an
+    /// earlier run, so nothing is asked of the server: mounting without a
+    /// connection (§9.6). Calls fail with `Offline` until it is reachable.
+    pub fn with_root(
+        client: ProtonDriveClient,
+        credential: TokenCredential,
+        username: String,
+        volume: impl Into<String>,
+        root: LinkId,
+    ) -> Self {
+        Self {
+            live: parking_lot::RwLock::new(Live { client, credential }),
+            username,
+            volume: VolumeId::new(volume.into()),
+            root,
+            block_maps: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Continues with a new login's connection (the same account): calls
+    /// already running finish on the old one.
+    pub fn replace_session(&self, client: ProtonDriveClient, credential: TokenCredential) {
+        *self.live.write() = Live { client, credential };
+    }
+
+    /// The volume id, kept for [`ProtonBackend::with_root`].
+    pub fn volume_id(&self) -> &str {
+        self.volume.raw()
+    }
+
+    fn client(&self) -> ProtonDriveClient {
+        self.live.read().client.clone()
+    }
+
+    /// Runs `call` on the current client, with one token refresh on a
+    /// rejected token ([`with_reauth`]).
+    async fn authed<T, F, Fut>(&self, call: F) -> Result<T>
+    where
+        F: Fn(ProtonDriveClient) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let credential = self.live.read().credential.clone();
+        with_reauth(&credential, || call(self.client())).await
     }
 
     /// Deletes everything in the account's trash for good (`pdmount trash
     /// empty`, D036). Not part of `Backend`: the mount never needs it.
     pub async fn empty_trash(&self) -> Result<()> {
-        self.client.empty_trash().await.map_err(map_error)
+        self.authed(|client| async move { client.empty_trash().await.map_err(map_error) })
+            .await
     }
 
     fn node_uid(&self, link: &LinkId) -> NodeUid {
@@ -99,11 +198,13 @@ impl ProtonBackend {
         {
             return Ok(Arc::clone(map));
         }
+        let uid = self.revision_uid(file, revision);
         let map = Arc::new(
-            self.client
-                .get_block_map(self.revision_uid(file, revision))
-                .await
-                .map_err(map_error)?,
+            self.authed(|client| {
+                let uid = uid.clone();
+                async move { client.get_block_map(uid).await.map_err(map_error) }
+            })
+            .await?,
         );
         *cached = Some((Instant::now(), Arc::clone(&map)));
         Ok(map)
@@ -158,10 +259,24 @@ fn convert_node(node: Node) -> RemoteNode {
                 name: base.name,
                 kind: NodeKind::File,
                 active_revision: Some(RevisionId::new(revision.uid.revision_id.raw())),
+                // Without a claimed size, the claimed block sizes add up to
+                // it; without a claimed mtime, the revision's commit time.
                 size: revision
                     .claimed_size
-                    .and_then(|size| u64::try_from(size).ok()),
-                mtime: revision.claimed_modification_time.map(system_time),
+                    .and_then(|size| u64::try_from(size).ok())
+                    .or_else(|| {
+                        revision.claimed_block_sizes.as_ref().map(|sizes| {
+                            sizes
+                                .iter()
+                                .map(|&size| u64::try_from(size).unwrap_or(0))
+                                .sum()
+                        })
+                    }),
+                mtime: Some(system_time(
+                    revision
+                        .claimed_modification_time
+                        .unwrap_or(revision.creation_time),
+                )),
                 mode,
                 sha1: revision
                     .claimed_digests
@@ -172,6 +287,16 @@ fn convert_node(node: Node) -> RemoteNode {
             }
         }
     }
+}
+
+/// Lowercase hex of a name hash digest.
+fn hash_to_hex(digest: &[u8]) -> NameHash {
+    NameHash::new(hex::encode(digest))
+}
+
+/// The digest behind a hex name hash; `None` when `text` is not hex.
+fn hash_from_hex(text: &str) -> Option<Vec<u8>> {
+    hex::decode(text).ok()
 }
 
 /// Nodes whose metadata could not be decrypted are skipped with a warning.
@@ -188,9 +313,14 @@ fn decrypted<D: std::fmt::Debug>(object: PotentialObject<Node, D>) -> Option<Rem
     }
 }
 
+/// The first cause of type `T` in an SDK error's chain.
+fn cause<T: std::error::Error + 'static>(error: &anyhow::Error) -> Option<&T> {
+    error.chain().find_map(|cause| cause.downcast_ref::<T>())
+}
+
 /// Classifies an SDK error (DESIGN.md Appendix A).
-pub fn map_error(error: anyhow::Error) -> BackendError {
-    if let Some(conflict) = error.downcast_ref::<NodeWithSameNameExistsError>() {
+fn map_error(error: anyhow::Error) -> BackendError {
+    if let Some(conflict) = cause::<NodeWithSameNameExistsError>(&error) {
         return BackendError::AlreadyExists {
             existing: conflict
                 .conflict
@@ -199,7 +329,7 @@ pub fn map_error(error: anyhow::Error) -> BackendError {
                 .map(|link| LinkId::new(link.raw())),
         };
     }
-    if let Some(conflict) = error.downcast_ref::<RevisionDraftConflictError>() {
+    if let Some(conflict) = cause::<RevisionDraftConflictError>(&error) {
         return BackendError::RevisionConflict {
             current: conflict
                 .conflict
@@ -208,23 +338,14 @@ pub fn map_error(error: anyhow::Error) -> BackendError {
                 .map(|revision| RevisionId::new(revision.raw())),
         };
     }
-    if error.downcast_ref::<DataIntegrityException>().is_some()
-        || error
-            .downcast_ref::<CompletedDownloadManifestVerificationException>()
-            .is_some()
-        || error
-            .downcast_ref::<proton_drive_sdk::error::ChecksumMismatchIntegrityException>()
-            .is_some()
-        || error
-            .downcast_ref::<proton_drive_sdk::error::ContentSizeMismatchIntegrityException>()
-            .is_some()
+    if cause::<DataIntegrityException>(&error).is_some()
+        || cause::<CompletedDownloadManifestVerificationException>(&error).is_some()
+        || cause::<proton_drive_sdk::error::ChecksumMismatchIntegrityException>(&error).is_some()
+        || cause::<proton_drive_sdk::error::ContentSizeMismatchIntegrityException>(&error).is_some()
     {
         return BackendError::Integrity(format!("{error:#}"));
     }
-    if let Some(refresh) = error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<TokenRefreshError>())
-    {
+    if let Some(refresh) = cause::<TokenRefreshError>(&error) {
         return if refresh.is_refresh_token_expired() {
             BackendError::Unauthorized
         } else {
@@ -234,23 +355,78 @@ pub fn map_error(error: anyhow::Error) -> BackendError {
     if let Some(api) = ApiError::find(&error) {
         return map_api_error(api, &error);
     }
-    if let Some(http) = error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
-    {
+    if let Some(too_many) = cause::<TooManyRequestsException>(&error) {
+        return BackendError::RateLimited {
+            retry_after: too_many.retry_after,
+        };
+    }
+    if let Some(transfer) = cause::<HttpTransferError>(&error) {
+        return map_transfer_error(transfer, &error);
+    }
+    if let Some(http) = transport_error(&error) {
         if http.is_connect() {
             return BackendError::Offline(format!("{error:#}"));
         }
-        if http.is_timeout() {
+        // A connection that broke while the request or the answer was on
+        // its way (reset, closed, cut short): the next attempt may succeed,
+        // and the next connect tells whether the drive is unreachable.
+        if http.is_timeout() || http.is_request() || http.is_body() || http.is_decode() {
             return BackendError::Transient(format!("{error:#}"));
         }
     }
     BackendError::Other(format!("{error:#}"))
 }
 
+/// Whether an SDK error (a session check, say) is a failure to connect, as
+/// opposed to an answer from the server.
+pub fn is_connection_error(error: &anyhow::Error) -> bool {
+    transport_error(error).is_some_and(reqwest::Error::is_connect)
+}
+
+/// The `reqwest::Error` behind an SDK error. Drive API calls go through
+/// `reqwest_middleware`, whose `Error::Reqwest` is `#[error(transparent)]`: the
+/// `reqwest::Error` is then not part of `anyhow::Error::chain()` and has to be
+/// taken out of the middleware error.
+fn transport_error(error: &anyhow::Error) -> Option<&reqwest::Error> {
+    error.chain().find_map(|cause| {
+        cause.downcast_ref::<reqwest::Error>().or_else(|| {
+            match cause.downcast_ref::<reqwest_middleware::Error>() {
+                Some(reqwest_middleware::Error::Reqwest(http)) => Some(http),
+                _ => None,
+            }
+        })
+    })
+}
+
+/// A failed block transfer (download, or upload to the storage endpoint).
+fn map_transfer_error(transfer: &HttpTransferError, error: &anyhow::Error) -> BackendError {
+    match transfer.status {
+        401 => BackendError::Unauthorized,
+        429 => BackendError::RateLimited {
+            retry_after: transfer.retry_after,
+        },
+        _ if transfer.is_retryable() => BackendError::Transient(format!("{error:#}")),
+        _ => BackendError::Other(format!("{error:#}")),
+    }
+}
+
+/// Code of a refused rename or move (M3.1, S6–S8); the message tells the cases apart.
+const CODE_REFUSED: u32 = 2000;
+/// Code of a commit whose draft was removed meanwhile (M3.1, S3).
+const CODE_NOT_IN_DRAFT: u32 = 2511;
+
 fn map_api_error(api: &ApiError, error: &anyhow::Error) -> BackendError {
-    if api.is_unauthorized() {
+    // An expired token can also arrive as HTTP 200 with `Code` 401 in the body
+    // (`proton-sdk-rs2` `session.rs` `ensure_authenticated`).
+    if api.is_unauthorized() || api.code == Some(401) {
         BackendError::Unauthorized
+    } else if api.code == Some(CODE_REFUSED) && api.message.contains("out of date") {
+        // Rename answers HTTP 422, move a 2xx body: the status is no signal.
+        BackendError::NameConflict
+    } else if api.code == Some(CODE_REFUSED) && api.message.contains("sub-folder") {
+        BackendError::InvalidMove
+    } else if api.code == Some(CODE_NOT_IN_DRAFT) {
+        BackendError::Transient(format!("{error:#}"))
     } else if api.is_not_found() {
         BackendError::NotFound
     } else if api.is_already_exists() {
@@ -322,7 +498,6 @@ fn mode_metadata(
 
 impl ProtonBackend {
     async fn upload(
-        &self,
         uploader: proton_drive_sdk::node::file::upload::FileUploader,
         reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
     ) -> Result<proton_drive_sdk::node::file::upload::UploadResult> {
@@ -331,10 +506,65 @@ impl ProtonBackend {
             .await
             .map_err(map_error)
     }
+
+    /// One verified, decrypted block. `download_block` of the SDK without
+    /// its size check, which is an untyped error: a block that decrypts to
+    /// another size than claimed is an integrity failure.
+    async fn download_block(
+        &self,
+        file: &LinkId,
+        revision: &RevisionId,
+        index: u32,
+    ) -> Result<Vec<u8>> {
+        let map = self.block_map(file, revision).await?;
+        let index = i32::try_from(index).map_err(|_| BackendError::NotFound)?;
+        if map.entry(index).is_none() {
+            return Err(BackendError::NotFound);
+        }
+        self.authed(|client| {
+            let map = Arc::clone(&map);
+            async move {
+                let entry = map.entry(index).expect("checked above");
+                let mut data = Vec::new();
+                client
+                    .block_downloader()
+                    .download_verified(
+                        &client,
+                        map.revision_uid.clone(),
+                        index,
+                        entry.bare_url.clone(),
+                        entry.token.clone(),
+                        &entry.hash_digest,
+                        map.content_key.clone(),
+                        &mut data,
+                    )
+                    .await
+                    .map_err(map_error)?;
+                if let Some(claimed) = entry.plain_size
+                    && data.len() as u64 != u64::from(claimed)
+                {
+                    return Err(BackendError::Integrity(format!(
+                        "block {index} of revision {} decrypted to {} bytes, claimed {claimed}",
+                        map.revision_uid,
+                        data.len()
+                    )));
+                }
+                Ok(data)
+            }
+        })
+        .await
+    }
 }
 
 #[async_trait::async_trait]
 impl Backend for ProtonBackend {
+    /// The SDK's revision writer reads this many plaintext bytes per block
+    /// (`sdk/node/revision.rs:529`), whatever its doc says about encrypted
+    /// sizes; the cache seeds its layout from it.
+    fn upload_block_size(&self) -> u64 {
+        self.client().target_block_size() as u64
+    }
+
     async fn account(&self) -> Result<AccountInfo> {
         Ok(AccountInfo {
             username: self.username.clone(),
@@ -343,21 +573,26 @@ impl Backend for ProtonBackend {
     }
 
     async fn root(&self) -> Result<RemoteNode> {
-        let root = self.client.get_my_files_folder().await.map_err(map_error)?;
+        let root = self
+            .authed(|client| async move { client.get_my_files_folder().await.map_err(map_error) })
+            .await?;
         Ok(convert_node(Node::Folder(root)))
     }
 
     async fn list_children(&self, folder: &LinkId) -> Result<Vec<RemoteNode>> {
         let children = self
-            .client
-            .list_children(
-                self.volume.clone(),
-                Some(proton_drive_sdk::links::LinkId::new(
-                    folder.as_str().to_owned(),
-                )),
-            )
-            .await
-            .map_err(map_error)?;
+            .authed(|client| async move {
+                client
+                    .list_children(
+                        self.volume.clone(),
+                        Some(proton_drive_sdk::links::LinkId::new(
+                            folder.as_str().to_owned(),
+                        )),
+                    )
+                    .await
+                    .map_err(map_error)
+            })
+            .await?;
         Ok(children
             .into_iter()
             .filter_map(decrypted)
@@ -369,22 +604,32 @@ impl Backend for ProtonBackend {
     /// answers from the SDK's entity cache, which neither our own revisions
     /// nor other devices' changes update, so events would look like echoes
     /// (D035). `get_nodes_uncached` refreshes those cache entries on the way.
+    /// Each node carries its name hash (P14), the precondition of `rename`.
     /// The API leaves out links that no longer exist.
     async fn get_nodes(&self, ids: &[LinkId]) -> Result<Vec<Option<RemoteNode>>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let links = ids
-            .iter()
-            .map(|id| proton_drive_sdk::links::LinkId::new(id.as_str().to_owned()))
-            .collect();
-        let mut found: HashMap<LinkId, RemoteNode> = self
-            .client
-            .get_nodes_uncached(self.volume.clone(), links)
-            .await
-            .map_err(map_error)?
+        let fetched = self
+            .authed(|client| async move {
+                let links = ids
+                    .iter()
+                    .map(|id| proton_drive_sdk::links::LinkId::new(id.as_str().to_owned()))
+                    .collect();
+                client
+                    .get_nodes_uncached_with_name_hashes(self.volume.clone(), links)
+                    .await
+                    .map_err(map_error)
+            })
+            .await?;
+        let mut found: HashMap<LinkId, RemoteNode> = fetched
             .into_iter()
-            .filter_map(decrypted)
+            .filter_map(|(object, digest)| {
+                decrypted(object).map(|node| RemoteNode {
+                    name_hash: Some(hash_to_hex(&digest)),
+                    ..node
+                })
+            })
             .map(|node| (node.link_id.clone(), node))
             .collect();
         Ok(ids.iter().map(|id| found.remove(id)).collect())
@@ -402,17 +647,21 @@ impl Backend for ProtonBackend {
             .collect())
     }
 
+    async fn fetch_block_into(
+        &self,
+        file: &LinkId,
+        revision: &RevisionId,
+        index: u32,
+        buf: &mut [u8],
+    ) -> Result<usize> {
+        let data = self.download_block(file, revision, index).await?;
+        crate::copy_block(&data, buf, index, revision)
+    }
+
     async fn fetch_block(&self, file: &LinkId, revision: &RevisionId, index: u32) -> Result<Bytes> {
-        let map = self.block_map(file, revision).await?;
-        let index = i32::try_from(index).map_err(|_| BackendError::NotFound)?;
-        if map.entry(index).is_none() {
-            return Err(BackendError::NotFound);
-        }
-        self.client
-            .download_block(&map, index)
+        self.download_block(file, revision, index)
             .await
             .map(Bytes::from)
-            .map_err(map_error)
     }
 
     async fn upload_new(
@@ -422,25 +671,32 @@ impl Backend for ProtonBackend {
         source: UploadSource,
         meta: FileMeta,
     ) -> Result<(LinkId, RevisionId)> {
-        let (size, reader) = open_source(source).await?;
-        let mut uploader = self
-            .client
-            .get_file_uploader(
-                self.node_uid(parent),
-                name.to_owned(),
-                meta.media_type,
-                size as i64,
-                Some(meta.mtime),
-                mode_metadata(meta.mode),
-                None,
-                false,
-            )
-            .await
-            .map_err(map_error)?;
-        if let Some(sha1) = meta.sha1 {
-            uploader.set_expected_sha1(sha1.to_vec());
-        }
-        let result = self.upload(uploader, reader).await?;
+        let result = self
+            .authed(|client| {
+                let source = source.clone();
+                let meta = meta.clone();
+                async move {
+                    let (size, reader) = open_source(source).await?;
+                    let mut uploader = client
+                        .get_file_uploader(
+                            self.node_uid(parent),
+                            name.to_owned(),
+                            meta.media_type,
+                            size as i64,
+                            Some(meta.mtime),
+                            mode_metadata(meta.mode),
+                            None,
+                            false,
+                        )
+                        .await
+                        .map_err(map_error)?;
+                    if let Some(sha1) = meta.sha1 {
+                        uploader.set_expected_sha1(sha1.to_vec());
+                    }
+                    Self::upload(uploader, reader).await
+                }
+            })
+            .await?;
         Ok((
             link_of(&result.node_uid),
             RevisionId::new(result.revision_uid.revision_id.raw()),
@@ -454,22 +710,29 @@ impl Backend for ProtonBackend {
         source: UploadSource,
         meta: FileMeta,
     ) -> Result<RevisionId> {
-        let (size, reader) = open_source(source).await?;
-        let mut uploader = self
-            .client
-            .get_file_revision_uploader(
-                self.revision_uid(file, base),
-                size as i64,
-                Some(meta.mtime),
-                mode_metadata(meta.mode),
-                None,
-            )
-            .await
-            .map_err(map_error)?;
-        if let Some(sha1) = meta.sha1 {
-            uploader.set_expected_sha1(sha1.to_vec());
-        }
-        let result = self.upload(uploader, reader).await?;
+        let result = self
+            .authed(|client| {
+                let source = source.clone();
+                let meta = meta.clone();
+                async move {
+                    let (size, reader) = open_source(source).await?;
+                    let mut uploader = client
+                        .get_file_revision_uploader(
+                            self.revision_uid(file, base),
+                            size as i64,
+                            Some(meta.mtime),
+                            mode_metadata(meta.mode),
+                            None,
+                        )
+                        .await
+                        .map_err(map_error)?;
+                    if let Some(sha1) = meta.sha1 {
+                        uploader.set_expected_sha1(sha1.to_vec());
+                    }
+                    Self::upload(uploader, reader).await
+                }
+            })
+            .await?;
         Ok(RevisionId::new(result.revision_uid.revision_id.raw()))
     }
 
@@ -480,10 +743,13 @@ impl Backend for ProtonBackend {
         mtime: SystemTime,
     ) -> Result<LinkId> {
         let folder = self
-            .client
-            .create_folder(self.node_uid(parent), name.to_owned(), Some(mtime))
-            .await
-            .map_err(map_error)?;
+            .authed(|client| async move {
+                client
+                    .create_folder(self.node_uid(parent), name.to_owned(), Some(mtime))
+                    .await
+                    .map_err(map_error)
+            })
+            .await?;
         Ok(link_of(&folder.base.uid))
     }
 
@@ -492,30 +758,56 @@ impl Backend for ProtonBackend {
         node: &LinkId,
         new_parent: Option<&LinkId>,
         new_name: &str,
-        _expected: Option<&NameHash>,
+        expected: Option<&NameHash>,
     ) -> Result<()> {
-        let uid = self.node_uid(node);
-        match new_parent {
-            Some(parent) => self
-                .client
-                .move_node(uid, self.node_uid(parent), Some(new_name.to_owned()))
-                .await
-                .map_err(map_error),
-            None => self
-                .client
-                .rename_node(uid, new_name.to_owned(), None)
-                .await
-                .map_err(map_error),
-        }
+        let original = match expected {
+            Some(hash) => Some(hash_from_hex(hash.as_str()).ok_or_else(|| {
+                BackendError::Other(format!("malformed name hash {:?}", hash.as_str()))
+            })?),
+            None => None,
+        };
+        self.authed(|client| {
+            let uid = self.node_uid(node);
+            let new_name = new_name.to_owned();
+            let original = original.clone();
+            async move {
+                match (new_parent, original) {
+                    (Some(parent), None) => {
+                        client
+                            .move_node(uid, self.node_uid(parent), Some(new_name))
+                            .await
+                    }
+                    (Some(parent), Some(hash)) => {
+                        client
+                            .move_node_with_original_hash(
+                                uid,
+                                self.node_uid(parent),
+                                Some(new_name),
+                                hash,
+                            )
+                            .await
+                    }
+                    (None, None) => client.rename_node(uid, new_name, None).await,
+                    (None, Some(hash)) => {
+                        client
+                            .rename_node_with_original_hash(uid, new_name, None, hash)
+                            .await
+                    }
+                }
+                .map_err(map_error)
+            }
+        })
+        .await
     }
 
     async fn trash(&self, nodes: &[LinkId]) -> Result<Vec<Result<()>>> {
         let uids: Vec<NodeUid> = nodes.iter().map(|link| self.node_uid(link)).collect();
         let mut results = self
-            .client
-            .trash_nodes(uids.clone())
-            .await
-            .map_err(map_error)?;
+            .authed(|client| {
+                let uids = uids.clone();
+                async move { client.trash_nodes(uids).await.map_err(map_error) }
+            })
+            .await?;
         Ok(uids
             .iter()
             .map(|uid| match results.remove(uid) {
@@ -530,19 +822,25 @@ impl Backend for ProtonBackend {
     }
 
     async fn latest_event_id(&self) -> Result<EventId> {
-        self.client
-            .get_volume_latest_event_id(self.volume.clone())
-            .await
-            .map(EventId::new)
-            .map_err(map_error)
+        self.authed(|client| async move {
+            client
+                .get_volume_latest_event_id(self.volume.clone())
+                .await
+                .map(EventId::new)
+                .map_err(map_error)
+        })
+        .await
     }
 
     async fn poll_events(&self, since: &EventId) -> Result<EventPage> {
         let response = self
-            .client
-            .poll_volume_events(self.volume.clone(), since.as_str())
-            .await
-            .map_err(map_error)?;
+            .authed(|client| async move {
+                client
+                    .poll_volume_events(self.volume.clone(), since.as_str())
+                    .await
+                    .map_err(map_error)
+            })
+            .await?;
         let events = response
             .events
             .into_iter()
@@ -569,10 +867,8 @@ impl Backend for ProtonBackend {
 
     async fn storage_info(&self) -> Result<StorageInfo> {
         let (used, max) = self
-            .client
-            .get_user_storage_info()
-            .await
-            .map_err(map_error)?;
+            .authed(|client| async move { client.get_user_storage_info().await.map_err(map_error) })
+            .await?;
         Ok(StorageInfo {
             used: u64::try_from(used).unwrap_or(0),
             max: u64::try_from(max).unwrap_or(0),
@@ -647,12 +943,351 @@ mod tests {
     }
 
     #[test]
+    fn refused_renames_and_moves_are_told_apart_by_message() {
+        let refused = |status: Option<u16>, message: &str| -> anyhow::Error {
+            let api = match status {
+                Some(status) => ApiError::from_http(
+                    reqwest::StatusCode::from_u16(status).expect("status"),
+                    &reqwest::header::HeaderMap::new(),
+                    &format!(r#"{{"Code":2000,"Error":"{message}"}}"#),
+                ),
+                None => ApiError::from_code(2000, message),
+            };
+            anyhow::Error::from(api).context("while renaming")
+        };
+        // Rename: HTTP 422. Move: a 2xx body with an error code.
+        for status in [Some(422), None] {
+            assert_eq!(
+                map_error(refused(
+                    status,
+                    "This file or folder was out of date, rename failed."
+                )),
+                BackendError::NameConflict
+            );
+        }
+        assert_eq!(
+            map_error(refused(
+                None,
+                "This file or folder was out of date, move failed."
+            )),
+            BackendError::NameConflict
+        );
+        assert_eq!(
+            map_error(refused(None, "Cannot move a folder into a sub-folder")),
+            BackendError::InvalidMove
+        );
+        assert!(matches!(
+            map_error(refused(Some(422), "something else")),
+            BackendError::Other(_)
+        ));
+    }
+
+    #[test]
+    fn a_draft_removed_before_the_commit_is_transient() {
+        let error = api_error(
+            422,
+            r#"{"Code":2511,"Error":"Given revision is not in draft"}"#,
+        );
+        assert!(matches!(
+            map_error(error.context("while committing")),
+            BackendError::Transient(_)
+        ));
+    }
+
+    #[test]
+    fn name_hashes_are_lowercase_hex_and_round_trip() {
+        let digest = [0x00, 0x0a, 0xab, 0xff, 0x10];
+        let hash = hash_to_hex(&digest);
+        assert_eq!(hash.as_str(), "000aabff10");
+        assert_eq!(hash_from_hex(hash.as_str()), Some(digest.to_vec()));
+        assert_eq!(hash_from_hex("ABff"), Some(vec![0xab, 0xff]));
+        assert_eq!(hash_from_hex("abc"), None);
+        assert_eq!(hash_from_hex("zz"), None);
+        assert_eq!(hash_from_hex("é"), None);
+        assert_eq!(hash_from_hex(""), Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_200_body_with_code_401_is_unauthorized() {
+        let body_401: anyhow::Error = ApiError::from_code(401, "Invalid access token").into();
+        assert_eq!(
+            map_error(body_401.context("while listing")),
+            BackendError::Unauthorized
+        );
+        // Other body codes without an HTTP status stay unclassified.
+        let other: anyhow::Error = ApiError::from_code(2001, "bad").into();
+        assert!(matches!(map_error(other), BackendError::Other(_)));
+    }
+
+    /// Nothing listens on port 1: the connection is refused at once.
+    const REFUSED: &str = "http://127.0.0.1:1/";
+
+    #[tokio::test]
+    async fn connection_errors_through_the_middleware_are_offline() {
+        let client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let failure = client.get(REFUSED).send().await.expect_err("refused");
+        // The middleware error hides the reqwest error from the chain.
+        let error = anyhow::Error::from(failure).context("while listing");
+        assert!(
+            error
+                .chain()
+                .all(|cause| cause.downcast_ref::<reqwest::Error>().is_none()),
+            "the chain exposes the reqwest error, so the helper is not needed"
+        );
+        assert!(matches!(map_error(error), BackendError::Offline(_)));
+    }
+
+    #[tokio::test]
+    async fn plain_reqwest_connection_errors_are_offline() {
+        let failure = reqwest::get(REFUSED).await.expect_err("refused");
+        let error = anyhow::Error::from(failure).context("while downloading");
+        assert!(matches!(map_error(error), BackendError::Offline(_)));
+    }
+
+    #[tokio::test]
+    async fn timeouts_are_transient() {
+        // Accepts the connection and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}/", listener.local_addr().expect("address"));
+        let _held = tokio::spawn(async move {
+            let _connection = listener.accept().await;
+            std::future::pending::<()>().await;
+        });
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .expect("client");
+        let plain = http.get(&url).send().await.expect_err("timeout");
+        assert!(matches!(
+            map_error(anyhow::Error::from(plain)),
+            BackendError::Transient(_)
+        ));
+        let wrapped = reqwest_middleware::ClientBuilder::new(http).build();
+        let failure = wrapped.get(&url).send().await.expect_err("timeout");
+        assert!(matches!(
+            map_error(anyhow::Error::from(failure)),
+            BackendError::Transient(_)
+        ));
+    }
+
+    /// A connection that breaks before the answer is complete is retried, not
+    /// a permanent failure.
+    #[tokio::test]
+    async fn connections_that_break_mid_request_are_transient() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Closes after reading the request, before any answer.
+        let closing = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let closing_url = format!("http://{}/", closing.local_addr().expect("address"));
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = closing.accept().await {
+                let mut request = [0u8; 1024];
+                let _ = socket.read(&mut request).await;
+            }
+        });
+        let failure = reqwest::get(&closing_url).await.expect_err("closed");
+        assert!(
+            matches!(
+                map_error(anyhow::Error::from(failure)),
+                BackendError::Transient(_)
+            ),
+            "closed before the answer"
+        );
+        // Promises 100 bytes, sends 10, closes.
+        let short = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let short_url = format!("http://{}/", short.local_addr().expect("address"));
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = short.accept().await {
+                let mut request = [0u8; 1024];
+                let _ = socket.read(&mut request).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n0123456789")
+                    .await;
+            }
+        });
+        let answer = reqwest::get(&short_url).await.expect("headers");
+        let failure = answer.bytes().await.expect_err("cut short");
+        assert!(
+            matches!(
+                map_error(anyhow::Error::from(failure)),
+                BackendError::Transient(_)
+            ),
+            "body cut short"
+        );
+    }
+
+    #[test]
+    fn block_transfer_errors_are_classified() {
+        let transfer = |status: u16, retry_after| -> anyhow::Error {
+            HttpTransferError::new(
+                reqwest::StatusCode::from_u16(status).expect("status"),
+                "blob",
+                retry_after,
+            )
+            .into()
+        };
+        let wait = Some(Duration::from_secs(7));
+        assert_eq!(
+            map_error(transfer(429, wait).context("block 3")),
+            BackendError::RateLimited { retry_after: wait }
+        );
+        for status in [408, 425, 500, 503] {
+            assert!(
+                matches!(
+                    map_error(transfer(status, None)),
+                    BackendError::Transient(_)
+                ),
+                "{status}"
+            );
+        }
+        assert_eq!(map_error(transfer(401, None)), BackendError::Unauthorized);
+        for status in [400, 404] {
+            assert!(
+                matches!(map_error(transfer(status, None)), BackendError::Other(_)),
+                "{status}"
+            );
+        }
+        let throttled: anyhow::Error = TooManyRequestsException { retry_after: wait }.into();
+        assert_eq!(
+            map_error(throttled.context("block 1")),
+            BackendError::RateLimited { retry_after: wait }
+        );
+        let unhinted: anyhow::Error = TooManyRequestsException { retry_after: None }.into();
+        assert_eq!(
+            map_error(unhinted),
+            BackendError::RateLimited { retry_after: None }
+        );
+    }
+
+    #[test]
     fn integrity_and_unknown_errors_are_classified() {
         let integrity: anyhow::Error = DataIntegrityException::new("hash mismatch").into();
         assert!(matches!(map_error(integrity), BackendError::Integrity(_)));
         assert!(matches!(
             map_error(anyhow::anyhow!("something else")),
             BackendError::Other(_)
+        ));
+    }
+
+    /// A credential whose refreshes succeed and are counted.
+    #[derive(Default)]
+    struct MockReauth {
+        refreshes: std::sync::atomic::AtomicU32,
+    }
+
+    impl MockReauth {
+        fn refreshes(&self) -> u32 {
+            self.refreshes.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Reauth for MockReauth {
+        async fn access_token(&self) -> anyhow::Result<String> {
+            Ok(format!("token{}", self.refreshes()))
+        }
+
+        async fn refreshed(&self, rejected: String) -> anyhow::Result<String> {
+            assert_eq!(rejected, format!("token{}", self.refreshes()));
+            let n = self
+                .refreshes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(format!("token{}", n + 1))
+        }
+    }
+
+    /// Calls that answer from a script, counting how often they ran.
+    fn scripted(
+        answers: Vec<Result<u32>>,
+    ) -> (
+        Arc<std::sync::atomic::AtomicU32>,
+        impl Fn() -> std::future::Ready<Result<u32>>,
+    ) {
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let seen = Arc::clone(&calls);
+        let call = move || {
+            let at = seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
+            std::future::ready(answers[at.min(answers.len() - 1)].clone())
+        };
+        (calls, call)
+    }
+
+    fn call_count(calls: &std::sync::atomic::AtomicU32) -> u32 {
+        calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[tokio::test]
+    async fn a_rejected_token_is_refreshed_once_and_the_call_repeated() {
+        let reauth = MockReauth::default();
+        let (calls, call) = scripted(vec![Err(BackendError::Unauthorized), Ok(7)]);
+        assert_eq!(with_reauth(&reauth, call).await, Ok(7));
+        assert_eq!(reauth.refreshes(), 1);
+        assert_eq!(call_count(&calls), 2);
+    }
+
+    #[tokio::test]
+    async fn a_second_rejection_is_unauthorized_after_one_retry() {
+        let reauth = MockReauth::default();
+        let (calls, call) = scripted(vec![Err(BackendError::Unauthorized)]);
+        assert_eq!(
+            with_reauth(&reauth, call).await,
+            Err(BackendError::Unauthorized)
+        );
+        assert_eq!(reauth.refreshes(), 1);
+        assert_eq!(call_count(&calls), 2);
+    }
+
+    #[tokio::test]
+    async fn other_answers_pass_without_a_refresh() {
+        let reauth = MockReauth::default();
+        let (calls, call) = scripted(vec![Err(BackendError::NotFound)]);
+        assert_eq!(
+            with_reauth(&reauth, call).await,
+            Err(BackendError::NotFound)
+        );
+        let (_, call) = scripted(vec![Ok(1)]);
+        assert_eq!(with_reauth(&reauth, call).await, Ok(1));
+        assert_eq!(reauth.refreshes(), 0);
+        assert_eq!(call_count(&calls), 1);
+    }
+
+    /// A credential whose refresh fails with `error`.
+    struct FailingReauth(fn() -> anyhow::Error);
+
+    #[async_trait::async_trait]
+    impl Reauth for FailingReauth {
+        async fn access_token(&self) -> anyhow::Result<String> {
+            Ok("token".into())
+        }
+
+        async fn refreshed(&self, _: String) -> anyhow::Result<String> {
+            Err((self.0)())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refresh_the_server_refuses_is_unauthorized() {
+        let reauth = FailingReauth(|| api_error(401, "{}").context("refreshing the token"));
+        let (calls, call) = scripted(vec![Err(BackendError::Unauthorized)]);
+        assert_eq!(
+            with_reauth(&reauth, call).await,
+            Err(BackendError::Unauthorized)
+        );
+        assert_eq!(call_count(&calls), 1, "no retry without a new token");
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_that_is_not_a_refusal_is_transient() {
+        let reauth = FailingReauth(|| api_error(503, "busy"));
+        let (_, call) = scripted(vec![Err(BackendError::Unauthorized)]);
+        assert!(matches!(
+            with_reauth(&reauth, call).await,
+            Err(BackendError::Transient(_))
         ));
     }
 

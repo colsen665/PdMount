@@ -85,7 +85,7 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             max_bytes: ByteSize(10 << 30),
-            ram_bytes: ByteSize(256 << 20),
+            ram_bytes: ByteSize(32 << 20),
             prefetch_small_files: ByteSize(256 << 10),
             prefetch_dir_budget: ByteSize(16 << 20),
         }
@@ -203,19 +203,23 @@ impl Default for KernelConfig {
 /// The official clients poll their own volume every 30 s
 /// (`cs/client/js/src/internal/events/eventScheduler.ts:1`).
 const MIN_POLL_INTERVAL: Duration = Duration::from_secs(30);
-
+/// Probes of a lost connection are cheap, one quota request each.
+const MIN_PROBE_INTERVAL: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SyncConfig {
     /// Event polling interval; never below the official clients' 30 s
     /// (D033).
     pub poll_interval: HumanDuration,
+    /// Time between connectivity probes while offline or signed out (§9.6).
+    pub probe_interval: HumanDuration,
 }
 
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
             poll_interval: HumanDuration(MIN_POLL_INTERVAL),
+            probe_interval: HumanDuration(Duration::from_secs(30)),
         }
     }
 }
@@ -288,8 +292,14 @@ impl Config {
         if self.upload.concurrency == 0 {
             return Err("upload.concurrency must be at least 1".into());
         }
+        if self.cache.ram_bytes.0 < crate::pool::MIN_RAM_BYTES {
+            return Err("cache.ram_bytes must be at least 16MiB".into());
+        }
         if self.sync.poll_interval.0 < MIN_POLL_INTERVAL {
             return Err("sync.poll_interval must be at least 30s".into());
+        }
+        if self.sync.probe_interval.0 < MIN_PROBE_INTERVAL {
+            return Err("sync.probe_interval must be at least 10s".into());
         }
         if self.device.name.as_deref().is_some_and(|name| {
             name.trim().is_empty() || name.contains(['/', '(', ')']) || name.len() > 64
@@ -379,6 +389,7 @@ writeback_cache = true
 
 [sync]
 poll_interval = "1m"
+probe_interval = "15s"
 
 [timeouts]
 metadata = "30s"
@@ -399,7 +410,7 @@ metadata = "30s"
             }]
         );
         assert_eq!(config.cache.max_bytes, ByteSize(20 << 30));
-        assert_eq!(config.cache.ram_bytes, ByteSize(256 << 20));
+        assert_eq!(config.cache.ram_bytes, ByteSize(32 << 20));
         assert_eq!(config.upload.concurrency, 2);
         assert_eq!(config.upload.debounce.0, Duration::from_millis(500));
         assert_eq!(
@@ -409,6 +420,7 @@ metadata = "30s"
         assert_eq!(config.fsync.mode, FsyncMode::Remote);
         assert!(config.kernel.writeback_cache);
         assert_eq!(config.sync.poll_interval.0, Duration::from_secs(60));
+        assert_eq!(config.sync.probe_interval.0, Duration::from_secs(15));
         assert_eq!(config.timeouts.metadata.0, Duration::from_secs(30));
     }
 
@@ -431,7 +443,15 @@ metadata = "30s"
             Err(ConfigError::Invalid { .. })
         ));
         assert!(matches!(
+            parse("[cache]\nram_bytes = \"8MiB\""),
+            Err(ConfigError::Invalid { .. })
+        ));
+        assert!(matches!(
             parse("[sync]\npoll_interval = \"5s\""),
+            Err(ConfigError::Invalid { .. })
+        ));
+        assert!(matches!(
+            parse("[sync]\nprobe_interval = \"5s\""),
             Err(ConfigError::Invalid { .. })
         ));
         assert!(matches!(

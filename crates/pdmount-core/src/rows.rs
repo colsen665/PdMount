@@ -54,8 +54,8 @@ pub fn write_rows(conn: &Connection, rows: &[(Ino, Option<NodeRow>)]) -> rusqlit
     let mut upsert = conn.prepare(
         "INSERT OR REPLACE INTO inodes(ino, kind, parent_ino, name, link_id, mode, mtime_ns, ctime_ns, size,
              listed, local_only, deleted, content_gen, meta_gen, uploaded_content_gen, uploaded_meta_gen,
-             deferred_error, atime_ns)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+             deferred_error, atime_ns, remote_newer)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
     )?;
     let mut upsert_remote = conn.prepare(
         "INSERT OR REPLACE INTO remote(link_id, parent_link, name, name_hash, kind, active_rev, size, mtime_ns,
@@ -87,6 +87,7 @@ pub fn write_rows(conn: &Connection, rows: &[(Ino, Option<NodeRow>)]) -> rusqlit
             gens.uploaded_meta as i64,
             row.deferred_error,
             row.atime.map_or(0, system_time_to_ns),
+            row.remote_newer,
         ])?;
         if let Some(remote) = &row.remote {
             upsert_remote.execute(params![
@@ -140,7 +141,7 @@ pub fn load_rows(conn: &Connection) -> rusqlite::Result<Vec<NodeRow>> {
                 i.local_only, i.deleted, i.content_gen, i.meta_gen, i.uploaded_content_gen,
                 i.uploaded_meta_gen, i.deferred_error,
                 r.link_id, r.parent_link, r.name, r.name_hash, r.active_rev, r.size, r.mtime_ns, r.mode, r.sha1,
-                i.atime_ns
+                i.atime_ns, i.remote_newer
          FROM inodes i LEFT JOIN remote r ON r.link_id = i.link_id",
     )?;
     let rows = statement
@@ -185,9 +186,63 @@ pub fn load_rows(conn: &Connection) -> rusqlite::Result<Vec<NodeRow>> {
                     uploaded_meta: row.get::<_, i64>(14)? as u64,
                 },
                 deferred_error: row.get(15)?,
+                remote_newer: row.get(26)?,
                 remote,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+    use crate::vfs::{Gens, ROOT_INO};
+    use std::time::UNIX_EPOCH;
+
+    fn row(ino: Ino, remote_newer: bool) -> NodeRow {
+        NodeRow {
+            ino,
+            kind: NodeKind::File,
+            parent: Some(ROOT_INO),
+            name: Some(format!("f{ino}")),
+            size: 0,
+            mtime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH,
+            atime: None,
+            mode: 0o644,
+            listed: false,
+            local_only: false,
+            deleted: false,
+            gens: Gens::default(),
+            deferred_error: None,
+            remote_newer,
+            remote: None,
+        }
+    }
+
+    #[test]
+    fn rows_round_trip_remote_newer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&dir.path().join("state.db")).expect("open");
+        store
+            .read(|conn| {
+                write_rows(conn, &[(ROOT_INO, Some(row(ROOT_INO, false)))])?;
+                write_rows(conn, &[(2, Some(row(2, true))), (3, Some(row(3, false)))])?;
+                let rows = load_rows(conn)?;
+                let flag = |ino| {
+                    rows.iter()
+                        .find(|row| row.ino == ino)
+                        .map(|row| row.remote_newer)
+                };
+                assert_eq!((flag(2), flag(3)), (Some(true), Some(false)));
+                // A rewrite clears it.
+                write_rows(conn, &[(2, Some(row(2, false)))])?;
+                let rows = load_rows(conn)?;
+                assert!(rows.iter().all(|row| !row.remote_newer));
+                Ok(())
+            })
+            .expect("rows");
+    }
 }

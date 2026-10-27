@@ -3203,8 +3203,10 @@ dependencies = [
  "chrono",
  "clap",
  "dbus-secret-service",
+ "hex",
  "keyring",
  "nix 0.30.1",
+ "parking_lot",
  "pdmount-backend",
  "pdmount-core",
  "pdmount-fuse",
@@ -3228,10 +3230,12 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
+ "hex",
  "nix 0.30.1",
  "parking_lot",
  "proton-drive-sdk",
  "reqwest",
+ "reqwest-middleware",
  "serde",
  "serde_json",
  "sha1 0.11.0",
@@ -3245,9 +3249,11 @@ dependencies = [
 name = "pdmount-core"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "blake3",
  "bytes",
  "chacha20poly1305",
+ "chrono",
  "dirs",
  "futures",
  "globset",
@@ -3717,7 +3723,7 @@ dependencies = [
 [[package]]
 name = "proton-drive-sdk"
 version = "0.4.0"
-source = "git+https://github.com/colsen665/proton-sdk-rs2?rev=7c92076d6029c08aff2959a77f7eb8456d4e0d24#7c92076d6029c08aff2959a77f7eb8456d4e0d24"
+source = "git+https://github.com/colsen665/proton-sdk-rs2?rev=c837e031507686d782777c6d15ce9dfc57f2baf8#c837e031507686d782777c6d15ce9dfc57f2baf8"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3779,7 +3785,7 @@ dependencies = [
 [[package]]
 name = "proton-sdk-rs2"
 version = "0.4.0"
-source = "git+https://github.com/colsen665/proton-sdk-rs2?rev=7c92076d6029c08aff2959a77f7eb8456d4e0d24#7c92076d6029c08aff2959a77f7eb8456d4e0d24"
+source = "git+https://github.com/colsen665/proton-sdk-rs2?rev=c837e031507686d782777c6d15ce9dfc57f2baf8#c837e031507686d782777c6d15ce9dfc57f2baf8"
 dependencies = [
  "aes-gcm",
  "anyhow",

@@ -19,14 +19,10 @@ pub enum CoreError {
     NotEmpty,
     #[error("invalid argument")]
     InvalidArgument,
-    #[error("operation not permitted")]
-    NotPermitted,
     #[error("permission denied")]
     AccessDenied,
     #[error("no space left (quota)")]
     NoSpace,
-    #[error("file too large")]
-    FileTooLarge,
     /// The directory must be listed first (slow path); never reaches FUSE.
     #[error("directory {0} is not listed yet")]
     NeedsListing(u64),
@@ -43,6 +39,9 @@ pub enum CoreError {
     InvalidName,
     #[error("name longer than 255 bytes")]
     NameTooLong,
+    /// A request that does not apply, with the reason for the user (EINVAL).
+    #[error("{0}")]
+    Refused(String),
     #[error("deadline expired")]
     Timeout,
     #[error("backend: {0}")]
@@ -67,13 +66,12 @@ impl CoreError {
             Self::Exists => libc::EEXIST,
             Self::NotEmpty => libc::ENOTEMPTY,
             Self::InvalidArgument => libc::EINVAL,
-            Self::NotPermitted => libc::EPERM,
             Self::AccessDenied => libc::EACCES,
             Self::NoSpace => libc::ENOSPC,
-            Self::FileTooLarge => libc::EFBIG,
             Self::Errno(errno) => *errno,
             Self::InvalidName => libc::EILSEQ,
             Self::NameTooLong => libc::ENAMETOOLONG,
+            Self::Refused(_) => libc::EINVAL,
             Self::Backend(error) => backend_errno(error),
             Self::Timeout
             | Self::Store(_)
@@ -95,6 +93,7 @@ fn backend_errno(error: &BackendError) -> i32 {
         BackendError::FileTooLarge => libc::EFBIG,
         BackendError::TooManyChildren => libc::EMLINK,
         BackendError::Unsupported(_) => libc::ENOTSUP,
+        BackendError::InvalidMove => libc::EINVAL,
         BackendError::RevisionConflict { .. }
         | BackendError::NameConflict
         | BackendError::RateLimited { .. }
@@ -149,6 +148,10 @@ mod tests {
         assert_eq!(
             CoreError::from(BackendError::Integrity("x".into())).errno(),
             libc::EIO
+        );
+        assert_eq!(
+            CoreError::from(BackendError::InvalidMove).errno(),
+            libc::EINVAL
         );
         assert_eq!(CoreError::ReadOnly.errno(), libc::EROFS);
         assert_eq!(CoreError::InvalidName.errno(), libc::EILSEQ);

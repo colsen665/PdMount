@@ -1,11 +1,16 @@
 //! `pdmount` command-line interface (DESIGN.md §14).
 
 mod access;
+mod auth;
+mod conflicts;
 mod control;
 mod credentials;
 mod daemon;
 mod doctor;
 mod mounts;
+mod notify;
+#[cfg(test)]
+mod probe;
 mod session;
 mod status;
 mod trash;
@@ -60,6 +65,9 @@ enum Command {
     /// Read-only and read-write rules per path (while mounted).
     #[command(subcommand)]
     Access(AccessCommand),
+    /// Conflicts between this device and others (while mounted).
+    #[command(subcommand)]
+    Conflicts(ConflictsCommand),
     /// The account's trash (Proton only, while not mounted).
     #[command(subcommand)]
     Trash(TrashCommand),
@@ -109,8 +117,74 @@ enum FakeCommand {
         path: String,
         #[arg(long)]
         from: std::path::PathBuf,
+        /// Act as an official app: no mode and no SHA-1 in the revision.
+        #[arg(long)]
+        app: bool,
         dir: std::path::PathBuf,
     },
+    /// Create a new file from a local file, as another client would.
+    Create {
+        /// The new file's path (`/a/b`); its folder must exist.
+        #[arg(long)]
+        path: String,
+        #[arg(long)]
+        from: std::path::PathBuf,
+        /// Act as an official app: no mode and no SHA-1 in the revision.
+        #[arg(long)]
+        app: bool,
+        dir: std::path::PathBuf,
+    },
+    /// Create a folder, as another client would.
+    Mkdir {
+        #[arg(long)]
+        path: String,
+        dir: std::path::PathBuf,
+    },
+    /// Make calls of running daemons on this fake fail, or stop doing so.
+    #[command(subcommand)]
+    Fault(FaultCommand),
+}
+
+#[cfg(feature = "fake-backend")]
+#[derive(Debug, Subcommand)]
+enum FaultCommand {
+    /// Calls fail as if the network were down.
+    Offline(FaultArgs),
+    /// Calls fail as if the session had expired.
+    Unauthorized(FaultArgs),
+    /// Remove the rules (of one client, or all).
+    Clear {
+        /// Client UID (`pdmount-<device id>`, see `pdmount status`).
+        #[arg(long)]
+        client: Option<String>,
+        dir: std::path::PathBuf,
+    },
+}
+
+#[cfg(feature = "fake-backend")]
+#[derive(Debug, clap::Args)]
+struct FaultArgs {
+    /// Stop after this many seconds (default: until cleared).
+    #[arg(long = "for")]
+    seconds: Option<u64>,
+    /// Only for this client UID.
+    #[arg(long)]
+    client: Option<String>,
+    dir: std::path::PathBuf,
+}
+
+/// The client a `pdmount fake` write acts as.
+#[cfg(feature = "fake-backend")]
+fn fake_client(app: bool) -> pdmount_backend::fake::FakeClient {
+    if app {
+        pdmount_backend::fake::FakeClient {
+            uid: Some("web".into()),
+            claims_sha1: false,
+            claims_mode: false,
+        }
+    } else {
+        pdmount_backend::fake::FakeClient::default()
+    }
 }
 
 /// The link of `/a/b` on a fake drive.
@@ -151,6 +225,36 @@ enum AccessCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum ConflictsCommand {
+    /// Show the unresolved conflicts, or those at or below a path.
+    List {
+        /// Include resolved conflicts.
+        #[arg(long)]
+        all: bool,
+        /// Absolute inside the mountpoint, or relative to the mount root.
+        path: Option<std::path::PathBuf>,
+    },
+    /// Show one conflict, by id or by the path of either copy.
+    Show {
+        /// A conflict id, or a path (write `./2024` for a file named 2024).
+        target: String,
+    },
+    /// Settle a conflict: keep both copies, or keep one of them.
+    Resolve {
+        #[arg(value_parser = parse_resolution)]
+        choice: pdmount_core::conflicts::Resolution,
+        /// A conflict id, or the path of either copy.
+        target: String,
+    },
+}
+
+fn parse_resolution(value: &str) -> Result<pdmount_core::conflicts::Resolution, String> {
+    pdmount_core::conflicts::Resolution::parse(value)
+        .filter(|_| value.contains('-'))
+        .ok_or_else(|| format!("expected keep-both, keep-local or keep-remote, got {value:?}"))
+}
+
+#[derive(Debug, Subcommand)]
 enum TrashCommand {
     /// Delete everything in the trash for good, account-wide.
     Empty {
@@ -179,6 +283,9 @@ struct MountArgs {
     #[arg(long, default_value = "proton", value_parser = daemon::BackendChoice::parse,
           hide = !cfg!(feature = "fake-backend"))]
     backend: daemon::BackendChoice,
+    /// Fail instead of signing in when the profile has no session.
+    #[arg(long)]
+    no_login: bool,
     /// Mountpoint; default: `mountpoint` from the config (~/ProtonDrive).
     mountpoint: Option<std::path::PathBuf>,
 }
@@ -263,8 +370,13 @@ async fn fake_command(command: FakeCommand) -> anyhow::Result<ExitCode> {
                 result?;
             }
         }
-        FakeCommand::Write { path, from, dir } => {
-            let fake = FakeBackend::open(&dir)?;
+        FakeCommand::Write {
+            path,
+            from,
+            app,
+            dir,
+        } => {
+            let fake = FakeBackend::open(&dir)?.with_client(fake_client(app));
             let link = fake_resolve(&fake, &path).await?;
             let node = fake
                 .get_nodes(std::slice::from_ref(&link))
@@ -287,6 +399,35 @@ async fn fake_command(command: FakeCommand) -> anyhow::Result<ExitCode> {
             let source = pdmount_backend::UploadSource::Bytes(data.into());
             fake.upload_revision(&link, &base, source, meta).await?;
         }
+        FakeCommand::Create {
+            path,
+            from,
+            app,
+            dir,
+        } => {
+            let fake = FakeBackend::open(&dir)?.with_client(fake_client(app));
+            let (parent, name) = path.rsplit_once('/').unwrap_or(("", path.as_str()));
+            let parent = fake_resolve(&fake, parent).await?;
+            let data = anyhow::Context::with_context(std::fs::read(&from), || {
+                format!("cannot read {}", from.display())
+            })?;
+            let meta = pdmount_backend::FileMeta {
+                mtime: std::time::SystemTime::now(),
+                mode: Some(0o644),
+                media_type: "application/octet-stream".into(),
+                sha1: None,
+            };
+            let source = pdmount_backend::UploadSource::Bytes(data.into());
+            fake.upload_new(&parent, name, source, meta).await?;
+        }
+        FakeCommand::Mkdir { path, dir } => {
+            let fake = FakeBackend::open(&dir)?;
+            let (parent, name) = path.rsplit_once('/').unwrap_or(("", path.as_str()));
+            let parent = fake_resolve(&fake, parent).await?;
+            fake.create_folder(&parent, name, std::time::SystemTime::now())
+                .await?;
+        }
+        FakeCommand::Fault(command) => fake_fault(command)?,
         FakeCommand::Changes { after, dir } => {
             for (seq, change) in FakeBackend::open(&dir)?.changes_since(after) {
                 match change {
@@ -308,6 +449,28 @@ async fn fake_command(command: FakeCommand) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+#[cfg(feature = "fake-backend")]
+fn fake_fault(command: FaultCommand) -> anyhow::Result<()> {
+    use pdmount_backend::fake::{FaultKind, FaultRule, add_fault, clear_faults};
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let rule = |kind, args: FaultArgs| {
+        let rule = FaultRule {
+            kind,
+            until_ms: args.seconds.map(|seconds| now_ms + seconds * 1000),
+            client: args.client,
+        };
+        add_fault(&args.dir, rule)
+    };
+    match command {
+        FaultCommand::Offline(args) => rule(FaultKind::Offline, args)?,
+        FaultCommand::Unauthorized(args) => rule(FaultKind::Unauthorized, args)?,
+        FaultCommand::Clear { client, dir } => clear_faults(&dir, client.as_deref())?,
+    }
+    Ok(())
+}
+
 fn home_dir() -> anyhow::Result<std::path::PathBuf> {
     std::env::var_os("HOME")
         .map(Into::into)
@@ -324,6 +487,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     match cli.command {
         Command::Login(browser) => {
             let config = Config::load(&paths.config_file())?;
+            if let Some(code) = daemon::login_via_daemon(&paths, browser.mode(&config)).await? {
+                return Ok(code);
+            }
             let logged_in = session::login(&paths, browser.mode(&config)).await?;
             println!(
                 "Logged in as {} (profile {}, session stored in {}).",
@@ -364,7 +530,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             if args.foreground {
                 daemon::run_foreground(&paths, &config, &mountpoint, &args.backend).await
             } else {
-                daemon::mount_background(&paths, &mountpoint, &args.backend, cli.verbose).await
+                let login = (!args.no_login).then_some(config.auth.browser);
+                daemon::mount_background(&paths, &mountpoint, &args.backend, cli.verbose, login)
+                    .await
             }
         }
         Command::Unmount(args) => {
@@ -403,6 +571,25 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 }
             }
         }
+        Command::Conflicts(command) => {
+            let config = Config::load(&paths.config_file())?;
+            let mountpoint = daemon::existing_mountpoint(&paths, &config, &home_dir()?, None);
+            match command {
+                ConflictsCommand::List { all, path } => {
+                    let path = path
+                        .map(|p| access::mount_relative(&p, &mountpoint))
+                        .transpose()?;
+                    conflicts::list(&paths, path, all).await
+                }
+                ConflictsCommand::Show { target } => {
+                    conflicts::show(&paths, conflicts::target(&target, &mountpoint)?).await
+                }
+                ConflictsCommand::Resolve { choice, target } => {
+                    conflicts::resolve(&paths, conflicts::target(&target, &mountpoint)?, choice)
+                        .await
+                }
+            }
+        }
         Command::Doctor => {
             let checks = doctor::run(&paths).await;
             for check in &checks {
@@ -420,7 +607,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 
 /// The SDK parses ML-DSA keys recursively; worker threads need a larger
 /// stack than tokio's default (pdcli uses the same size).
-const WORKER_STACK_SIZE: usize = 16 << 20;
+pub(crate) const WORKER_STACK_SIZE: usize = 16 << 20;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();

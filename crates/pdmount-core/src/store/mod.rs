@@ -28,7 +28,11 @@ use tokio::sync::oneshot;
 
 /// Migrations in order; the schema version is the number applied
 /// (`PRAGMA user_version`).
-const MIGRATIONS: &[&str] = &[include_str!("0001.sql"), include_str!("0002.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("0001.sql"),
+    include_str!("0002.sql"),
+    include_str!("0003.sql"),
+];
 /// The sync thread checkpoints the WAL once no commit came for
 /// [`CHECKPOINT_IDLE`], or after [`CHECKPOINT_WRITES`] writes under steady
 /// load. On btrfs a checkpoint (database fsync) slows every file creation
@@ -607,6 +611,43 @@ mod tests {
             })
             .expect("count");
         assert_eq!(rows, 5_000);
+    }
+
+    #[test]
+    fn migration_0003_applies_to_a_version_2_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).expect("open");
+        for sql in &MIGRATIONS[..2] {
+            conn.execute_batch(sql).expect("migration");
+        }
+        conn.pragma_update(None, "user_version", 2)
+            .expect("version");
+        conn.execute(
+            "INSERT INTO conflicts(id, kind, ino, orig_name, local_device, created_at, state)
+             VALUES (7, 'edit_edit', 5, 'a', 'dev', 1, 'open')",
+            [],
+        )
+        .expect("old row");
+        drop(conn);
+        let store = Store::open(&path).expect("migrate");
+        let (version, detail, other, indexes): (i64, Option<String>, Option<i64>, i64) = store
+            .read(|conn| {
+                let version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+                let (detail, other) = conn.query_row(
+                    "SELECT detail, other_ino FROM conflicts WHERE id = 7",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                let indexes = conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'conflicts_state'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok((version, detail, other, indexes))
+            })
+            .expect("read");
+        assert_eq!((version, detail, other, indexes), (3, None, None, 1));
     }
 
     #[test]

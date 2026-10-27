@@ -1,7 +1,8 @@
 //! `.pdignore` rules (DESIGN.md §7.7, D018): entries that stay local-only.
 //!
 //! Gitignore syntax: `#` comments, `!` negation, a trailing `/` for
-//! directories, a leading `/` to anchor at the mount root; later rules
+//! directories, a `/` at the start or in the middle to anchor at the mount
+//! root, `*` and `?` within one name, `**` across directories; later rules
 //! override earlier ones. A rule only keeps new nodes from being created
 //! remotely; what already exists remotely keeps syncing.
 //!
@@ -10,7 +11,7 @@
 //! list is empty, and rules come from `<mount>/.pdignore` plus
 //! `~/.config/pdmount/<profile>.pdignore`.
 
-use globset::{Glob, GlobMatcher};
+use globset::{GlobBuilder, GlobMatcher};
 
 /// Name of the rules file at the mount root.
 pub const ROOT_FILE: &str = ".pdignore";
@@ -93,9 +94,12 @@ fn parse_rule(line: &str) -> Option<Rule> {
     if let Some(rest) = pattern.strip_prefix("\\#") {
         pattern = rest;
     }
-    let anchored = pattern.starts_with('/');
     let dir_only = pattern.ends_with('/');
-    let pattern = pattern.trim_matches('/');
+    let pattern = pattern.trim_end_matches('/');
+    // As in gitignore, a slash at the start or in the middle anchors the
+    // pattern at the root.
+    let anchored = pattern.contains('/');
+    let pattern = pattern.trim_start_matches('/');
     if pattern.is_empty() {
         return None;
     }
@@ -109,7 +113,8 @@ fn parse_rule(line: &str) -> Option<Rule> {
     }
     let matchers: Vec<GlobMatcher> = patterns
         .iter()
-        .filter_map(|p| Glob::new(p).ok())
+        // `*` and `?` stop at `/`; only `**` crosses directories.
+        .filter_map(|p| GlobBuilder::new(p).literal_separator(true).build().ok())
         .map(|glob| glob.compile_matcher())
         .collect();
     (!matchers.is_empty()).then_some(Rule {
@@ -138,6 +143,19 @@ mod tests {
         assert!(matcher.is_ignored("docs/file.tmp", false));
         assert!(!matcher.is_ignored("src/docs/file.tmp", false));
         assert!(!matcher.is_ignored("src/main.rs", false));
+    }
+
+    #[test]
+    fn wildcards_stay_within_a_name_and_a_middle_slash_anchors() {
+        let matcher = IgnoreMatcher::new(["/docs/*.tmp\n/*.o\nbuild/out\nlogs/**/*.gz\n"]);
+        assert!(matcher.is_ignored("docs/a.tmp", false));
+        assert!(!matcher.is_ignored("docs/sub/a.tmp", false));
+        assert!(matcher.is_ignored("main.o", false));
+        assert!(!matcher.is_ignored("src/main.o", false));
+        assert!(matcher.is_ignored("build/out", false));
+        assert!(!matcher.is_ignored("src/build/out", false));
+        assert!(matcher.is_ignored("logs/a/b/old.gz", false));
+        assert!(matcher.is_ignored("logs/old.gz", false));
     }
 
     #[test]

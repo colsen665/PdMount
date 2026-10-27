@@ -3,6 +3,10 @@
 //! peer's uid is checked.
 
 use anyhow::Context;
+use anyhow::bail;
+use pdmount_core::ProfilePaths;
+use pdmount_core::config::AccessMode;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::future::Future;
@@ -14,12 +18,17 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+/// Pause after a failed `accept` (out of descriptors, say).
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     Ping,
     Status,
     Stats,
+    /// Start a web login in the daemon and answer with its link (D042).
+    Login,
     /// Upload everything pending, then answer (`unmount --wait`).
     Drain {
         timeout_secs: u64,
@@ -39,10 +48,230 @@ pub enum Request {
     AccessEffective {
         path: String,
     },
+    /// Conflicts (DESIGN.md §10.8). `path` is relative to the mount root;
+    /// `target` is a conflict id (all digits) or such a path.
+    ConflictsList {
+        path: Option<String>,
+        all: bool,
+    },
+    ConflictsShow {
+        target: String,
+    },
+    ConflictsResolve {
+        target: String,
+        choice: pdmount_core::conflicts::Resolution,
+    },
+}
+
+// A reply is `{"ok": true, ...}` with the fields of the request's reply type
+// below, or `{"ok": false, "error": "..."}`. The daemon builds replies from
+// these types and the CLI reads them back with the same types.
+
+/// `Ping`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Pong {
+    pub pid: u32,
+}
+
+/// `Status`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StatusReply {
+    pub pid: u32,
+    pub mountpoint: PathBuf,
+    pub queue_pending: u64,
+    pub queue_parked: u64,
+    /// Conflicts waiting for the user.
+    pub conflicts: u64,
+    pub connectivity: pdmount_core::health::Connectivity,
+    /// Unix seconds when `connectivity` began.
+    pub connectivity_since: u64,
+    /// A login the daemon runs (D042), until it ends.
+    pub sign_in_url: Option<String>,
+    pub sign_in_code: Option<String>,
+    /// Why the last daemon login failed.
+    pub sign_in_error: Option<String>,
+    pub username: String,
+    /// Where the session is stored.
+    pub credentials: String,
+    pub quota_used: Option<u64>,
+    pub quota_max: Option<u64>,
+    pub inodes: u64,
+    pub cache_bytes: u64,
+    pub cache_blocks: u64,
+}
+
+/// `Login`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LoginReply {
+    pub url: String,
+    pub code: String,
+}
+
+/// `Drain`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DrainReply {
+    pub pending: u64,
+    pub parked: u64,
+    /// `(path, reason)` of each parked change.
+    pub parked_items: Vec<(String, String)>,
+}
+
+/// `AccessSet`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AccessSetReply {
+    /// Pending changes in the subtree; they still upload.
+    pub pending: u64,
+}
+
+/// `AccessList`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AccessListReply {
+    pub default: AccessMode,
+    pub rules: Vec<RuleReply>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RuleReply {
+    pub mode: AccessMode,
+    /// `None`: orphaned, its entry is gone.
+    pub path: Option<String>,
+    pub set_as: String,
+    pub source: String,
+}
+
+/// `AccessEffective`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AccessEffectiveReply {
+    pub mode: AccessMode,
+    /// The deciding rule's path; `None`: the default.
+    pub rule: Option<String>,
+}
+
+/// `ConflictsList`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConflictsReply {
+    pub conflicts: Vec<ConflictReply>,
+}
+
+/// `ConflictsShow` and `ConflictsResolve`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConflictOneReply {
+    pub conflict: ConflictReply,
+}
+
+/// A conflict as the control socket carries it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictReply {
+    pub id: i64,
+    pub kind: String,
+    pub state: String,
+    pub path: Option<String>,
+    pub other_path: Option<String>,
+    pub orig_name: String,
+    pub conflict_name: Option<String>,
+    pub local_rev: Option<String>,
+    pub remote_rev: Option<String>,
+    pub local_device: String,
+    /// Unix seconds.
+    pub created_at: i64,
+    pub detail: Option<String>,
+}
+
+impl From<&pdmount_core::conflicts::ConflictView> for ConflictReply {
+    fn from(view: &pdmount_core::conflicts::ConflictView) -> Self {
+        Self {
+            id: view.id,
+            kind: view.kind.as_str().to_owned(),
+            state: view.state.as_str().to_owned(),
+            path: view.path.clone(),
+            other_path: view.other_path.clone(),
+            orig_name: view.orig_name.clone(),
+            conflict_name: view.conflict_name.clone(),
+            local_rev: view.local_rev.as_ref().map(|rev| rev.as_str().to_owned()),
+            remote_rev: view.remote_rev.as_ref().map(|rev| rev.as_str().to_owned()),
+            local_device: view.local_device.clone(),
+            created_at: view.created_at,
+            detail: view.detail.clone(),
+        }
+    }
+}
+
+/// `Stats`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StatsReply {
+    /// By name, as `Metrics` counts them.
+    pub counters: std::collections::BTreeMap<String, u64>,
+    pub pool: Vec<PoolClassReply>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PoolClassReply {
+    /// The slot size, or `scratch`.
+    pub class: String,
+    pub slots: usize,
+    pub in_use: usize,
+}
+
+/// `Unmount`, and requests that answer only whether they worked.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Done {}
+
+/// A successful reply.
+pub fn ok(body: impl Serialize) -> Value {
+    let mut value = serde_json::to_value(body).expect("replies serialize");
+    if let Value::Object(fields) = &mut value {
+        fields.insert("ok".into(), Value::Bool(true));
+    }
+    value
+}
+
+pub fn failed(error: impl std::fmt::Display) -> Value {
+    serde_json::json!({ "ok": false, "error": error.to_string() })
+}
+
+/// [`ok`] or [`failed`].
+pub fn reply<T: Serialize, E: std::fmt::Display>(result: Result<T, E>) -> Value {
+    result.map_or_else(failed, ok)
 }
 
 pub type Handler =
     Arc<dyn Fn(Request) -> Pin<Box<dyn Future<Output = Value> + Send>> + Send + Sync>;
+
+/// Sends one request and reads its reply as `T`; a refused request is an
+/// error with the daemon's message. `Ok(None)` means no daemon is listening.
+pub async fn call_ok<T: DeserializeOwned>(
+    socket: &Path,
+    request: Request,
+    timeout: Duration,
+) -> anyhow::Result<Option<T>> {
+    let Some(reply) = call(socket, request, timeout).await? else {
+        return Ok(None);
+    };
+    if reply["ok"] != true {
+        bail!("{}", reply["error"].as_str().unwrap_or("unknown error"));
+    }
+    Ok(Some(
+        serde_json::from_value(reply).context("invalid daemon response")?,
+    ))
+}
+
+/// [`call_ok`] for commands that need the daemon: `what` says what goes
+/// through it ("access rules are changed").
+pub async fn ask<T: DeserializeOwned>(
+    paths: &ProfilePaths,
+    request: Request,
+    timeout: Duration,
+    what: &str,
+) -> anyhow::Result<T> {
+    call_ok(&paths.control_socket(), request, timeout)
+        .await?
+        .with_context(|| {
+            format!(
+                "profile {} is not mounted; {what} through the running daemon",
+                paths.profile
+            )
+        })
+}
 
 /// Sends one request. `Ok(None)` means no daemon is listening.
 pub async fn call(
@@ -99,8 +328,9 @@ fn is_hangup(error: &anyhow::Error) -> bool {
     })
 }
 
-/// Binds the socket and serves requests until the task is aborted.
-pub fn serve(socket: &Path, handler: Handler) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+/// Creates the socket's directory (mode 0700). `$XDG_RUNTIME_DIR` is a tmpfs,
+/// so it is gone after every reboot.
+pub fn create_dir(socket: &Path) -> anyhow::Result<()> {
     if let Some(dir) = socket.parent() {
         std::fs::DirBuilder::new()
             .recursive(true)
@@ -108,6 +338,12 @@ pub fn serve(socket: &Path, handler: Handler) -> anyhow::Result<tokio::task::Joi
             .create(dir)
             .with_context(|| format!("cannot create {}", dir.display()))?;
     }
+    Ok(())
+}
+
+/// Binds the socket and serves requests until the task is aborted.
+pub fn serve(socket: &Path, handler: Handler) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    create_dir(socket)?;
     // The caller checked that no daemon answers, so a leftover file is stale.
     let _ = std::fs::remove_file(socket);
     let listener =
@@ -116,8 +352,14 @@ pub fn serve(socket: &Path, handler: Handler) -> anyhow::Result<tokio::task::Joi
     let uid = nix::unistd::getuid().as_raw();
     Ok(tokio::spawn(async move {
         loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                continue;
+            let stream = match listener.accept().await {
+                Ok((stream, _)) => stream,
+                // EMFILE and the like persist: retrying at once would spin.
+                Err(error) => {
+                    tracing::warn!(%error, "control socket: accept failed");
+                    tokio::time::sleep(ACCEPT_RETRY).await;
+                    continue;
+                }
             };
             let handler = Arc::clone(&handler);
             tokio::spawn(async move {
@@ -139,9 +381,7 @@ async fn serve_one(stream: UnixStream, uid: u32, handler: Handler) -> anyhow::Re
     reader.read_line(&mut line).await?;
     let response = match serde_json::from_str::<Request>(&line) {
         Ok(request) => handler(request).await,
-        Err(error) => {
-            serde_json::json!({ "ok": false, "error": format!("invalid request: {error}") })
-        }
+        Err(error) => failed(format!("invalid request: {error}")),
     };
     let mut out = serde_json::to_string(&response)?;
     out.push('\n');
@@ -183,6 +423,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_replies_round_trip_and_refusals_are_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("test.sock");
+        let handler: Handler = Arc::new(|request| {
+            Box::pin(async move {
+                match request {
+                    Request::Ping => ok(Pong { pid: 7 }),
+                    _ => failed("busy"),
+                }
+            })
+        });
+        let server = serve(&socket, handler).expect("serve");
+        let pong: Pong = call_ok(&socket, Request::Ping, Duration::from_secs(5))
+            .await
+            .expect("call")
+            .expect("daemon");
+        assert_eq!(pong.pid, 7);
+        let refused = call_ok::<Done>(&socket, Request::Unmount, Duration::from_secs(5)).await;
+        assert_eq!(refused.expect_err("refused").to_string(), "busy");
+        // Another reply type is an error, not zeros.
+        let wrong = call_ok::<DrainReply>(&socket, Request::Ping, Duration::from_secs(5)).await;
+        assert!(wrong.is_err());
+        server.abort();
+    }
+
+    #[test]
+    fn replies_keep_their_wire_fields() {
+        let reply = ok(AccessEffectiveReply {
+            mode: AccessMode::Ro,
+            rule: None,
+        });
+        assert_eq!(
+            reply,
+            serde_json::json!({ "ok": true, "mode": "ro", "rule": null })
+        );
+    }
+
+    #[tokio::test]
     async fn no_daemon_is_not_an_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let response = call(
@@ -200,6 +478,24 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Request::Unmount).expect("json"),
             r#"{"cmd":"unmount"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::ConflictsResolve {
+                target: "3".into(),
+                choice: pdmount_core::conflicts::Resolution::KeepLocal,
+            })
+            .expect("json"),
+            r#"{"cmd":"conflicts_resolve","target":"3","choice":"keep_local"}"#
+        );
+        let parsed: Request =
+            serde_json::from_str(r#"{"cmd":"conflicts_list","path":null,"all":true}"#)
+                .expect("parse");
+        assert_eq!(
+            parsed,
+            Request::ConflictsList {
+                path: None,
+                all: true
+            }
         );
     }
 }

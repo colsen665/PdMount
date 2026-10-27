@@ -149,13 +149,23 @@ impl StagingDir {
             .write(true)
             .open(self.data_path(ino))?;
         let size = file.metadata()?.len();
-        Ok(Staged {
+        let mut staged = Staged {
             ino,
             dir: self.clone(),
             file,
             sidecar,
             size,
-        })
+        };
+        // A truncate that cut the file but crashed before its sidecar save
+        // ([`Staged::truncate`]): the file is the truth, finish the cut.
+        if let Some(base) = &mut staged.sidecar.base
+            && base.size > size
+        {
+            base.size = size;
+            staged.drop_base_if_complete();
+            staged.save()?;
+        }
+        Ok(staged)
     }
 
     /// Deletes the staging files of an inode.
@@ -209,7 +219,7 @@ impl Staged {
     }
 
     /// Bytes of the base that a grid block holds.
-    fn base_span(&self, index: u64) -> Option<(u64, u64)> {
+    pub fn base_range(&self, index: u64) -> Option<(u64, u64)> {
         let base = self.sidecar.base.as_ref()?;
         let start = index * GRID;
         (start < base.size && !self.sidecar.materialized.contains(&index))
@@ -251,7 +261,7 @@ impl Staged {
         for index in Self::blocks(offset, end - offset) {
             let start = offset.max(index * GRID);
             let stop = end.min((index + 1) * GRID);
-            match self.base_span(index) {
+            match self.base_range(index) {
                 Some((_, base_end)) if start < base_end => {
                     let mid = stop.min(base_end);
                     push(Piece::Base {
@@ -280,7 +290,7 @@ impl Staged {
         let end = offset + len;
         Self::blocks(offset, len)
             .filter(|&index| {
-                self.base_span(index).is_some_and(|(start, stop)| {
+                self.base_range(index).is_some_and(|(start, stop)| {
                     let overlaps = offset < stop && end > start;
                     overlaps && (offset > start || end < stop)
                 })
@@ -292,7 +302,7 @@ impl Staged {
     /// cut in the middle.
     pub fn blocks_to_materialize_for_truncate(&self, size: u64) -> Vec<u64> {
         let index = size / GRID;
-        match self.base_span(index) {
+        match self.base_range(index) {
             Some((start, end)) if size > start && size < end => vec![index],
             _ => Vec::new(),
         }
@@ -308,11 +318,6 @@ impl Staged {
             .collect()
     }
 
-    /// The base byte range a grid block needs, if it is still missing.
-    pub fn base_range(&self, index: u64) -> Option<(u64, u64)> {
-        self.base_span(index)
-    }
-
     /// Copies base content into a missing block. `data` is the base's bytes
     /// for [`Staged::base_range`] at the time it was read; a block that was
     /// materialized meanwhile, or a base that changed, is left alone.
@@ -320,10 +325,17 @@ impl Staged {
         if self.sidecar.base.as_ref().map(|b| (&b.link, &b.rev)) != Some((&base.link, &base.rev)) {
             return Ok(());
         }
-        let Some((start, end)) = self.base_span(index) else {
+        let Some((start, end)) = self.base_range(index) else {
             return Ok(());
         };
-        let len = ((end - start) as usize).min(data.len());
+        let len = (end - start) as usize;
+        if data.len() < len {
+            // A short read would become zeros in the upload.
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("base block {index} has {} of {len} bytes", data.len()),
+            ));
+        }
         self.file.write_all_at(&data[..len], start)?;
         self.sidecar.materialized.insert(index);
         self.drop_base_if_complete();
@@ -338,18 +350,19 @@ impl Staged {
         let end = offset + len;
         let covered: Vec<u64> = Self::blocks(offset, len)
             .filter(|&index| {
-                self.base_span(index)
+                self.base_range(index)
                     .is_some_and(|(start, stop)| offset <= start && end >= stop)
             })
             .collect();
+        // Data first: a crash before the sidecar save leaves the block on its
+        // base (the write was never acknowledged), never a hole of zeros.
+        self.file.write_all_at(data, offset)?;
+        self.size = self.size.max(offset + len);
         if !covered.is_empty() {
-            // Mark first: after a crash, the block's bytes are the new ones.
             self.sidecar.materialized.extend(covered);
             self.drop_base_if_complete();
             self.save()?;
         }
-        self.file.write_all_at(data, offset)?;
-        self.size = self.size.max(offset + len);
         Ok(())
     }
 
@@ -361,6 +374,10 @@ impl Staged {
     /// Changes the size. A cut inside a missing base block must have been
     /// materialized ([`Staged::blocks_to_materialize_for_truncate`]).
     pub fn truncate(&mut self, size: u64) -> io::Result<()> {
+        // The file first: reopening takes the size from it, so a crash before
+        // the sidecar save never exposes the base tail as zeros.
+        self.file.set_len(size)?;
+        self.size = size;
         if let Some(base) = &mut self.sidecar.base
             && size < base.size
         {
@@ -368,8 +385,6 @@ impl Staged {
             self.drop_base_if_complete();
             self.save()?;
         }
-        self.file.set_len(size)?;
-        self.size = size;
         Ok(())
     }
 
@@ -570,5 +585,41 @@ mod tests {
         assert_eq!(std::fs::read(snapshot).expect("read"), b"abcd");
         staging.remove(3);
         assert!(staging.staged_inos().expect("list").is_empty());
+    }
+
+    #[test]
+    fn a_short_base_read_is_not_materialized() {
+        let (_temp, staging) = dir();
+        let mut staged = staging.create(4, None, Some(base(4)), 4).expect("create");
+        assert!(staged.materialize(0, &base(4), b"ab").is_err());
+        assert_eq!(staged.missing_blocks(), vec![0]);
+    }
+
+    #[test]
+    fn reopening_finishes_a_truncate_cut_short_by_a_crash() {
+        let (_temp, staging) = dir();
+        drop(
+            staging
+                .create(6, None, Some(base(2 * GRID)), 2 * GRID)
+                .expect("create"),
+        );
+        // The file was cut, the sidecar save never happened.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(staging.data_path(6))
+            .and_then(|file| file.set_len(GRID))
+            .expect("cut");
+        let mut staged = staging.reopen(6).expect("reopen");
+        assert_eq!(staged.size(), GRID);
+        assert_eq!(staged.missing_blocks(), vec![0]);
+        // Growing again reads zeros, not the old base tail.
+        staged.truncate(2 * GRID).expect("extend");
+        assert_eq!(
+            staged.plan_read(GRID, 10),
+            vec![Piece::Staging {
+                offset: GRID,
+                len: 10
+            }]
+        );
     }
 }

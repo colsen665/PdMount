@@ -14,19 +14,47 @@
 //! every listed directory is re-listed in the background
 //! ([`Engine::revalidate`]); event polling follows in M3.
 //!
-//! Lock order: a per-inode staging lock may be taken before the tree lock,
-//! never while holding it.
+//! # Lock order
+//!
+//! Synchronous locks, outermost first; a lock is taken only while holding
+//! locks above it ([`crate::lock_order`] checks this in debug builds):
+//!
+//! 1. the staging of one inode (one at a time);
+//! 2. the staged map (`staged`);
+//! 3. the access rules;
+//! 4. the tree (no recursive read: a waiting writer blocks the second);
+//! 5. leaves, which take nothing while held: journal entries, the conflict
+//!    registry, the `.pdignore` rules.
+//!
+//! The other mutexes (handles, quota, inode numbers, refresh state, ...)
+//! guard one field each and take nothing while held. None of these locks
+//! is held across an `.await`. Asynchronous locks, held across the backend
+//! calls they serialize, come before all of them: the event cursor, then a
+//! background turn of the [`Gate`], which a holder never asks for again (it
+//! would wait for itself); `reserving` before `inos`.
+//!
+//! A guard in a call's arguments, or in an `if let` or `match` scrutinee,
+//! lives until the call or the whole block ends.
 
 use crate::Config;
 use crate::access::{Rule, RuleSource, RuleView, Rules};
-use crate::cache::{BlockCache, BlockKey, CacheOptions, Layout, Priority, assemble};
+use crate::cache::{
+    BlockCache, BlockKey, CacheOptions, Layout, Priority, READ_BLOCKS_HELD, ReadData,
+};
 use crate::config::AccessMode;
+use crate::conflicts::{
+    Clock, Conflict, ConflictKind, ConflictNote, ConflictNotice, ConflictState, Conflicts, Namer,
+    store_conflict, store_state,
+};
+use crate::device::DeviceIdentity;
 use crate::errors::{CoreError, Result};
 use crate::gate::Gate;
+use crate::health::{Connectivity, Health, Monitored};
 use crate::journal::Journal;
+use crate::lock_order::{self, Rank};
 use crate::metrics::{Metrics, check_not_hot};
 use crate::pdignore::IgnoreMatcher;
-use crate::rows::{load_rows, sql_ino, write_rows};
+use crate::rows::{load_rows, write_rows};
 use crate::singleflight::SingleFlight;
 use crate::staging::{Base, Piece, Staged, StagingDir};
 use crate::store::{Store, meta_get, meta_set};
@@ -34,10 +62,10 @@ use crate::vfs::{
     ApplyError, Attr, Changes, Content, DirEntry, Ino, Invalidation, Lookup, NodeRow, ROOT_INO,
     RemoteState, RenameMode, Tree,
 };
-use bytes::Bytes;
-use pdmount_backend::{Backend, EventId, LinkId, NodeKind, RevisionId, StorageInfo};
+use futures::StreamExt;
+use pdmount_backend::{Backend, EventId, LinkId, NodeKind, RemoteNode, RevisionId, StorageInfo};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
@@ -59,6 +87,9 @@ const ACCESS_FLUSH: Duration = Duration::from_secs(60);
 /// Staging removals wait this long to share one store fsync: each fsync
 /// stalls the WAL writes that FUSE replies wait for (D032).
 const STAGING_REMOVAL_DELAY: Duration = Duration::from_secs(1);
+/// Plans of a staged read before giving up on writes that keep moving its
+/// base pieces.
+const STAGED_READ_ATTEMPTS: usize = 8;
 
 pub struct EngineOptions {
     pub state_db: PathBuf,
@@ -67,6 +98,31 @@ pub struct EngineOptions {
     pub local_ignore: Option<PathBuf>,
     pub cache: CacheOptions,
     pub config: Config,
+    /// This device, named in conflict copies (§10.2, §10.7).
+    pub device: DeviceIdentity,
+    /// The time source for conflict names.
+    pub clock: Clock,
+}
+
+impl EngineOptions {
+    /// State, staging and block cache all in `dir`, no profile `.pdignore`,
+    /// 16 MiB of RAM cache and 64 MiB of disk cache (tests and benchmarks).
+    pub fn in_dir(dir: &Path, config: Config, device: DeviceIdentity, clock: Clock) -> Self {
+        Self {
+            state_db: dir.join("state.db"),
+            staging_dir: dir.join("staging"),
+            local_ignore: None,
+            cache: CacheOptions {
+                dir: dir.join("blocks"),
+                master_key: [7; 32],
+                ram_bytes: 16 << 20,
+                disk_bytes: 64 << 20,
+            },
+            config,
+            device,
+            clock,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,25 +186,33 @@ enum ReadSource {
         rev: Option<RevisionId>,
         size: u64,
     },
-    Staged(Arc<parking_lot::Mutex<Staged>>),
+    Staged(Arc<StagingLock>),
 }
 
 pub struct Engine {
+    /// The backend as the engine sees it: watched by [`Monitored`].
     pub(crate) backend: Arc<dyn Backend>,
+    monitored: Arc<Monitored>,
+    pub(crate) health: Arc<Health>,
     pub(crate) store: Arc<Store>,
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) cache: Arc<BlockCache>,
     pub(crate) config: Config,
-    pub(crate) tree: parking_lot::RwLock<Tree>,
+    device: DeviceIdentity,
+    clock: Clock,
+    pub(crate) tree: lock_order::RwLock<Tree>,
     inos: parking_lot::Mutex<InoAllocator>,
     reserving: tokio::sync::Mutex<()>,
-    listings: SingleFlight<Ino, ()>,
+    /// Per directory: the listing in flight, which answers with the number
+    /// it took from `listing_epoch` when it started (D054).
+    listings: SingleFlight<Ino, (u64, Result<()>)>,
+    listing_epoch: AtomicU64,
     pub(crate) invalidations: mpsc::UnboundedSender<Invalidation>,
     dirs: parking_lot::Mutex<HashMap<u64, Arc<Vec<DirEntry>>>>,
     files: parking_lot::Mutex<HashMap<u64, OpenFile>>,
     next_handle: AtomicU64,
     pub(crate) staging: StagingDir,
-    pub(crate) staged: Arc<parking_lot::Mutex<StagedMap>>,
+    pub(crate) staged: Arc<lock_order::Mutex<StagedMap>>,
     /// Staging to delete once the store rows naming it are durable.
     staging_removals: Arc<parking_lot::Mutex<Vec<Ino>>>,
     pub(crate) journal: Journal,
@@ -161,12 +225,16 @@ pub struct Engine {
     pending_bytes: parking_lot::Mutex<Option<(std::time::Instant, u64, u64)>>,
     prefetched_dirs: parking_lot::Mutex<HashSet<Ino>>,
     /// `.pdignore` rules: the profile's file, then the mount root's.
-    ignore: parking_lot::RwLock<Arc<IgnoreMatcher>>,
+    ignore: lock_order::RwLock<Arc<IgnoreMatcher>>,
     local_ignore: String,
     /// Asks the background task to reload the rules.
     ignore_changed: tokio::sync::Notify,
-    /// Access rules (§11); taken before the tree lock, never while holding it.
-    access: parking_lot::RwLock<Rules>,
+    /// Access rules (§11).
+    access: lock_order::RwLock<Rules>,
+    /// The conflict registry (§10.8).
+    conflicts: lock_order::Mutex<Conflicts>,
+    /// Newly registered conflicts, for the notification hook.
+    notices: tokio::sync::broadcast::Sender<ConflictNotice>,
     pub(crate) gate: Gate,
     /// Where the event stream continues (§9.1); held while syncing.
     pub(crate) event_cursor: tokio::sync::Mutex<Option<EventId>>,
@@ -180,7 +248,7 @@ pub struct Engine {
 async fn remove_committed_staging(
     store: Arc<Store>,
     staging: StagingDir,
-    staged: Arc<parking_lot::Mutex<StagedMap>>,
+    staged: Arc<lock_order::Mutex<StagedMap>>,
     removals: Arc<parking_lot::Mutex<Vec<Ino>>>,
 ) {
     let inos = std::mem::take(&mut *removals.lock());
@@ -213,6 +281,9 @@ impl Engine {
         backend: Arc<dyn Backend>,
         options: EngineOptions,
     ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<Invalidation>)> {
+        let health = Arc::new(Health::default());
+        let monitored = Arc::new(Monitored::new(backend, Arc::clone(&health)));
+        let backend: Arc<dyn Backend> = monitored.clone();
         let store = Arc::new(Store::open(&options.state_db)?);
         let metrics = Arc::new(Metrics::default());
         let account = backend.account().await?;
@@ -228,9 +299,14 @@ impl Engine {
             None => initialize(&store, backend.as_ref(), &metrics).await?,
         }
         let staging = StagingDir::open(&options.staging_dir)?;
-        let (tree, reserved, staged) = load(&store, &staging)?;
+        let (mut tree, reserved, staged) = load(&store, &staging)?;
+        tree.set_namer(Namer {
+            device: options.device.name.clone(),
+            clock: Arc::clone(&options.clock),
+        });
         let cursor = crate::events::load_cursor(&store)?;
         let access = store.read(|conn| Rules::load(conn, options.config.access.default))?;
+        let conflicts = store.read(Conflicts::load)?;
         let cache = BlockCache::open(
             Arc::clone(&backend),
             Arc::clone(&store),
@@ -246,33 +322,43 @@ impl Engine {
             .unwrap_or_default();
         let engine = Arc::new(Self {
             backend,
+            monitored,
+            health,
             store,
             metrics,
             cache: Arc::new(cache),
             config: options.config,
-            tree: parking_lot::RwLock::new(tree),
+            device: options.device,
+            clock: options.clock,
+            tree: lock_order::RwLock::new(Rank::Tree, tree),
             inos: parking_lot::Mutex::new(InoAllocator {
                 next: reserved + 1,
                 reserved,
             }),
             reserving: tokio::sync::Mutex::new(()),
             listings: SingleFlight::default(),
+            listing_epoch: AtomicU64::new(0),
             invalidations: sender,
             dirs: parking_lot::Mutex::default(),
             files: parking_lot::Mutex::default(),
             next_handle: AtomicU64::new(1),
             staging,
-            staged: Arc::new(parking_lot::Mutex::new(staged)),
+            staged: Arc::new(lock_order::Mutex::new(Rank::StagedMap, staged)),
             staging_removals: Arc::default(),
             journal,
             storage: parking_lot::Mutex::default(),
             remote_clock: AtomicU64::new(0),
             pending_bytes: parking_lot::Mutex::default(),
             prefetched_dirs: parking_lot::Mutex::default(),
-            ignore: parking_lot::RwLock::new(Arc::new(IgnoreMatcher::new([local_ignore.as_str()]))),
+            ignore: lock_order::RwLock::new(
+                Rank::Leaf,
+                Arc::new(IgnoreMatcher::new([local_ignore.as_str()])),
+            ),
             local_ignore,
             ignore_changed: tokio::sync::Notify::new(),
-            access: parking_lot::RwLock::new(access),
+            access: lock_order::RwLock::new(Rank::Access, access),
+            conflicts: lock_order::Mutex::new(Rank::Leaf, conflicts),
+            notices: tokio::sync::broadcast::channel(64).0,
             gate: Gate::new(BACKGROUND_INTERVAL),
             event_cursor: tokio::sync::Mutex::new(cursor),
             refresh: parking_lot::Mutex::default(),
@@ -283,16 +369,98 @@ impl Engine {
         Ok((engine, receiver))
     }
 
+    /// Connectivity of the drive (§9.6).
+    pub fn health(&self) -> &Arc<Health> {
+        &self.health
+    }
+
     pub fn metrics(&self) -> &Arc<Metrics> {
         &self.metrics
+    }
+
+    /// Block pool slots in use per class (§6.2).
+    pub fn cache_pool_usage(&self) -> Vec<crate::pool::ClassUsage> {
+        self.cache.pool_usage()
     }
 
     pub fn config(&self) -> &Config {
         &self.config
     }
 
+    pub fn device(&self) -> &DeviceIdentity {
+        &self.device
+    }
+
+    /// The time source for conflict names and records.
+    pub fn clock(&self) -> &Clock {
+        &self.clock
+    }
+
     pub fn runtime(&self) -> &tokio::runtime::Handle {
         &self.runtime
+    }
+
+    /// Receives a notice for every conflict registered from now on.
+    pub fn subscribe_conflicts(&self) -> tokio::sync::broadcast::Receiver<ConflictNotice> {
+        self.notices.subscribe()
+    }
+
+    /// Registers a conflict: numbers it, queues its row, logs it and tells
+    /// the subscribers. A crash may lose the record, never the conflict copy.
+    pub fn record_conflict(&self, note: ConflictNote) -> i64 {
+        let path = self.tree.read().path(note.ino);
+        let at = self.clock()()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs() as i64);
+        let conflict = self.conflicts.lock().insert(note, &self.device.name, at);
+        let row = conflict.clone();
+        self.store.write(move |conn| store_conflict(conn, &row));
+        tracing::warn!(
+            id = conflict.id,
+            kind = conflict.kind.as_str(),
+            path = path.as_deref().unwrap_or(""),
+            conflict_name = conflict.conflict_name.as_deref().unwrap_or(""),
+            "conflict"
+        );
+        // No subscriber is not an error.
+        let _ = self.notices.send(ConflictNotice {
+            id: conflict.id,
+            kind: conflict.kind,
+            path,
+        });
+        conflict.id
+    }
+
+    /// Records the other copy of a conflict once it shows.
+    pub(crate) fn set_conflict_other(&self, id: i64, other: Ino) {
+        let row = self.conflicts.lock().set_other_ino(id, other).cloned();
+        if let Some(row) = row {
+            self.store.write(move |conn| store_conflict(conn, &row));
+        }
+    }
+
+    /// Changes a conflict's state; `false` for an unknown id.
+    pub fn set_conflict_state(&self, id: i64, state: ConflictState) -> bool {
+        if self.conflicts.lock().set_state(id, state).is_none() {
+            return false;
+        }
+        self.store.write(move |conn| store_state(conn, id, state));
+        true
+    }
+
+    /// Every registered conflict, oldest first.
+    pub fn conflicts(&self) -> Vec<Conflict> {
+        self.conflicts.lock().all().cloned().collect()
+    }
+
+    #[cfg(test)]
+    pub fn conflict_count(&self) -> usize {
+        self.conflicts.lock().count_active()
+    }
+
+    /// Conflicts that wait for the user (state `open`).
+    pub fn conflict_open_count(&self) -> usize {
+        self.conflicts.lock().count_open()
     }
 
     /// Runs `reply` once the store rows the current request queued are
@@ -330,11 +498,16 @@ impl Engine {
     /// Starts the event task (which also catches up after mounting), the
     /// journal executor, quota refresh and cache bookkeeping.
     pub fn start_background(self: &Arc<Self>) {
+        // Remote nodes a yield left hidden before the last stop (D055).
+        self.journal
+            .list_later(self.folders_missing_an_other_copy());
         let mut tasks = self.background.lock();
         let this = Arc::clone(self);
         tasks.push(self.runtime.spawn(async move { this.run_events().await }));
         let this = Arc::clone(self);
         tasks.push(self.runtime.spawn(async move { this.run_journal().await }));
+        let this = Arc::clone(self);
+        tasks.push(self.runtime.spawn(async move { this.run_health().await }));
         let this = Arc::clone(self);
         tasks.push(self.runtime.spawn(async move {
             loop {
@@ -365,6 +538,58 @@ impl Engine {
             self.runtime
                 .spawn(async move { this.import_config_rules().await }),
         );
+    }
+
+    /// The probe task: while the drive cannot be reached, asks for the quota
+    /// every `sync.probe_interval` (or at once after [`Health::kick`]); the
+    /// first answer ends `Offline`. Work that waits for `Online` is woken on
+    /// the transition. A rejected session is not probed: only a login ends it.
+    pub(crate) async fn run_health(self: Arc<Self>) {
+        let interval = self.config.sync.probe_interval.0;
+        let mut changes = self.health.subscribe();
+        let mut state = self.health.state();
+        loop {
+            match state {
+                Connectivity::Online => {
+                    if changes.changed().await.is_err() {
+                        return;
+                    }
+                }
+                Connectivity::Offline => {
+                    tokio::select! {
+                        () = tokio::time::sleep(interval) => {}
+                        () = self.health.kicked() => {}
+                        _ = changes.changed() => {}
+                    }
+                    if self.health.state() == Connectivity::Offline {
+                        let _turn = self.gate.background().await;
+                        if let Err(error) = self.monitored.probe().await {
+                            tracing::debug!(%error, "probe failed");
+                        }
+                    }
+                }
+                Connectivity::NeedsLogin => {
+                    tokio::select! {
+                        () = self.health.kicked() => {
+                            // A new session was set: the first answer ends the state.
+                            if self.health.state() == Connectivity::NeedsLogin {
+                                let _turn = self.gate.background().await;
+                                match self.monitored.probe().await {
+                                    Ok(()) => self.health.set(Connectivity::Online),
+                                    Err(error) => tracing::debug!(%error, "probe failed"),
+                                }
+                            }
+                        }
+                        _ = changes.changed() => {}
+                    }
+                }
+            }
+            let now = self.health.state();
+            if now == Connectivity::Online && state != Connectivity::Online {
+                self.journal.wake_all();
+            }
+            state = now;
+        }
     }
 
     /// Stops background work and commits the store. Pending journal work
@@ -423,16 +648,14 @@ impl Engine {
         }
     }
 
-    /// Opens a listed directory; `None` means it must be listed first.
-    pub fn opendir(self: &Arc<Self>, ino: Ino) -> Result<Option<u64>> {
+    /// Opens a listed directory; `NeedsListing` when it was never listed.
+    pub fn opendir(self: &Arc<Self>, ino: Ino) -> Result<u64> {
         self.ensure_allowed(ino, MAY_READ)?;
-        let Some(entries) = self.tree.read().dir_entries(ino)? else {
-            return Ok(None);
-        };
+        let entries = self.tree.read().dir_entries(ino)?;
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         self.dirs.lock().insert(handle, Arc::new(entries));
         self.prefetch_dir(ino);
-        Ok(Some(handle))
+        Ok(handle)
     }
 
     /// The snapshot taken by `opendir`.
@@ -452,11 +675,6 @@ impl Engine {
 
     pub fn releasedir(&self, handle: u64) {
         self.dirs.lock().remove(&handle);
-    }
-
-    /// Whether a directory has been listed (for `FOPEN_CACHE_DIR`).
-    pub fn is_listed(&self, ino: Ino) -> bool {
-        self.tree.read().get(ino).is_some_and(|node| node.listed)
     }
 
     pub fn statfs(&self) -> StatFs {
@@ -524,7 +742,7 @@ impl Engine {
         };
         self.staged
             .lock()
-            .insert(ino, Arc::new(parking_lot::Mutex::new(staged)));
+            .insert(ino, Arc::new(StagingLock::new(Rank::Staging, staged)));
         self.persist(&[ino, parent]);
         self.journal.touch_content(ino);
         let handle = self.add_handle(ino, true);
@@ -558,11 +776,14 @@ impl Engine {
     fn remove(&self, parent: Ino, name: &[u8], dir: bool) -> Result<()> {
         let name = crate::vfs::validate_name(name)?;
         self.ensure_dir_writable(parent)?;
-        let (ino, droppable) = {
+        let (ino, droppable, relist) = {
             let mut tree = self.tree.write();
             let ino = tree.remove_entry(parent, name, dir, now())?;
-            (ino, tree.is_droppable(ino))
+            (ino, tree.is_droppable(ino), tree.take_relist())
         };
+        if !relist.is_empty() {
+            self.journal.list_later(relist);
+        }
         self.persist(&[ino, parent]);
         self.journal.touch(ino);
         if droppable {
@@ -610,12 +831,15 @@ impl Engine {
             source.is_some_and(|ino| tree.get(ino).is_some_and(|node| node.is_dir()))
         };
         let ignored = self.is_ignored(new_parent, new_name, is_dir);
-        let (renamed, adopted_rev) = {
+        let (renamed, adopted_rev, relist) = {
             let mut tree = self.tree.write();
             let renamed = tree.rename(parent, name, new_parent, new_name, mode, now())?;
             let adopted_rev = self.adopt_on_replace(&mut tree, &renamed, ignored);
-            (renamed, adopted_rev)
+            (renamed, adopted_rev, tree.take_relist())
         };
+        if !relist.is_empty() {
+            self.journal.list_later(relist);
+        }
         let mut reclassified = self.reclassify(renamed.ino);
         if let Some(rev) = adopted_rev
             && let Some(staged) = self.staged_entry(renamed.ino)
@@ -930,7 +1154,7 @@ impl Engine {
         handle: u64,
         offset: u64,
         size: u32,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<ReadData>> {
         let file = self.file(handle)?;
         match self.read_source(file.ino)? {
             ReadSource::Remote {
@@ -939,26 +1163,16 @@ impl Engine {
                 size: file_size,
             } => {
                 let Some((rev, len)) = read_range(rev, file_size, offset, size) else {
-                    return Ok(Some(Vec::new()));
+                    return Ok(Some(ReadData::empty()));
                 };
                 let Some(layout) = self.cache.layout_local(&link, &rev, file_size) else {
                     return Ok(None);
                 };
-                let spans = layout.spans(offset, len);
-                let mut blocks = Vec::with_capacity(spans.len());
-                for span in spans {
-                    let key = BlockKey {
-                        link: link.clone(),
-                        rev: rev.clone(),
-                        index: span.index,
-                    };
-                    match self.cache.get_local(&key) {
-                        Some(data) => blocks.push(data),
-                        None => return Ok(None),
-                    }
-                }
+                let Some(data) = self.read_blocks_local(&link, &rev, &layout, offset, len) else {
+                    return Ok(None);
+                };
                 self.readahead(handle, &link, &rev, &layout, offset, len);
-                Ok(Some(assemble(spans, &blocks, offset, len)))
+                Ok(Some(data))
             }
             ReadSource::Staged(staged) => {
                 let staged = staged.lock();
@@ -981,13 +1195,13 @@ impl Engine {
                         }
                     }
                 }
-                Ok(Some(out))
+                Ok(Some(ReadData::Owned(out)))
             }
         }
     }
 
     /// Reads a range, downloading missing blocks.
-    pub async fn read(self: &Arc<Self>, handle: u64, offset: u64, size: u32) -> Result<Vec<u8>> {
+    pub async fn read(self: &Arc<Self>, handle: u64, offset: u64, size: u32) -> Result<ReadData> {
         let _foreground = self.gate.foreground();
         let file = self.file(handle)?;
         match self.read_source(file.ino)? {
@@ -997,7 +1211,7 @@ impl Engine {
                 size: file_size,
             } => {
                 let Some((rev, len)) = read_range(rev, file_size, offset, size) else {
-                    return Ok(Vec::new());
+                    return Ok(ReadData::empty());
                 };
                 let layout = self.cache.layout(&link, &rev, file_size).await?;
                 let data = self
@@ -1007,45 +1221,62 @@ impl Engine {
                 Ok(data)
             }
             ReadSource::Staged(staged) => {
-                // Fetch base pieces without holding the lock, then assemble.
-                let (pieces, base) = {
-                    let staged = staged.lock();
-                    (
-                        staged.plan_read(offset, u64::from(size)),
-                        staged.base().cloned(),
-                    )
-                };
-                let mut fetched = HashMap::new();
-                for piece in &pieces {
-                    if let (Piece::Base { offset, len }, Some(base)) = (piece, &base) {
-                        let data = self
-                            .read_revision(base, *offset, *len, Priority::Interactive)
-                            .await?;
-                        fetched.insert(*offset, data);
+                // Fetch base pieces without holding the lock, then assemble. A
+                // write or truncate meanwhile can split or move the base
+                // pieces: plan again and fetch only what is still missing.
+                let mut fetched: Vec<(u64, ReadData)> = Vec::new();
+                let mut fetched_from: Option<Base> = None;
+                for _ in 0..STAGED_READ_ATTEMPTS {
+                    let (pieces, base) = {
+                        let staged = staged.lock();
+                        (
+                            staged.plan_read(offset, u64::from(size)),
+                            staged.base().cloned(),
+                        )
+                    };
+                    if base != fetched_from {
+                        fetched.clear();
+                        fetched_from.clone_from(&base);
                     }
-                }
-                let staged = staged.lock();
-                let mut out = Vec::new();
-                for piece in staged.plan_read(offset, u64::from(size)) {
-                    match piece {
-                        Piece::Staging { offset, len } => {
-                            let start = out.len();
-                            out.resize(start + len as usize, 0);
-                            staged.read_at(offset, &mut out[start..])?;
+                    for piece in &pieces {
+                        if let (Piece::Base { offset, len }, Some(base)) = (piece, &base)
+                            && covering(&fetched, *offset, *len).is_none()
+                        {
+                            let data = self
+                                .read_revision(base, *offset, *len, Priority::Interactive)
+                                .await?;
+                            fetched.push((*offset, data));
                         }
-                        Piece::Base { offset, len } => match fetched.get(&offset) {
-                            Some(data) if data.len() as u64 >= len => {
-                                out.extend_from_slice(&data[..len as usize]);
+                    }
+                    let staged = staged.lock();
+                    if staged.base() != fetched_from.as_ref() {
+                        continue;
+                    }
+                    let mut out = Vec::new();
+                    let mut complete = true;
+                    for piece in staged.plan_read(offset, u64::from(size)) {
+                        match piece {
+                            Piece::Staging { offset, len } => {
+                                let start = out.len();
+                                out.resize(start + len as usize, 0);
+                                staged.read_at(offset, &mut out[start..])?;
                             }
-                            _ => {
-                                return Err(CoreError::Internal(
-                                    "staged read changed while fetching".into(),
-                                ));
-                            }
-                        },
+                            Piece::Base { offset, len } => match covering(&fetched, offset, len) {
+                                Some(data) => out.extend_from_slice(data),
+                                None => {
+                                    complete = false;
+                                    break;
+                                }
+                            },
+                        }
+                    }
+                    if complete {
+                        return Ok(ReadData::Owned(out));
                     }
                 }
-                Ok(out)
+                Err(CoreError::Internal(
+                    "staged read kept changing while fetching".into(),
+                ))
             }
         }
     }
@@ -1059,13 +1290,14 @@ impl Engine {
                 .await
                 .map_err(|e| CoreError::Internal(e.to_string()))??;
         }
-        self.persist(&[ino]);
-        self.store.flush().await?;
+        // Taken before the commit, so the cleared error is on disk too.
         let error = self
             .tree
             .write()
             .get_mut(ino)
             .and_then(|node| node.deferred_error.take());
+        self.persist(&[ino]);
+        self.store.flush().await?;
         match error {
             Some(errno) => Err(CoreError::Errno(errno)),
             None => Ok(()),
@@ -1095,14 +1327,36 @@ impl Engine {
             }
             node.listed
         };
-        if listed { Ok(()) } else { self.list(dir).await }
+        // Any listing will do, also one that started before this call.
+        if listed {
+            Ok(())
+        } else {
+            self.list_shared(dir).await?.1
+        }
     }
 
-    /// Fetches the children of `dir` and applies them (shared per directory).
+    /// Fetches the children of `dir` and applies them, with a listing that
+    /// started after this call (D054): one already in flight may predate the
+    /// change the caller wants to see, so after joining it this lists again.
     pub async fn list(self: &Arc<Self>, dir: Ino) -> Result<()> {
+        let asked = self.listing_epoch.load(Ordering::SeqCst);
+        let (started, result) = self.list_shared(dir).await?;
+        if started > asked {
+            return result;
+        }
+        // The flight above has ended, so this one starts after the call.
+        self.list_shared(dir).await?.1
+    }
+
+    /// Joins the listing of `dir` in flight, or starts one; answers with the
+    /// number the listing took when it started.
+    async fn list_shared(self: &Arc<Self>, dir: Ino) -> Result<(u64, Result<()>)> {
         let this = Arc::clone(self);
         self.listings
-            .run(dir, move || async move { this.list_now(dir).await })
+            .run(dir, move || async move {
+                let started = this.listing_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok((started, this.list_now(dir).await))
+            })
             .await
     }
 
@@ -1135,24 +1389,40 @@ impl Engine {
                 .apply_listing_at(dir, &children, &mut inos, fetched_at);
             match applied {
                 Ok(changes) => {
-                    self.apply_changes(changes);
+                    let vanished = self.apply_changes(changes);
+                    if !vanished.is_empty()
+                        && let Err(error) = self.resolve_vanished(vanished).await
+                    {
+                        tracing::warn!(dir, %error, "resolving nodes removed remotely failed");
+                    }
                     return Ok(());
                 }
-                Err(ApplyError::NeedInos(_)) => continue,
+                Err(ApplyError::NeedInos(missing)) => {
+                    // `unknown_count` should have covered it; never spin.
+                    inos.extend(self.allocate_inos(missing as u64).await?);
+                    continue;
+                }
                 Err(ApplyError::NotADirectory) => return Err(CoreError::NotFound),
             }
         }
     }
 
-    /// Persists and announces the effects of a tree change.
-    pub(crate) fn apply_changes(&self, changes: Changes) {
+    /// Persists and announces the effects of a tree change. Returns the
+    /// nodes whose remote counterpart vanished while they have local
+    /// changes; [`Engine::resolve_vanished`] decides what happens to them.
+    pub(crate) fn apply_changes(&self, changes: Changes) -> Vec<Ino> {
         let Changes {
             changed,
             removed,
             invalidations,
+            vanished,
+            clashes,
+            notes,
+            remote_newer,
         } = changes;
         let mut rows = changed;
         rows.extend(&removed);
+        rows.extend(&remote_newer);
         if rows.contains(&ROOT_INO) {
             // The root was listed: `/.pdignore` may have changed.
             self.refresh_ignore();
@@ -1172,13 +1442,253 @@ impl Engine {
         for invalidation in invalidations {
             let _ = self.invalidations.send(invalidation);
         }
+        for note in notes {
+            self.record_conflict(note);
+        }
+        // The journal settles a clash when it next looks at the node
+        // (identical content never yields, D016).
+        for ino in clashes {
+            self.journal.touch(ino);
+        }
+        for ino in remote_newer {
+            self.journal.touch(ino);
+            let path = self.tree.read().path(ino);
+            tracing::info!(
+                ino,
+                path = path.as_deref().unwrap_or(""),
+                "a newer remote revision exists than the one this file is based on"
+            );
+            // Id 0: the conflict is not registered yet; the upload does that.
+            let _ = self.notices.send(ConflictNotice {
+                id: 0,
+                kind: ConflictKind::EditEdit,
+                path,
+            });
+        }
+        vanished
+    }
+
+    /// Settles nodes that were removed or moved remotely while they have
+    /// local changes (§10.5): a removed subtree is kept as its minimal chain
+    /// of pending items and uploaded again; a node that only moved follows
+    /// the move at the next listing of its new folder.
+    ///
+    /// Never awaits a listing (the caller may hold one): listings of other
+    /// folders are spawned.
+    pub(crate) fn resolve_vanished(
+        self: &Arc<Self>,
+        inos: Vec<Ino>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> {
+        // Boxed: a listing resolves, and resolving spawns listings.
+        let this = Arc::clone(self);
+        Box::pin(async move { this.resolve_vanished_now(inos).await })
+    }
+
+    async fn resolve_vanished_now(self: &Arc<Self>, inos: Vec<Ino>) -> Result<()> {
+        let mut seen = HashSet::new();
+        let (root, starts) = {
+            let tree = self.tree.read();
+            let starts: Vec<(Ino, LinkId)> = inos
+                .into_iter()
+                .filter(|ino| seen.insert(*ino))
+                .filter_map(|ino| {
+                    let node = tree.get(ino).filter(|node| node.attached)?;
+                    Some((ino, node.link()?.clone()))
+                })
+                .collect();
+            (tree.link_of(ROOT_INO).cloned(), starts)
+        };
+        if starts.is_empty() {
+            return Ok(());
+        }
+
+        // Fresh state of every link on the way from each node up to the
+        // root (trashed nodes keep their parent; a child of a trashed folder
+        // is not reported trashed itself).
+        let mut fetched: HashMap<LinkId, Option<RemoteNode>> = HashMap::new();
+        let mut chains: Vec<Vec<LinkId>> =
+            starts.iter().map(|(_, link)| vec![link.clone()]).collect();
+        loop {
+            let missing: Vec<LinkId> = {
+                let mut unique = HashSet::new();
+                chains
+                    .iter()
+                    .flatten()
+                    .filter(|link| !fetched.contains_key(*link) && unique.insert((*link).clone()))
+                    .cloned()
+                    .collect()
+            };
+            if missing.is_empty() {
+                break;
+            }
+            // No gate turn of its own: this runs inside a listing, which in
+            // the background already holds a turn (events, revalidation), and
+            // in the foreground blocks a waiting user; a nested turn would
+            // wait for itself.
+            for batch in missing.chunks(crate::events::NODE_BATCH) {
+                check_not_hot(&self.metrics, "get_nodes");
+                let nodes = self.backend.get_nodes(batch).await?;
+                fetched.extend(batch.iter().cloned().zip(nodes));
+            }
+            for chain in &mut chains {
+                let last = chain.last().expect("chains are not empty");
+                let Some(Some(node)) = fetched.get(last) else {
+                    continue;
+                };
+                let Some(parent) = &node.parent_link_id else {
+                    continue;
+                };
+                if Some(parent) != root.as_ref() && !chain.contains(parent) {
+                    chain.push(parent.clone());
+                }
+            }
+        }
+        let gone = |link: &LinkId| {
+            fetched.get(link).is_none_or(|node| node.is_none())
+                || fetched
+                    .get(link)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|node| node.trashed)
+        };
+
+        let mut targets = Vec::new();
+        let mut relist = Vec::new();
+        let mut displaced = Vec::new();
+        {
+            let tree = self.tree.read();
+            for ((ino, link), chain) in starts.iter().zip(&chains) {
+                // The highest removed element decides how much goes.
+                if let Some(highest) = chain.iter().rev().find(|link| gone(link)) {
+                    let top = tree
+                        .by_link(highest)
+                        .filter(|&top| tree.is_within(*ino, top));
+                    targets.push(top.unwrap_or(*ino));
+                    continue;
+                }
+                // Nothing is gone: the node moved remotely.
+                let Some(Some(fresh)) = fetched.get(link) else {
+                    continue;
+                };
+                let known_parent = tree
+                    .get(*ino)
+                    .and_then(|node| node.remote.as_ref())
+                    .and_then(|remote| remote.parent_link.clone());
+                if fresh.parent_link_id == known_parent {
+                    // The listing and the node disagree about one folder;
+                    // the next listing settles it.
+                    tracing::debug!(ino, "a node missing from its listing exists remotely");
+                    continue;
+                }
+                match fresh.parent_link_id.as_ref().and_then(|p| tree.by_link(p)) {
+                    Some(dir) => relist.push(dir),
+                    None => displaced.push((*ino, fresh.clone())),
+                }
+            }
+        }
+
+        for dir in relist {
+            let this = Arc::clone(self);
+            self.runtime.spawn(async move {
+                if let Err(error) = this.list(dir).await {
+                    tracing::warn!(dir, %error, "listing a folder that received a moved node failed");
+                }
+            });
+        }
+        for (ino, fresh) in displaced {
+            let stamp = self.stamp();
+            let mut tree = self.tree.write();
+            if tree.get(ino).and_then(|node| node.link()) != Some(&fresh.link_id) {
+                continue;
+            }
+            let orig_name = tree
+                .get(ino)
+                .map(|node| node.name.clone())
+                .unwrap_or_default();
+            tree.set_remote_at(ino, Some(RemoteState::from_remote(&fresh)), stamp);
+            drop(tree);
+            self.persist(&[ino]);
+            self.journal.touch(ino);
+            self.record_conflict(ConflictNote {
+                link: Some(fresh.link_id.clone()),
+                remote_rev: fresh.active_revision.clone(),
+                detail: Some(
+                    "moved remotely to a folder not shown here; local placement kept".to_owned(),
+                ),
+                ..ConflictNote::new(ConflictKind::RenameRename, ino, orig_name)
+            });
+        }
+
+        // Ancestors first; a target inside another one is covered by it.
+        targets.sort_unstable();
+        targets.dedup();
+        let covered: HashSet<Ino> = {
+            let tree = self.tree.read();
+            targets
+                .iter()
+                .copied()
+                .filter(|&target| {
+                    targets
+                        .iter()
+                        .any(|&other| other != target && tree.is_within(target, other))
+                })
+                .collect()
+        };
+        for target in targets
+            .into_iter()
+            .filter(|target| !covered.contains(target))
+        {
+            let (resurrected, renamed) = {
+                let mut tree = self.tree.write();
+                // Settled meanwhile (another listing, an event).
+                if !tree
+                    .get(target)
+                    .is_some_and(|node| node.attached && node.remote.is_some())
+                {
+                    continue;
+                }
+                let renamed = tree.renamed_in(target);
+                (tree.resurrect_minimal(target), renamed)
+            };
+            let crate::vfs::Resurrected {
+                changes,
+                kept,
+                removed_renamed,
+            } = resurrected;
+            let removed = changes.removed.len();
+            self.apply_changes(changes);
+            if !kept.is_empty() {
+                // Not inside the call: a guard in its arguments lives until
+                // it returns, and `record_conflict` reads the tree too.
+                let name = self
+                    .tree
+                    .read()
+                    .get(target)
+                    .map(|node| node.name.clone())
+                    .unwrap_or_default();
+                self.record_conflict(ConflictNote {
+                    detail: Some(format!("kept {}, removed {removed}", kept.len())),
+                    ..ConflictNote::new(ConflictKind::RemoteDeleteLocalEdit, target, name)
+                });
+            }
+            for ino in removed_renamed {
+                let Some((_, name, link)) = renamed.iter().find(|(renamed, ..)| *renamed == ino)
+                else {
+                    continue;
+                };
+                self.record_conflict(ConflictNote {
+                    link: link.clone(),
+                    detail: Some(
+                        "renamed here; deleted on another device, the delete won".to_owned(),
+                    ),
+                    ..ConflictNote::new(ConflictKind::RemoteDeleteLocalRename, ino, name.clone())
+                });
+            }
+        }
+        Ok(())
     }
 
     fn journal_relevant(&self, ino: Ino) -> bool {
-        let tree = self.tree.read();
-        tree.get(ino)
-            .is_some_and(|node| node.deleted || node.content_pending() || node.meta_pending())
-            || tree.placement_pending(ino)
+        self.tree.read().has_pending_work(ino)
     }
 
     /// Re-lists every listed directory, root first, as background work
@@ -1258,13 +1768,13 @@ impl Engine {
 
     // ---- internals: staging ----
 
-    pub(crate) fn staged_entry(&self, ino: Ino) -> Option<Arc<parking_lot::Mutex<Staged>>> {
+    pub(crate) fn staged_entry(&self, ino: Ino) -> Option<Arc<StagingLock>> {
         self.staged.lock().get(&ino).cloned()
     }
 
     /// The staging of a file, created from its remote content if needed
     /// (local disk only).
-    pub(crate) fn ensure_staged(&self, ino: Ino) -> Result<Arc<parking_lot::Mutex<Staged>>> {
+    pub(crate) fn ensure_staged(&self, ino: Ino) -> Result<Arc<StagingLock>> {
         self.stage(ino, false)
     }
 
@@ -1297,7 +1807,7 @@ impl Engine {
         )))
     }
 
-    fn stage(&self, ino: Ino, empty: bool) -> Result<Arc<parking_lot::Mutex<Staged>>> {
+    fn stage(&self, ino: Ino, empty: bool) -> Result<Arc<StagingLock>> {
         let mut map = self.staged.lock();
         if let Some(staged) = map.get(&ino) {
             return Ok(Arc::clone(staged));
@@ -1326,7 +1836,8 @@ impl Engine {
                 _ => (remote_rev, None, if empty { 0 } else { node.size }),
             }
         };
-        let staged = Arc::new(parking_lot::Mutex::new(
+        let staged = Arc::new(StagingLock::new(
+            Rank::Staging,
             self.staging.create(ino, base_rev, base, size)?,
         ));
         map.insert(ino, Arc::clone(&staged));
@@ -1364,21 +1875,39 @@ impl Engine {
     }
 
     /// Bytes `[offset, offset + len)` of a base revision, from the cache.
-    fn read_revision_local(&self, base: &Base, offset: u64, len: u64) -> Option<Vec<u8>> {
+    fn read_revision_local(&self, base: &Base, offset: u64, len: u64) -> Option<ReadData> {
         let layout = self
             .cache
             .layout_local(&base.link, &base.rev, base.rev_size)?;
-        let spans = layout.spans(offset, len);
-        let mut blocks = Vec::with_capacity(spans.len());
-        for span in spans {
-            let key = BlockKey {
-                link: base.link.clone(),
-                rev: base.rev.clone(),
-                index: span.index,
-            };
-            blocks.push(self.cache.get_local(&key)?);
+        self.read_blocks_local(&base.link, &base.rev, &layout, offset, len)
+    }
+
+    /// Bytes `[offset, offset + len)` of a revision from RAM or disk: a
+    /// slice of the block it lies in, or assembled in a scratch slot
+    /// (§6.2). `None` if a block is missing.
+    fn read_blocks_local(
+        &self,
+        link: &LinkId,
+        rev: &RevisionId,
+        layout: &Layout,
+        offset: u64,
+        len: u64,
+    ) -> Option<ReadData> {
+        let key = |index| BlockKey::new(link, rev, index);
+        match layout.spans(offset, len) {
+            [] => Some(ReadData::empty()),
+            [span] => {
+                let data = self.cache.get_local(&key(span.index))?;
+                Some(ReadData::of_block(span, data, offset, len))
+            }
+            spans => {
+                let mut out = self.cache.read_buf_now(offset, len);
+                for span in spans {
+                    out.append(span, &self.cache.get_local(&key(span.index))?);
+                }
+                Some(out.finish())
+            }
         }
-        Some(assemble(spans, &blocks, offset, len))
     }
 
     /// Bytes `[offset, offset + len)` of a base revision, downloading
@@ -1389,7 +1918,7 @@ impl Engine {
         offset: u64,
         len: u64,
         priority: Priority,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<ReadData> {
         let layout = self
             .cache
             .layout(&base.link, &base.rev, base.rev_size)
@@ -1398,6 +1927,8 @@ impl Engine {
             .await
     }
 
+    /// [`Engine::read_blocks_local`], downloading missing blocks. A read
+    /// across blocks takes its scratch slot once the first block is here.
     async fn read_layout(
         &self,
         link: &LinkId,
@@ -1406,19 +1937,35 @@ impl Engine {
         offset: u64,
         len: u64,
         priority: Priority,
-    ) -> Result<Vec<u8>> {
-        let spans = layout.spans(offset, len);
-        let fetches = spans.iter().map(|span| {
-            let key = BlockKey {
-                link: link.clone(),
-                rev: rev.clone(),
-                index: span.index,
+    ) -> Result<ReadData> {
+        let key = |index| BlockKey::new(link, rev, index);
+        let spans = match layout.spans(offset, len) {
+            [] => return Ok(ReadData::empty()),
+            [span] => {
+                let data = self.cache.get(&key(span.index), span.len, priority).await?;
+                return Ok(ReadData::of_block(span, data, offset, len));
+            }
+            spans => spans,
+        };
+        // Futures that own their inputs, so the stream is `Send`.
+        let fetches: Vec<_> = spans
+            .iter()
+            .map(|span| {
+                let (cache, key, block_len) = (Arc::clone(&self.cache), key(span.index), span.len);
+                async move { cache.get(&key, block_len, priority).await }
+            })
+            .collect();
+        let mut blocks = futures::stream::iter(fetches).buffered(READ_BLOCKS_HELD);
+        let mut out = None;
+        for span in spans {
+            let data = blocks.next().await.expect("one block per span")?;
+            let out = match &mut out {
+                Some(out) => out,
+                None => out.insert(self.cache.read_buf(offset, len).await),
             };
-            let cache = Arc::clone(&self.cache);
-            async move { cache.get(&key, span.len, priority).await }
-        });
-        let blocks: Vec<Bytes> = futures::future::try_join_all(fetches).await?;
-        Ok(assemble(spans, &blocks, offset, len))
+            out.append(span, &data);
+        }
+        Ok(out.map_or_else(ReadData::empty, |out| out.finish()))
     }
 
     fn read_source(&self, ino: Ino) -> Result<ReadSource> {
@@ -1438,7 +1985,7 @@ impl Engine {
 
     /// Removes a detached node nobody references any more, with its
     /// staging.
-    fn drop_detached(&self, ino: Ino) {
+    pub(crate) fn drop_detached(&self, ino: Ino) {
         let dropped = {
             let mut tree = self.tree.write();
             if tree.is_droppable(ino) && !self.journal.in_flight(ino) {
@@ -1489,9 +2036,6 @@ impl Engine {
 
     // ---- access rules (§11) ----
 
-    /// EACCES unless the owner bits of the stored mode grant `want`. Only
-    /// the mounting user reaches the mount (no `allow_other`), so these are
-    /// the bits that apply; the kernel does not check them itself (D031).
     /// Whether `handle` is open for writing on `ino`.
     fn writable_handle(&self, ino: Ino, handle: Option<u64>) -> bool {
         handle.is_some_and(|handle| {
@@ -1502,6 +2046,9 @@ impl Engine {
         })
     }
 
+    /// EACCES unless the owner bits of the stored mode grant `want`. Only
+    /// the mounting user reaches the mount (no `allow_other`), so these are
+    /// the bits that apply; the kernel does not check them itself (D031).
     fn ensure_allowed(&self, ino: Ino, want: u32) -> Result<()> {
         if want == 0 {
             return Ok(());
@@ -1694,12 +2241,7 @@ impl Engine {
     /// Drops the kernel's attributes for a subtree (mode bits changed).
     fn invalidate_subtree(&self, ino: Ino) {
         let tree = self.tree.read();
-        let mut stack = vec![ino];
-        while let Some(current) = stack.pop() {
-            let Some(node) = tree.get(current) else {
-                continue;
-            };
-            stack.extend(node.children.values().copied());
+        for current in tree.subtree(ino) {
             let _ = self
                 .invalidations
                 .send(Invalidation::Inode { ino: current });
@@ -1855,11 +2397,7 @@ impl Engine {
         let pending: Vec<Ino> = {
             let tree = self.tree.read();
             tree.inos()
-                .filter(|&ino| {
-                    tree.get(ino).is_some_and(|node| {
-                        node.deleted || node.content_pending() || node.meta_pending()
-                    }) || tree.placement_pending(ino)
-                })
+                .filter(|&ino| tree.has_pending_work(ino))
                 .collect()
         };
         for ino in pending {
@@ -1915,7 +2453,7 @@ impl Engine {
         }
     }
 
-    async fn allocate_inos(&self, count: u64) -> Result<Vec<Ino>> {
+    pub(crate) async fn allocate_inos(&self, count: u64) -> Result<Vec<Ino>> {
         self.reserve_inos(count).await?;
         let mut inos = self.inos.lock();
         if inos.next + count - 1 > inos.reserved {
@@ -1966,11 +2504,7 @@ impl Engine {
                 break;
             };
             index = next.index;
-            let key = BlockKey {
-                link: link.clone(),
-                rev: rev.clone(),
-                index: next.index,
-            };
+            let key = BlockKey::new(link, rev, next.index);
             if self.cache.contains(&key) {
                 continue;
             }
@@ -2038,11 +2572,7 @@ impl Engine {
     async fn prefetch_file(&self, link: &LinkId, rev: &RevisionId, size: u64) -> Result<()> {
         let layout = self.cache.layout(link, rev, size).await?;
         for span in &layout.blocks {
-            let key = BlockKey {
-                link: link.clone(),
-                rev: rev.clone(),
-                index: span.index,
-            };
+            let key = BlockKey::new(link, rev, span.index);
             self.cache.get(&key, span.len, Priority::Prefetch).await?;
         }
         Ok(())
@@ -2094,6 +2624,15 @@ pub fn pending_changes(state_db: &std::path::Path, staging_dir: &std::path::Path
     Ok(pending)
 }
 
+/// `[offset, offset + len)` from a fetched base piece that covers it.
+fn covering(fetched: &[(u64, ReadData)], offset: u64, len: u64) -> Option<&[u8]> {
+    fetched.iter().find_map(|(start, data)| {
+        let from = offset.checked_sub(*start)?;
+        let to = from.checked_add(len)?;
+        (to <= data.len() as u64).then(|| &data[from as usize..to as usize])
+    })
+}
+
 /// The revision and clamped length of a read, or `None` at or past EOF.
 fn read_range(
     rev: Option<RevisionId>,
@@ -2118,19 +2657,22 @@ async fn initialize(store: &Store, backend: &dyn Backend, metrics: &Metrics) -> 
     let row = tree.row(ROOT_INO).expect("root");
     store
         .write_durable(move |conn| {
-            conn.execute(
-                "INSERT OR REPLACE INTO event_cursor(volume, event_id, updated_at) VALUES (?1, ?2, strftime('%s','now'))",
-                (MY_FILES_VOLUME, &cursor.0),
-            )?;
+            crate::events::write_cursor(conn, &cursor)?;
             write_rows(conn, &[(ROOT_INO, Some(row.clone()))])?;
             meta_set(conn, "ino_reserved", &ROOT_INO.to_string())?;
-            meta_set(conn, "root_link", &row.remote.as_ref().expect("root is remote").link.0)
+            meta_set(
+                conn,
+                "root_link",
+                &row.remote.as_ref().expect("root is remote").link.0,
+            )
         })
         .await?;
     Ok(())
 }
 
-type StagedMap = HashMap<Ino, Arc<parking_lot::Mutex<Staged>>>;
+type StagedMap = HashMap<Ino, Arc<StagingLock>>;
+/// The lock of one inode's staging.
+pub(crate) type StagingLock = lock_order::Mutex<Staged>;
 
 /// Loads the stored tree, the inode reservation and the staged inodes.
 fn load(store: &Store, staging: &StagingDir) -> Result<(Tree, Ino, StagedMap)> {
@@ -2155,12 +2697,9 @@ fn load(store: &Store, staging: &StagingDir) -> Result<(Tree, Ino, StagedMap)> {
     let (mut tree, stale) = Tree::from_rows(rows);
     if !stale.is_empty() {
         tracing::info!(count = stale.len(), "dropping unreachable stored nodes");
-        store.write(move |conn| {
-            for ino in &stale {
-                conn.execute("DELETE FROM inodes WHERE ino = ?1", [sql_ino(*ino)])?;
-            }
-            Ok(())
-        });
+        // `write_rows` also drops the `remote` rows nobody refers to then.
+        let rows: Vec<(Ino, Option<NodeRow>)> = stale.iter().map(|&ino| (ino, None)).collect();
+        store.write(move |conn| write_rows(conn, &rows));
     }
     // Staging files are the content of changed files. Staging without a
     // node is left over from a node that is gone, and staging of a node
@@ -2188,7 +2727,7 @@ fn load(store: &Store, staging: &StagingDir) -> Result<(Tree, Ino, StagedMap)> {
                         node.gens.content += 1;
                     }
                 }
-                staged.insert(ino, Arc::new(parking_lot::Mutex::new(file)));
+                staged.insert(ino, Arc::new(StagingLock::new(Rank::Staging, file)));
             }
             Err(error) => {
                 tracing::error!(ino, %error, "cannot reopen a staging file; its local changes are lost");
@@ -2210,12 +2749,13 @@ fn load(store: &Store, staging: &StagingDir) -> Result<(Tree, Ino, StagedMap)> {
         if let Some(node) = tree.get_mut(ino) {
             node.size = 0;
         }
-        staged.insert(ino, Arc::new(parking_lot::Mutex::new(file)));
+        staged.insert(ino, Arc::new(StagingLock::new(Rank::Staging, file)));
     }
     Ok((tree, reserved, staged))
 }
 
 #[cfg(test)]
 mod proptests;
+mod surface;
 #[cfg(test)]
 mod tests;

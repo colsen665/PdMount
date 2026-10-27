@@ -29,10 +29,8 @@ verify_cycle
 bare=$TEST_ROOT/g6/r.git
 git -C "$bare" fsck --full --strict
 git clone -q "file://$bare" "$work/clone-url"
-for clone in clone-url; do
-    [[ "$(git -C "$work/$clone" rev-parse HEAD)" == "$(git -C "$work/local" rev-parse HEAD)" ]] ||
-        fail "$clone has the wrong HEAD"
-done
+[[ "$(git -C "$work/clone-url" rev-parse HEAD)" == "$(git -C "$work/local" rev-parse HEAD)" ]] ||
+    fail "clone-url has the wrong HEAD"
 [[ "$(git -C "$work/clone-path" rev-parse origin/main)" == "$(git -C "$work/local" rev-parse HEAD)" ]] ||
     fail "fetch did not see the second push"
 check_hot_path

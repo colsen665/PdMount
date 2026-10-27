@@ -18,6 +18,7 @@ use pdmount_backend::NodeKind;
 use pdmount_core::config::FsyncMode;
 use pdmount_core::engine::{Engine, OpenMode, SetAttr};
 use pdmount_core::errors::{CoreError, Result};
+use pdmount_core::health::Connectivity;
 use pdmount_core::metrics::{self, Metrics};
 use pdmount_core::vfs::{Attr, Invalidation, Lookup, RenameMode};
 use std::ffi::OsStr;
@@ -32,9 +33,20 @@ use tokio::sync::{Semaphore, mpsc};
 /// Concurrent slow-path requests (§4.2); matches `max_background`.
 const SLOW_PATH_LIMIT: usize = 64;
 const FUSER_THREADS: usize = 4;
+// Each fuser thread can hold one scratch slot for a reply across blocks.
+const _: () = assert!(FUSER_THREADS <= pdmount_core::pool::SCRATCH_SLOTS);
 const BLKSIZE: u32 = 128 * 1024;
 /// Slow-path attempts before giving up (listing, then inode numbers, ...).
 const SLOW_ATTEMPTS: usize = 4;
+
+/// The deadline of a slow-path request given the connectivity at its start.
+fn deadline_for(state: Connectivity, normal: Duration, offline_read: Duration) -> Duration {
+    if state == Connectivity::Online {
+        normal
+    } else {
+        normal.min(offline_read)
+    }
+}
 
 pub struct PdFs {
     engine: Arc<Engine>,
@@ -62,6 +74,25 @@ impl PdFs {
             uid,
             gid,
         }
+    }
+
+    /// Deadline of a metadata request: short while the drive cannot be
+    /// reached, so uncached listings fail with EIO instead of hanging (§9.6).
+    fn metadata_deadline(&self) -> Duration {
+        self.deadline(self.metadata_deadline)
+    }
+
+    /// Deadline of a request that may fetch blocks.
+    fn block_deadline(&self) -> Duration {
+        self.deadline(self.block_deadline)
+    }
+
+    fn deadline(&self, normal: Duration) -> Duration {
+        deadline_for(
+            self.engine.health().state(),
+            normal,
+            self.engine.config().timeouts.offline_read.0,
+        )
     }
 
     /// Runs a callback body as a hot-path handler, catching panics.
@@ -132,7 +163,7 @@ impl PdFs {
                 let engine = Arc::clone(&self.engine);
                 self.slow(
                     op,
-                    self.metadata_deadline,
+                    self.metadata_deadline(),
                     async move {
                         let mut error = error;
                         for _ in 0..SLOW_ATTEMPTS {
@@ -153,18 +184,6 @@ impl PdFs {
 
     fn file_attr(&self, attr: &Attr) -> FileAttr {
         file_attr(attr, self.uid, self.gid)
-    }
-
-    fn reply_lookup(&self, lookup: Lookup, reply: ReplyEntry) {
-        reply_lookup(
-            lookup,
-            reply,
-            self.uid,
-            self.gid,
-            self.attr_ttl,
-            self.entry_ttl,
-            self.negative_ttl,
-        );
     }
 
     /// Sends a successful reply only once the store has committed the rows
@@ -192,6 +211,42 @@ impl PdFs {
             Err(error) => reply.error(errno(&error)),
         }
     }
+
+    fn lookup_reply(&self) -> impl FnOnce(Result<Lookup>, ReplyEntry) + Send + 'static {
+        let entry = self.entry_reply();
+        let (uid, gid, negative_ttl) = (self.uid, self.gid, self.negative_ttl);
+        move |result, reply| match result {
+            Ok(Lookup::Found(attr)) => entry(Ok(attr), reply),
+            // A zero node id with a TTL is a cached negative entry (§5.4).
+            Ok(Lookup::Negative) => {
+                let negative = Attr {
+                    ino: 0,
+                    kind: NodeKind::File,
+                    size: 0,
+                    mtime: std::time::UNIX_EPOCH,
+                    ctime: std::time::UNIX_EPOCH,
+                    atime: std::time::UNIX_EPOCH,
+                    perm: 0,
+                    nlink: 0,
+                };
+                reply.entry_with_ttls(
+                    &Duration::ZERO,
+                    &negative_ttl,
+                    &file_attr(&negative, uid, gid),
+                    Generation(0),
+                );
+            }
+            Err(error) => reply.error(errno(&error)),
+        }
+    }
+}
+
+/// Answers an empty reply with a result.
+fn reply_empty(reply: ReplyEmpty) -> impl FnOnce(Result<()>) + Send + 'static {
+    move |result| match result {
+        Ok(()) => reply.ok(),
+        Err(error) => reply.error(errno(&error)),
+    }
 }
 
 fn is_resolvable(error: &CoreError) -> bool {
@@ -203,6 +258,18 @@ async fn resolve(engine: &Arc<Engine>, error: &CoreError) -> Result<()> {
         CoreError::NeedsListing(dir) => engine.ensure_listed(*dir).await,
         CoreError::NeedsInos => engine.reserve_inos(16).await,
         other => Err(other.clone()),
+    }
+}
+
+/// The size protocol of `getxattr` and `listxattr`: a zero `size` asks for
+/// the length, a smaller buffer is ERANGE.
+fn xattr_reply(reply: ReplyXattr, data: &[u8], size: u32) {
+    if size == 0 {
+        reply.size(data.len() as u32);
+    } else if (size as usize) < data.len() {
+        reply.error(Errno::ERANGE);
+    } else {
+        reply.data(data);
     }
 }
 
@@ -234,45 +301,6 @@ fn file_type(kind: NodeKind) -> FileType {
     match kind {
         NodeKind::File => FileType::RegularFile,
         NodeKind::Folder => FileType::Directory,
-    }
-}
-
-fn reply_lookup(
-    lookup: Lookup,
-    reply: ReplyEntry,
-    uid: u32,
-    gid: u32,
-    attr_ttl: Duration,
-    entry_ttl: Duration,
-    negative_ttl: Duration,
-) {
-    match lookup {
-        Lookup::Found(attr) => reply.entry_with_ttls(
-            &attr_ttl,
-            &entry_ttl,
-            &file_attr(&attr, uid, gid),
-            Generation(0),
-        ),
-        // A zero node id with a TTL is a cached negative entry (§5.4).
-        Lookup::Negative => {
-            let negative = Attr {
-                ino: 0,
-                kind: NodeKind::File,
-                size: 0,
-                mtime: std::time::UNIX_EPOCH,
-                ctime: std::time::UNIX_EPOCH,
-                atime: std::time::UNIX_EPOCH,
-                perm: 0,
-                nlink: 0,
-            };
-            reply.entry_with_ttls(
-                &Duration::ZERO,
-                &negative_ttl,
-                &file_attr(&negative, uid, gid),
-                Generation(0),
-            );
-        }
-        Lookup::NeedsListing => reply.error(Errno::EIO),
     }
 }
 
@@ -335,30 +363,14 @@ impl Filesystem for PdFs {
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         self.handle("lookup", || {
-            match self.engine.lookup(parent.0, name.as_bytes()) {
-                Ok(Lookup::NeedsListing) => {
-                    let engine = Arc::clone(&self.engine);
-                    let name = name.to_owned();
-                    let (uid, gid) = (self.uid, self.gid);
-                    let ttls = (self.attr_ttl, self.entry_ttl, self.negative_ttl);
-                    self.slow(
-                        "lookup",
-                        self.metadata_deadline,
-                        async move {
-                            engine.ensure_listed(parent.0).await?;
-                            engine.lookup(parent.0, name.as_bytes())
-                        },
-                        move |result| match result {
-                            Ok(lookup) => {
-                                reply_lookup(lookup, reply, uid, gid, ttls.0, ttls.1, ttls.2)
-                            }
-                            Err(error) => reply.error(errno(&error)),
-                        },
-                    );
-                }
-                Ok(lookup) => self.reply_lookup(lookup, reply),
-                Err(error) => reply.error(errno(&error)),
-            }
+            let engine = Arc::clone(&self.engine);
+            let name = name.to_owned();
+            let respond = self.lookup_reply();
+            self.retrying(
+                "lookup",
+                move || engine.lookup(parent.0, name.as_bytes()),
+                move |result| respond(result, reply),
+            );
         });
     }
 
@@ -413,7 +425,7 @@ impl Filesystem for PdFs {
                     let engine = Arc::clone(&self.engine);
                     self.slow(
                         "setattr",
-                        self.block_deadline,
+                        self.block_deadline(),
                         async move { engine.setattr_slow(ino.0, change).await },
                         respond,
                     );
@@ -465,10 +477,7 @@ impl Filesystem for PdFs {
             self.retrying(
                 "unlink",
                 move || engine.unlink(parent.0, name.as_bytes()),
-                self.committed(move |result| match result {
-                    Ok(()) => reply.ok(),
-                    Err(error) => reply.error(errno(&error)),
-                }),
+                self.committed(reply_empty(reply)),
             );
         });
     }
@@ -480,10 +489,7 @@ impl Filesystem for PdFs {
             self.retrying(
                 "rmdir",
                 move || engine.rmdir(parent.0, name.as_bytes()),
-                self.committed(move |result| match result {
-                    Ok(()) => reply.ok(),
-                    Err(error) => reply.error(errno(&error)),
-                }),
+                self.committed(reply_empty(reply)),
             );
         });
     }
@@ -533,10 +539,7 @@ impl Filesystem for PdFs {
                         mode,
                     )
                 },
-                self.committed(move |result| match result {
-                    Ok(()) => reply.ok(),
-                    Err(error) => reply.error(errno(&error)),
-                }),
+                self.committed(reply_empty(reply)),
             );
         });
     }
@@ -625,7 +628,7 @@ impl Filesystem for PdFs {
                     let engine = Arc::clone(&self.engine);
                     self.slow(
                         "read",
-                        self.block_deadline,
+                        self.block_deadline(),
                         async move { engine.read(fh.0, offset, size).await },
                         move |result| match result {
                             Ok(data) => reply.data(&data),
@@ -661,7 +664,7 @@ impl Filesystem for PdFs {
                     let data = data.to_vec();
                     self.slow(
                         "write",
-                        self.block_deadline,
+                        self.block_deadline(),
                         async move { engine.write(fh.0, offset, data).await },
                         respond,
                     );
@@ -713,7 +716,7 @@ impl Filesystem for PdFs {
             let engine = Arc::clone(&self.engine);
             let remote = engine.config().fsync.mode == FsyncMode::Remote;
             let deadline = if remote {
-                self.block_deadline
+                self.block_deadline()
             } else {
                 self.metadata_deadline
             };
@@ -727,35 +730,22 @@ impl Filesystem for PdFs {
                     }
                     Ok(())
                 },
-                move |result| match result {
-                    Ok(()) => reply.ok(),
-                    Err(error) => reply.error(errno(&error)),
-                },
+                reply_empty(reply),
             );
         });
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        self.handle("opendir", || match self.engine.opendir(ino.0) {
-            Ok(Some(handle)) => reply.opened(FileHandle(handle), FopenFlags::FOPEN_CACHE_DIR),
-            Ok(None) => {
-                let engine = Arc::clone(&self.engine);
-                self.slow(
-                    "opendir",
-                    self.metadata_deadline,
-                    async move {
-                        engine.ensure_listed(ino.0).await?;
-                        engine
-                            .opendir(ino.0)?
-                            .ok_or(CoreError::Internal("listing vanished".into()))
-                    },
-                    move |result| match result {
-                        Ok(handle) => reply.opened(FileHandle(handle), FopenFlags::FOPEN_CACHE_DIR),
-                        Err(error) => reply.error(errno(&error)),
-                    },
-                );
-            }
-            Err(error) => reply.error(errno(&error)),
+        self.handle("opendir", || {
+            let engine = Arc::clone(&self.engine);
+            self.retrying(
+                "opendir",
+                move || engine.opendir(ino.0),
+                move |result| match result {
+                    Ok(handle) => reply.opened(FileHandle(handle), FopenFlags::FOPEN_CACHE_DIR),
+                    Err(error) => reply.error(errno(&error)),
+                },
+            );
         });
     }
 
@@ -855,12 +845,9 @@ impl Filesystem for PdFs {
             let engine = Arc::clone(&self.engine);
             self.slow(
                 "fsyncdir",
-                self.metadata_deadline,
+                self.metadata_deadline(),
                 async move { engine.fsyncdir().await },
-                move |result| match result {
-                    Ok(()) => reply.ok(),
-                    Err(error) => reply.error(errno(&error)),
-                },
+                reply_empty(reply),
             );
         });
     }
@@ -874,34 +861,36 @@ impl Filesystem for PdFs {
         });
     }
 
-    fn getxattr(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _name: &OsStr,
-        _size: u32,
-        reply: ReplyXattr,
-    ) {
-        self.handle("getxattr", || reply.error(Errno::NO_XATTR));
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        self.handle("getxattr", || {
+            let value = name
+                .to_str()
+                .map_or(Ok(None), |name| self.engine.xattr(ino.0, name));
+            match value {
+                Ok(Some(value)) => xattr_reply(reply, value.as_bytes(), size),
+                Ok(None) => reply.error(Errno::NO_XATTR),
+                Err(error) => reply.error(errno(&error)),
+            }
+        });
     }
 
-    fn listxattr(&self, _req: &Request, _ino: INodeNo, size: u32, reply: ReplyXattr) {
-        self.handle("listxattr", || {
-            if size == 0 {
-                reply.size(0);
-            } else {
-                reply.data(&[]);
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        self.handle("listxattr", || match self.engine.xattr_names(ino.0) {
+            Ok(names) => {
+                let list: Vec<u8> = names
+                    .iter()
+                    .flat_map(|name| name.bytes().chain(std::iter::once(0)))
+                    .collect();
+                xattr_reply(reply, &list, size);
             }
+            Err(error) => reply.error(errno(&error)),
         });
     }
 
     fn access(&self, _req: &Request, ino: INodeNo, mask: fuser::AccessFlags, reply: ReplyEmpty) {
         // Without `default_permissions` the daemon checks modes (D031).
         self.handle("access", || {
-            match self.engine.access(ino.0, mask.bits() as u32) {
-                Ok(()) => reply.ok(),
-                Err(error) => reply.error(errno(&error)),
-            }
+            reply_empty(reply)(self.engine.access(ino.0, mask.bits() as u32))
         });
     }
 
@@ -950,11 +939,6 @@ impl Mounted {
 
     pub fn unmount(self) -> std::io::Result<()> {
         self.session.umount_and_join()
-    }
-
-    /// Waits until the session ends without unmounting.
-    pub fn join(self) -> std::io::Result<()> {
-        self.session.join()
     }
 }
 
@@ -1012,5 +996,28 @@ fn notify_loop(notifier: Notifier, mut invalidations: mpsc::UnboundedReceiver<In
             Err(error) if error.raw_os_error() == Some(nix::libc::ENOENT) => {}
             Err(error) => tracing::debug!(?invalidation, %error, "invalidation failed"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn requests_fail_fast_unless_the_drive_is_online() {
+        let normal = Duration::from_secs(20);
+        let offline_read = Duration::from_secs(2);
+        assert_eq!(
+            deadline_for(Connectivity::Online, normal, offline_read),
+            normal
+        );
+        for state in [Connectivity::Offline, Connectivity::NeedsLogin] {
+            assert_eq!(deadline_for(state, normal, offline_read), offline_read);
+        }
+        // A configured deadline shorter than offline_read is kept.
+        assert_eq!(
+            deadline_for(Connectivity::Offline, Duration::from_secs(1), offline_read),
+            Duration::from_secs(1)
+        );
     }
 }

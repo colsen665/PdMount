@@ -10,11 +10,17 @@
 #            wrote), unmount --force, mount, wait until the queue is empty
 #   fresh    wait until the queue is empty, unmount, `reset --keep-login`,
 #            mount: everything is read from the backend again
+#   second   a second profile (device B) is mounted too, before the scenario's
+#            changes. wait until A's queue is empty, then until a marker file
+#            written on A shows on B (within the visibility SLO, D037), then
+#            wait for B's queue and switch PROFILE, MNT, TEST_ROOT and REMOTE to
+#            B: the checks after verify_cycle read what B received through its
+#            event stream
 #
 # Environment:
 #   BACKEND      proton (default): the real account; fake: a persisted fake drive
 #                (needs a build with `--features fake-backend`)
-#   VERIFY_MODE  live, remount, crash or fresh (see above)
+#   VERIFY_MODE  live, remount, crash, fresh or second (see above)
 #   PDMOUNT      pdmount binary (default: target/release/pdmount, else target/debug/pdmount;
 #                with BACKEND=fake: target/debug/pdmount)
 #   PROFILE      profile (default: default; with BACKEND=fake: fake-scenarios)
@@ -22,10 +28,13 @@
 #                (D029; only keyring tests use the keyring)
 #   SCENARIO_ROOT  work directories and, with BACKEND=fake, everything else below (default:
 #                /dev/shm/pdmount-tests if /dev/shm is writable, else ~/.cache/pdmount-scenarios).
-#                With BACKEND=fake, XDG_{CONFIG,DATA,CACHE,STATE}_HOME point into it as well, so the
-#                test profile's store, staging, cache and log stay in tmpfs
+#                With BACKEND=fake, XDG_{CONFIG,DATA,CACHE,STATE}_HOME and XDG_RUNTIME_DIR point into it
+#                as well, so the test profile's store, staging, cache, log and socket stay in tmpfs
 #   CACHE_MAX    with BACKEND=fake: the test profile's `[cache] max_bytes` (default: 1GiB)
 #   MNT          mountpoint (default: ~/ProtonDrive; with BACKEND=fake: $SCENARIO_ROOT/fake-mnt)
+#   PROFILE2, MNT2  device B, for the `second` mode and the M scenarios (real account: profile
+#                `second`, ~/ProtonDrive-second; fake: fake-scenarios-2, $SCENARIO_ROOT/fake-mnt-2).
+#                The fake profiles are named dev-a and dev-b (`[device] name`)
 #   FAKE_DIR     the fake drive (default: $SCENARIO_ROOT/fake-drive); seeded with the dataset on
 #                first use. PDMOUNT_FAKE_KEEP_REVISIONS defaults to 4 here
 #   DATASET      local copy of the M1 dataset, regenerated if missing (default:
@@ -49,6 +58,8 @@ case $BACKEND in
     proton)
         PROFILE=${PROFILE:-default}
         MNT=${MNT:-$HOME/ProtonDrive}
+        PROFILE2=${PROFILE2:-second}
+        MNT2=${MNT2:-$HOME/ProtonDrive-second}
         # The local copy of the uploaded dataset (2.3 GiB) stays on disk; it is only read.
         DATASET=${DATASET:-$HOME/.cache/pdmount-scenarios/m1}
         dataset_flags=()
@@ -62,14 +73,24 @@ case $BACKEND in
         dataset_flags=(--no-big)
         backend_flag=(--backend "fake:$FAKE_DIR")
         PDMOUNT=${PDMOUNT:-$repo/target/debug/pdmount}
-        # The test profile's state, staging, cache and log go to SCENARIO_ROOT too.
+        # The test profile's state, staging, cache, log and socket go to SCENARIO_ROOT too. A
+        # runtime directory, as desktop sessions have: the sandbox user has none.
         export XDG_CONFIG_HOME=$SCENARIO_ROOT/xdg/config XDG_DATA_HOME=$SCENARIO_ROOT/xdg/data \
-            XDG_CACHE_HOME=$SCENARIO_ROOT/xdg/cache XDG_STATE_HOME=$SCENARIO_ROOT/xdg/state
-        config=$XDG_CONFIG_HOME/pdmount/$PROFILE.toml
-        if [[ ! -f "$config" ]]; then
-            mkdir -p "${config%/*}"
-            printf '[cache]\nmax_bytes = "%s"\nram_bytes = "128MiB"\n' "${CACHE_MAX:-1GiB}" >"$config"
-        fi
+            XDG_CACHE_HOME=$SCENARIO_ROOT/xdg/cache XDG_STATE_HOME=$SCENARIO_ROOT/xdg/state \
+            XDG_RUNTIME_DIR=$SCENARIO_ROOT/xdg/run
+        PROFILE2=${PROFILE2:-fake-scenarios-2}
+        MNT2=${MNT2:-$SCENARIO_ROOT/fake-mnt-2}
+        # One config per profile; an older one gets the device name added.
+        fake_config() { # <profile> <device name>
+            local config=$XDG_CONFIG_HOME/pdmount/$1.toml
+            if [[ ! -f "$config" ]]; then
+                mkdir -p "${config%/*}"
+                printf '[cache]\nmax_bytes = "%s"\nram_bytes = "32MiB"\n' "${CACHE_MAX:-1GiB}" >"$config"
+            fi
+            grep -q '^\[device\]' "$config" || printf '\n[device]\nname = "%s"\n' "$2" >>"$config"
+        }
+        fake_config "$PROFILE" dev-a
+        fake_config "$PROFILE2" dev-b
         # The fake keeps a few revisions per file (it lives in the daemon).
         export PDMOUNT_FAKE_KEEP_REVISIONS=${PDMOUNT_FAKE_KEEP_REVISIONS:-4}
         ;;
@@ -93,11 +114,32 @@ pd() { "$PDMOUNT" --profile "$PROFILE" "${secrets_flag[@]}" "$@"; }
 step() { printf '\n==> %s\n' "$*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+pd2() { "$PDMOUNT" --profile "$PROFILE2" "${secrets_flag[@]}" "$@"; }
+
 # `status` exits 1 without an active session (always so for the fake).
 status_text() { pd status 2>/dev/null || true; }
 is_mounted() { status_text | grep -q '^Mount: *mounted'; }
 mount_now() { pd mount "${backend_flag[@]}" "$MNT"; }
+is_mounted_second() { pd2 status 2>/dev/null | grep -q '^Mount: *mounted'; }
+mount_second() { pd2 mount "${backend_flag[@]}" "$MNT2"; }
+
+# The SDK client UID of a device (the fake's `--client`): `pdmount-<id>` from
+# the `Device:` line of its status. Argument: 1 (default) or 2.
+device_uid() { # [1|2]
+    local text
+    if [[ ${1:-1} == 2 ]]; then text=$(pd2 status 2>/dev/null || true); else text=$(status_text); fi
+    sed -n 's/^Device: .*(\([0-9a-f-]*\))$/pdmount-\1/p' <<<"$text"
+}
 daemon_pid() { status_text | sed -n 's/.*daemon pid \([0-9]*\).*/\1/p'; }
+
+# kill -9 the daemon and wait until the process is gone.
+kill_daemon() {
+    local pid
+    pid=$(daemon_pid)
+    [[ -n "$pid" ]] || fail "no daemon pid in pdmount status"
+    kill -9 "$pid"
+    while kill -0 "$pid" 2>/dev/null; do sleep 0.1; done
+}
 
 ensure_dataset() {
     if [[ ! -f "$LOCAL/MANIFEST.sha256" ]]; then
@@ -117,22 +159,69 @@ ensure_fake_drive() {
     if [[ ! -f "$FAKE_DIR/.seeded-m1" ]]; then
         step "seeding the fake drive $FAKE_DIR from $DATASET"
         if is_mounted; then pd unmount "$MNT"; fi
+        if is_mounted_second; then pd2 unmount "$MNT2"; fi
         ensure_dataset
         rm -rf "$FAKE_DIR"
         "$PDMOUNT" fake seed --from "$DATASET" "$FAKE_DIR"
         touch "$FAKE_DIR/.seeded-m1"
         pd reset --keep-login >/dev/null
+        pd2 reset --keep-login >/dev/null
     fi
 }
 
 # Mounts if needed. Scenarios that read the M1 dataset call require_m1 after it.
 prepare_mount() {
     case "$VERIFY_MODE" in
-        live | remount | crash | fresh) ;;
-        *) fail "unknown VERIFY_MODE=$VERIFY_MODE (live, remount, crash, fresh)" ;;
+        live | remount | crash | fresh | second) ;;
+        *) fail "unknown VERIFY_MODE=$VERIFY_MODE (live, remount, crash, fresh, second)" ;;
     esac
     ensure_fake_drive
     is_mounted || mount_now
+    # B is mounted before the scenario's changes, so they reach it as events.
+    if [[ $VERIFY_MODE == second ]]; then
+        is_mounted_second || mount_second
+        # B must have applied the events of the scenarios before, or the
+        # visibility check below would time their backlog (the fake's trash
+        # purges, for one, come in pages of 50).
+        wait_queue_empty
+        mkdir -p "$ROOT_A"
+        ls "$ROOT_B" >/dev/null 2>&1 || true
+        send_marker "$ROOT_A" "$ROOT_B" barrier "${BARRIER_TIMEOUT:-900}"
+        # And A must have applied what B did meanwhile: checks on B can write
+        # (`git status` refreshes the index), and A deleting such a file would
+        # revive it (M4, `local_delete_remote_edit`).
+        wait_queue_empty2
+        send_marker "$ROOT_B" "$ROOT_A" barrier "${BARRIER_TIMEOUT:-900}"
+        wait_queue_empty
+        # Changes from here on are what B has to receive (see second_marker).
+        second_mark=$(fake_change_mark)
+    fi
+}
+
+# Waits until the daemon's event stream has caught up with everything that
+# happened before (BACKEND=fake): a file made by another client in the test
+# root shows on the mount, and events arrive in order. Without it a scenario
+# that times remote changes starts behind the events of the scenarios before.
+event_barrier() {
+    local name=.barrier-$RANDOM$RANDOM
+    rm -f "$TEST_ROOT"/.barrier-* 2>/dev/null || true
+    printf barrier >"$work/$name"
+    "$PDMOUNT" fake create --path "/pdmount-test/$name" --from "$work/$name" "$FAKE_DIR"
+    local start=$SECONDS
+    until [[ -e "$TEST_ROOT/$name" ]]; do
+        ((SECONDS - start < ${BARRIER_TIMEOUT:-600})) || fail "the event stream did not catch up"
+        sleep 1
+    done
+    echo "events caught up after $((SECONDS - start)) s"
+}
+
+# Both devices, for the M scenarios (live mode only).
+prepare_two() {
+    # Two live mounts are the whole point; the other modes would only restart them.
+    [[ $VERIFY_MODE == live ]] || { echo "$(basename "$0" .sh): two devices, live mode only; skipped in $VERIFY_MODE mode"; exit 0; }
+    ensure_fake_drive
+    is_mounted || mount_now
+    is_mounted_second || mount_second
 }
 
 require_m1() {
@@ -141,15 +230,18 @@ require_m1() {
 
 # Waits until no upload or namespace change is pending (`pdmount status`
 # reports `Queue: 0 pending`). Daemons without a queue line pass at once.
-wait_queue_empty() {
+wait_queue_of() { # <status function>
     local deadline=$((SECONDS + ${QUEUE_TIMEOUT:-600})) line
     while :; do
-        line=$(status_text | grep '^Queue:' || true)
+        line=$("$1" | grep '^Queue:' || true)
         [[ -z "$line" || "$line" =~ ^Queue:\ +0\ pending ]] && return 0
         ((SECONDS < deadline)) || fail "the queue did not drain within ${QUEUE_TIMEOUT:-600} s: $line"
         sleep 1
     done
 }
+status_text2() { pd2 status 2>/dev/null || true; }
+wait_queue_empty() { wait_queue_of status_text; }
+wait_queue_empty2() { wait_queue_of status_text2; }
 
 verify_cycle() {
     case "$VERIFY_MODE" in
@@ -161,11 +253,7 @@ verify_cycle() {
             ;;
         crash)
             step "crash: kill -9 the daemon, unmount --force, mount, drain"
-            local pid
-            pid=$(daemon_pid)
-            [[ -n "$pid" ]] || fail "no daemon pid in pdmount status"
-            kill -9 "$pid"
-            while kill -0 "$pid" 2>/dev/null; do sleep 0.1; done
+            kill_daemon
             pd unmount --force "$MNT"
             mount_now
             wait_queue_empty
@@ -177,7 +265,67 @@ verify_cycle() {
             pd reset --keep-login
             mount_now
             ;;
+        second)
+            step "second: wait for device B, then check on B"
+            wait_queue_empty
+            second_marker
+            ;;
     esac
+}
+
+# A marker written in <from> shows in <to> within poll_interval + 10 s of its
+# commit (D037): the clock starts when the writer's queue is empty, since the
+# upload debounce is not part of the bound. The event stream delivers what came
+# before it, so a device that sees the marker has applied the changes made
+# earlier.
+send_marker() { # <from test root> <to test root> <tag> [limit in seconds]
+    local name start limit=${4:-${SECOND_SLO:-40}}
+    name=.marker-$3-$RANDOM$RANDOM
+    rm -f "$1"/.marker-* 2>/dev/null || true
+    mkdir -p "$1"
+    printf marker >"$1/$name"
+    if [[ $1 == "$MNT2"/* ]]; then wait_queue_empty2; else wait_queue_empty; fi
+    start=$SECONDS
+    until [[ -e "$2/$name" ]]; do
+        ((SECONDS - start < limit)) ||
+            fail "the marker $3 is not visible after $limit s (visibility SLO, D037)"
+        sleep 1
+    done
+    echo "marker $3 visible after $((SECONDS - start)) s"
+}
+
+# The limit is the SLO of one event page (poll_interval + 10 s = 40 s). B
+# applies a page of 50 events in about 12 s (listings and lookups are paced,
+# D027), so each further page of the scenario's changes (fake only; the real
+# account counts none) adds 15 s.
+second_marker() {
+    local events pages=1
+    wait_queue_empty
+    # A's access rules are local state; lift them so the next run can clean up.
+    release_access_rules
+    if [[ $BACKEND == fake ]]; then
+        events=$(fake_changes "${second_mark:-0}" | wc -l)
+        pages=$(((events + 49) / 50))
+        ((pages >= 1)) || pages=1
+    fi
+    send_marker "$TEST_ROOT" "$MNT2/pdmount-test" "$(basename "$0" .sh)" \
+        $((${SECOND_SLO:-40} + 15 * (pages - 1)))
+    PROFILE=$PROFILE2
+    MNT=$MNT2
+    TEST_ROOT=$MNT2/pdmount-test
+    REMOTE=$MNT2/pdmount-m1
+    wait_queue_empty
+}
+
+# Removes the access rules the scenarios set, those under pdmount-test/
+# (`pdmount access list`: MODE PATH SET-AS SOURCE STATUS). Rules elsewhere
+# belong to the user (D028).
+release_access_rules() {
+    local path
+    while read -r path; do
+        [[ -n "$path" ]] && { pd access unset "$MNT$path" >/dev/null 2>&1 || true; }
+    done < <(pd access list 2>/dev/null |
+        awk '($1 == "ro" || $1 == "rw") && ($2 == "/pdmount-test" || index($2, "/pdmount-test/") == 1) { print $2 }')
 }
 
 check_hot_path() {
@@ -191,7 +339,15 @@ check_hot_path() {
 # the trap must be set in the script's own shell.
 make_workdir() {
     work=$(mktemp -d "$SCENARIO_ROOT/work.XXXXXX")
-    trap 'rm -rf "$work"' EXIT
+    trap scenario_cleanup EXIT
+}
+
+# At exit (make_workdir): lifts a fault the scenario injected, so a failed
+# scenario does not leave a device offline for the ones after it, and
+# removes the work directory.
+scenario_cleanup() {
+    if [[ -n ${fault_active:-} ]]; then fake_fault clear >/dev/null 2>&1 || true; fi
+    rm -rf "${work:-}"
 }
 
 # ---- M2 write scenarios ----
@@ -240,7 +396,7 @@ PY
 
 # Directory mtimes are local-only (D013): fresh mounts show creation times.
 dir_time_flags() {
-    if [[ $VERIFY_MODE == fresh ]]; then echo --omit-dir-times; fi
+    if [[ $VERIFY_MODE == fresh || $VERIFY_MODE == second ]]; then echo --omit-dir-times; fi
 }
 
 # Fails unless rsync finds nothing to do, by mtime and size and by checksum.
@@ -290,4 +446,132 @@ git_env() {
         GIT_CONFIG_KEY_1=maintenance.auto GIT_CONFIG_VALUE_1=false
     export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
     export GIT_AUTHOR_DATE='2026-10-20T00:00:00Z' GIT_COMMITTER_DATE='2026-10-20T00:00:00Z'
+}
+
+# ---- M scenarios: two devices (live mode, DESIGN.md §15.3) ----
+
+# Device A is $MNT, device B is $MNT2.
+ROOT_A=$MNT/pdmount-test
+ROOT_B=$MNT2/pdmount-test
+
+# Waits until both queues are empty and a marker has gone each way, so that
+# every change made so far has reached both devices.
+sync_devices() {
+    wait_queue_empty
+    wait_queue_empty2
+    send_marker "$ROOT_A" "$ROOT_B" a2b
+    wait_queue_empty2
+    send_marker "$ROOT_B" "$ROOT_A" b2a
+    wait_queue_empty
+}
+
+wait_visible() { # <path> [seconds]
+    local limit=${2:-90} start=$SECONDS
+    until [[ -e "$1" ]]; do
+        ((SECONDS - start < limit)) || fail "$1 is not visible after $limit s"
+        sleep 1
+    done
+}
+
+# Waits until a file reads as the given content.
+wait_content() { # <path> <content> [seconds]
+    local limit=${3:-90} start=$SECONDS
+    until [[ "$(cat "$1" 2>/dev/null)" == "$2" ]]; do
+        ((SECONDS - start < limit)) || fail "$1 does not read '$2' after $limit s (reads '$(cat "$1" 2>&1)')"
+        sleep 1
+    done
+}
+
+expect_eq() { # <what> <got> <want>
+    [[ "$2" == "$3" ]] || fail "$1: got '$2', expected '$3'"
+}
+
+# Opens <file> for writing (created or truncated), writes <content> and keeps
+# it open until release_hold <name>. The write stays local while it is open.
+declare -A hold_pid
+hold_open() { # <name> <file> <content>
+    local ready=$work/$1.ready
+    python3 -I - "$2" "$3" "$ready" "$work/$1.release" <<'PY' &
+import os, sys, time
+path, content, ready, release = sys.argv[1:5]
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+os.write(fd, content.encode())
+open(ready, "w").close()
+# Ends when released, or when the scenario is gone (its work directory too).
+deadline = time.time() + 900
+while not os.path.exists(release) and os.path.exists(ready) and time.time() < deadline:
+    time.sleep(0.1)
+os.close(fd)
+PY
+    hold_pid[$1]=$!
+    local start=$SECONDS
+    until [[ -e "$ready" ]]; do
+        ((SECONDS - start < 20)) || fail "could not open $2 for writing"
+        sleep 0.1
+    done
+}
+
+release_hold() { # <name>
+    touch "$work/$1.release"
+    wait "${hold_pid[$1]}" || fail "holding $1 failed"
+}
+
+# A changed <dir on A> while B holds a file open (hold_open b): waits until B
+# has applied the change, then closes B's file and syncs both devices. The
+# marker goes into the same directory, so the listing on B that shows the
+# marker shows A's change too, and B notices it while its file is open.
+reach_b_while_held() { # <dir on A> <dir on B> <tag>
+    send_marker "$1" "$2" "$3"
+    release_hold b
+    sync_devices
+}
+
+# The kinds of the open conflicts of device 1 (A) or 2 (B) at or below a
+# path, one per line. Conflicts stay open across scenarios, so each scenario
+# looks at its own directory.
+conflict_kinds() { # <1|2> <path>
+    local text
+    if [[ $1 == 2 ]]; then text=$(pd2 conflicts list "$2"); else text=$(pd conflicts list "$2"); fi
+    awk 'NR > 1 && $1 ~ /^[0-9]+$/ { print $3 }' <<<"$text"
+}
+
+expect_conflicts() { # <1|2> <path> <kinds...> (none = no conflicts)
+    local device=$1 path=$2 got want
+    shift 2
+    got=$(conflict_kinds "$device" "$path" | sort | paste -sd' ')
+    want=$(printf '%s\n' "$@" | sort | paste -sd' ')
+    expect_eq "open conflicts of device $device below $path" "$got" "$want"
+}
+
+# Entries of <dir> whose names look like conflict copies.
+conflict_copies() { # <dir>
+    find "$1" -maxdepth 1 -name '*(conflict *' -printf '%f\n' | sort
+}
+
+fake_fault() {
+    "$PDMOUNT" fake fault "$@" "$FAKE_DIR"
+    if [[ $1 == clear ]]; then fault_active=; else fault_active=1; fi
+}
+
+# Sets uid_a to device A's client UID (the fake's `--client`).
+need_uid_a() {
+    uid_a=$(device_uid 1)
+    [[ -n "$uid_a" ]] || fail "no device id for A in pdmount status"
+}
+
+# Device A cannot reach the fake drive until a_back; extra arguments go to
+# `fake fault offline` (e.g. `--for 90`).
+a_offline() {
+    need_uid_a
+    fake_fault offline --client "$uid_a" "$@"
+}
+
+# B's changes are uploaded, A is back online and has drained its queue, and
+# both devices have seen each other's changes.
+a_back() {
+    wait_queue_empty2
+    fake_fault clear
+    echo "A is back; waiting for its queue"
+    wait_queue_empty
+    sync_devices
 }

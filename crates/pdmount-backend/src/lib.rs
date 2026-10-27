@@ -107,6 +107,19 @@ pub struct FileMeta {
     pub sha1: Option<[u8; 20]>,
 }
 
+/// One revision of a file, for tests and diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionMeta {
+    pub id: RevisionId,
+    pub created: SystemTime,
+    pub size: Option<u64>,
+    /// `None` when the uploading client did not claim a SHA-1.
+    pub sha1: Option<[u8; 20]>,
+    /// Client UID that uploaded the revision, when recorded.
+    pub client_uid: Option<String>,
+    pub active: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EventKind {
     Delete,
@@ -169,6 +182,8 @@ pub enum BackendError {
     RevisionConflict { current: Option<RevisionId> },
     #[error("the node changed since it was read")]
     NameConflict,
+    #[error("the move would put a folder inside itself")]
+    InvalidMove,
     #[error("rate limited")]
     RateLimited { retry_after: Option<Duration> },
     #[error("temporary failure: {0}")]
@@ -193,9 +208,51 @@ impl BackendError {
             Self::RateLimited { .. } | Self::Transient(_) | Self::Offline(_)
         )
     }
+
+    /// No connection or no session: the operation is not at fault and
+    /// succeeds once the drive is reachable again.
+    pub fn is_unreachable(&self) -> bool {
+        matches!(self, Self::Offline(_) | Self::Unauthorized)
+    }
+
+    /// Neither waiting nor a new session helps: the same request fails again.
+    pub fn is_permanent(&self) -> bool {
+        !self.is_retryable() && !self.is_unreachable()
+    }
+
+    /// Permanent failures that no retry can fix and that need the user (quota,
+    /// plan limits, permissions): no point in trying again before parking.
+    pub fn needs_the_user(&self) -> bool {
+        matches!(
+            self,
+            Self::QuotaExceeded
+                | Self::FileTooLarge
+                | Self::Unsupported(_)
+                | Self::PermissionDenied
+                | Self::TooManyChildren
+                | Self::NestingTooDeep
+        )
+    }
 }
 
 pub type Result<T> = std::result::Result<T, BackendError>;
+
+/// The largest plaintext block Proton Drive stores (and PdMount uploads).
+pub const MAX_BLOCK_BYTES: usize = 4 << 20;
+
+/// Copies a fetched block into the caller's buffer (`fetch_block_into` of
+/// a backend that gets its blocks as owned bytes).
+pub fn copy_block(data: &[u8], buf: &mut [u8], index: u32, revision: &RevisionId) -> Result<usize> {
+    let capacity = buf.len();
+    let target = buf.get_mut(..data.len()).ok_or_else(|| {
+        BackendError::Integrity(format!(
+            "block {index} of {revision} has {} bytes, more than the {capacity} expected",
+            data.len()
+        ))
+    })?;
+    target.copy_from_slice(data);
+    Ok(data.len())
+}
 
 /// Operations PdMount needs from Proton Drive "My Files".
 #[async_trait::async_trait]
@@ -223,8 +280,27 @@ pub trait Backend: Send + Sync + 'static {
     /// Block layout of a revision.
     async fn blocks(&self, file: &LinkId, revision: &RevisionId) -> Result<Vec<BlockInfo>>;
 
-    /// Verified plaintext of one block (1-based index).
-    async fn fetch_block(&self, file: &LinkId, revision: &RevisionId, index: u32) -> Result<Bytes>;
+    /// Verified plaintext of one block (1-based index) into `buf`, returning
+    /// the block's length. A block longer than `buf` is an
+    /// [`BackendError::Integrity`] error. The block cache reads through
+    /// this, so every backend and wrapper implements it.
+    async fn fetch_block_into(
+        &self,
+        file: &LinkId,
+        revision: &RevisionId,
+        index: u32,
+        buf: &mut [u8],
+    ) -> Result<usize>;
+
+    /// [`Backend::fetch_block_into`] into a new buffer (probes and tests).
+    async fn fetch_block(&self, file: &LinkId, revision: &RevisionId, index: u32) -> Result<Bytes> {
+        let mut buf = vec![0; MAX_BLOCK_BYTES];
+        let len = self
+            .fetch_block_into(file, revision, index, &mut buf)
+            .await?;
+        buf.truncate(len);
+        Ok(Bytes::from(buf))
+    }
 
     /// Creates a file with its first revision.
     async fn upload_new(
@@ -260,6 +336,11 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Moves nodes to the trash; one result per node, in request order.
     async fn trash(&self, nodes: &[LinkId]) -> Result<Vec<Result<()>>>;
+
+    /// Revisions of a file, oldest first.
+    async fn revisions(&self, _file: &LinkId) -> Result<Vec<RevisionMeta>> {
+        Err(BackendError::Unsupported("revision list"))
+    }
 
     async fn latest_event_id(&self) -> Result<EventId>;
 

@@ -8,6 +8,7 @@ use crate::mounts;
 use crate::session::{self, Resumed};
 use pdmount_backend::{Backend, StorageInfo};
 use pdmount_core::device::DeviceIdentity;
+use pdmount_core::health::Connectivity;
 use pdmount_core::units::ByteSize;
 use pdmount_core::{Config, ProfilePaths};
 use std::fmt;
@@ -23,7 +24,11 @@ pub struct StatusReport {
 
 pub enum SessionState {
     NotLoggedIn,
-    NeedsLogin(String),
+    NeedsLogin {
+        reason: String,
+        /// A sign-in link and its code, while the daemon waits for one.
+        sign_in: Option<(String, String)>,
+    },
     Active {
         username: String,
         /// Where the credentials are stored.
@@ -41,15 +46,36 @@ pub enum MountState {
         pid: u64,
         queue_pending: u64,
         queue_parked: u64,
+        /// Conflicts waiting for the user.
+        conflicts: u64,
         inodes: u64,
         cache_bytes: u64,
         cache_blocks: u64,
+        connectivity: Connectivity,
+        /// Unix seconds when `connectivity` began.
+        connectivity_since: u64,
     },
 }
 
 impl SessionState {
     pub fn is_active(&self) -> bool {
         matches!(self, Self::Active { .. })
+    }
+}
+
+/// `HH:MM`, or the date as well when it is not today.
+fn local_time(unix_secs: u64) -> String {
+    use chrono::{Local, TimeZone};
+    let Some(time) = i64::try_from(unix_secs)
+        .ok()
+        .and_then(|secs| Local.timestamp_opt(secs, 0).single())
+    else {
+        return "an unknown time".into();
+    };
+    if time.date_naive() == Local::now().date_naive() {
+        time.format("%H:%M").to_string()
+    } else {
+        time.format("%Y-%m-%d %H:%M").to_string()
     }
 }
 
@@ -68,8 +94,14 @@ impl fmt::Display for StatusReport {
             SessionState::NotLoggedIn => {
                 writeln!(f, "Session:    not logged in (run `pdmount login`)")?;
             }
-            SessionState::NeedsLogin(reason) => {
-                writeln!(f, "Session:    expired, run `pdmount login` ({reason})")?;
+            SessionState::NeedsLogin { reason, sign_in } => {
+                writeln!(f, "Session:    needs login, run `pdmount login` ({reason})")?;
+                if let Some((url, code)) = sign_in {
+                    writeln!(f, "Sign-in:    {url}")?;
+                    if !code.is_empty() {
+                        writeln!(f, "Code:       {code}")?;
+                    }
+                }
             }
             SessionState::Active {
                 username,
@@ -102,15 +134,34 @@ impl fmt::Display for StatusReport {
                 pid,
                 queue_pending,
                 queue_parked,
+                conflicts,
                 inodes,
                 cache_bytes,
                 cache_blocks,
+                connectivity,
+                connectivity_since,
             } => {
                 writeln!(f, "Mount:      mounted (daemon pid {pid})")?;
+                match connectivity {
+                    Connectivity::Online => writeln!(f, "Connection: online")?,
+                    Connectivity::Offline => writeln!(
+                        f,
+                        "Connection: offline since {} ({queue_pending} pending)",
+                        local_time(*connectivity_since)
+                    )?,
+                    Connectivity::NeedsLogin => writeln!(
+                        f,
+                        "Connection: needs login since {} ({queue_pending} pending)",
+                        local_time(*connectivity_since)
+                    )?,
+                }
                 writeln!(
                     f,
                     "Queue:      {queue_pending} pending, {queue_parked} parked"
                 )?;
+                if *conflicts > 0 {
+                    writeln!(f, "Conflicts:  {conflicts} open (pdmount conflicts list)")?;
+                }
                 writeln!(f, "Inodes:     {inodes}")?;
                 write!(
                     f,
@@ -129,42 +180,69 @@ pub async fn status(
 ) -> anyhow::Result<StatusReport> {
     let device = session::device_identity(paths, config)?;
     let mountpoint = crate::daemon::existing_mountpoint(paths, config, home, None);
-    let daemon = control::call(
+    let daemon = control::call_ok::<control::StatusReply>(
         &paths.control_socket(),
         Request::Status,
         Duration::from_secs(5),
     )
     .await?;
     if let Some(reply) = daemon {
-        let number = |key: &str| reply[key].as_u64().unwrap_or(0);
-        let quota = match (reply["quota_used"].as_u64(), reply["quota_max"].as_u64()) {
+        let quota = match (reply.quota_used, reply.quota_max) {
             (Some(used), Some(max)) => Some(StorageInfo { used, max }),
             _ => None,
         };
+        let connectivity = reply.connectivity;
+        let session = if connectivity == Connectivity::NeedsLogin {
+            SessionState::NeedsLogin {
+                reason: reply
+                    .sign_in_error
+                    .unwrap_or_else(|| "the server rejected the session".to_owned()),
+                sign_in: reply
+                    .sign_in_url
+                    .map(|url| (url, reply.sign_in_code.unwrap_or_default())),
+            }
+        } else {
+            SessionState::Active {
+                username: reply.username,
+                storage: reply.credentials,
+                quota,
+            }
+        };
         return Ok(StatusReport {
             profile: paths.profile.to_string(),
-            session: SessionState::Active {
-                username: reply["username"].as_str().unwrap_or("?").to_owned(),
-                storage: reply["credentials"].as_str().unwrap_or("?").to_owned(),
-                quota,
-            },
+            session,
             device,
-            mountpoint: reply["mountpoint"]
-                .as_str()
-                .map_or(mountpoint, std::path::PathBuf::from),
+            mountpoint: reply.mountpoint,
             mount: MountState::Mounted {
-                pid: number("pid"),
-                queue_pending: number("queue_pending"),
-                queue_parked: number("queue_parked"),
-                inodes: number("inodes"),
-                cache_bytes: number("cache_bytes"),
-                cache_blocks: number("cache_blocks"),
+                pid: reply.pid.into(),
+                queue_pending: reply.queue_pending,
+                queue_parked: reply.queue_parked,
+                conflicts: reply.conflicts,
+                inodes: reply.inodes,
+                cache_bytes: reply.cache_bytes,
+                cache_blocks: reply.cache_blocks,
+                connectivity,
+                connectivity_since: reply.connectivity_since,
             },
         });
     }
+    // A daemon that no longer answers may still save its tokens: a resume
+    // here could rotate them.
+    if let Some(pid) = crate::daemon::daemon_pid(paths) {
+        anyhow::bail!(
+            "the daemon of profile {} (pid {pid}) is shutting down; run `pdmount status` again in a moment",
+            paths.profile
+        );
+    }
     let session = match session::resume(paths).await? {
         Resumed::NotLoggedIn => SessionState::NotLoggedIn,
-        Resumed::NeedsLogin(error) => SessionState::NeedsLogin(format!("{error:#}")),
+        Resumed::Offline { error, .. } => {
+            return Err(error.context("cannot reach Proton to check the session"));
+        }
+        Resumed::NeedsLogin { error, .. } => SessionState::NeedsLogin {
+            reason: format!("{error:#}"),
+            sign_in: None,
+        },
         Resumed::Active(logged_in) => {
             let backend = session::proton_backend(&logged_in, &device).await?;
             SessionState::Active {
@@ -241,20 +319,79 @@ mod tests {
                 pid: 42,
                 queue_pending: 2,
                 queue_parked: 0,
+                conflicts: 0,
                 inodes: 7,
                 cache_bytes: 1 << 20,
                 cache_blocks: 3,
+                connectivity: Connectivity::Online,
+                connectivity_since: 0,
             },
         );
         assert!(mounted.contains("mounted (daemon pid 42)"));
         assert!(mounted.contains("Queue:      2 pending, 0 parked"));
+        assert!(!mounted.contains("Conflicts:"));
+        let conflicted = report_with(
+            active(),
+            MountState::Mounted {
+                pid: 42,
+                queue_pending: 0,
+                queue_parked: 0,
+                conflicts: 3,
+                inodes: 7,
+                cache_bytes: 0,
+                cache_blocks: 0,
+                connectivity: Connectivity::Online,
+                connectivity_since: 0,
+            },
+        );
+        assert!(conflicted.contains("Conflicts:  3 open (pdmount conflicts list)"));
         assert!(mounted.contains("Cache:      1.0 MiB in 3 blocks"));
+    }
+
+    #[test]
+    fn connection_line_follows_the_daemon() {
+        let mounted = |connectivity| {
+            report_with(
+                SessionState::Active {
+                    username: "u".into(),
+                    storage: "file".into(),
+                    quota: None,
+                },
+                MountState::Mounted {
+                    pid: 1,
+                    queue_pending: 4,
+                    queue_parked: 0,
+                    conflicts: 0,
+                    inodes: 1,
+                    cache_bytes: 0,
+                    cache_blocks: 0,
+                    connectivity,
+                    connectivity_since: 1_700_000_000,
+                },
+            )
+        };
+        assert!(mounted(Connectivity::Online).contains("Connection: online\n"));
+        let offline = mounted(Connectivity::Offline);
+        assert!(offline.contains("Connection: offline since "));
+        assert!(offline.contains("(4 pending)"));
+        assert!(mounted(Connectivity::NeedsLogin).contains("Connection: needs login since "));
     }
 
     #[test]
     fn logged_out_report_tells_how_to_log_in() {
         assert!(report(SessionState::NotLoggedIn).contains("run `pdmount login`"));
-        assert!(report(SessionState::NeedsLogin("expired".into())).contains("expired"));
+        let waiting = report(SessionState::NeedsLogin {
+            reason: "expired".into(),
+            sign_in: Some(("https://account.proton.me/x".into(), "ABCD".into())),
+        });
+        assert!(waiting.contains("Session:    needs login"));
+        assert!(waiting.contains("expired"));
+        assert!(waiting.contains("Sign-in:    https://account.proton.me/x\nCode:       ABCD\n"));
+        let idle = report(SessionState::NeedsLogin {
+            reason: "expired".into(),
+            sign_in: None,
+        });
+        assert!(!idle.contains("Sign-in:"));
     }
 
     #[test]

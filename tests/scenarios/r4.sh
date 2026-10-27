@@ -11,7 +11,8 @@ rsync -a "$work/src/" "$area/dst/"
 wait_queue_empty
 # 1 MiB in the middle, not block aligned.
 head -c $((1 << 20)) /dev/urandom |
-    dd of="$work/src/big.bin" bs=1 seek=$((20 * 1024 * 1024 + 12345)) conv=notrunc status=none
+    dd of="$work/src/big.bin" bs=1M count=1 iflag=fullblock oflag=seek_bytes \
+        seek=$((20 * 1024 * 1024 + 12345)) conv=notrunc status=none
 
 step "R4 [$VERIFY_MODE]: rsync --inplace --no-whole-file"
 rsync -a --inplace --no-whole-file "$work/src/" "$area/dst/"

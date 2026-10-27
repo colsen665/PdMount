@@ -122,7 +122,12 @@ scratchpad directory that depends on the exact versions and run `cargo fetch`. T
   `tests/pjdfstest.list`. `FSX_DURATION=<s> tests/fsx.sh`: fsx with mmap on the fake (default 6 h). Both use the scenario
   setup (`SCENARIO_ROOT`, `PROFILE`); give a long fsx run its own `SCENARIO_ROOT` and `PROFILE` so other fake runs can
   go on meanwhile.
+- Q1/Q6 probe (M3.1, real account, about a minute; writes only under `pdmount-test/q1/`): `PROBE_PROFILE_A=default
+  PROBE_PROFILE_B=second PROBE_SECRETS=force-file cargo test -p pdmount probe -- --ignored --nocapture`
+  (`PROBE_PROFILE_B=same`: A's session with another client UID).
 - Journal property tests: `PROPTEST_CASES=10000 cargo test -p pdmount-core proptests` (about 140 s; default 32 cases).
+- `scripts/bench/read.sh [ram_mib ...]`: client-side read MiB/s and p50/p99 on a fake mount at several `cache.ram_bytes`
+  (M3.19.1; same release build).
 - `scripts/bench/latency.sh [clients] [iterations]`: client-side p50/p99/max of namespace operations on a fake mount, for
   the §5.7 SLOs (release build with `--features fake-backend`; `SCENARIO_ROOT` on disk to measure the disk).
 - Mounted fake-backend tests (`crates/pdmount-fuse/tests/`) need `/dev/fuse` and `fusermount3`; they skip otherwise.

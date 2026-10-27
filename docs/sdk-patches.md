@@ -58,7 +58,7 @@ Path prefixes: `sdk/` = `proton-drive-sdk-0.4.0/src/`, `rs2/` = `proton-sdk-rs2-
 |---|---|
 | M0/M1 (read-only mount) | P1, P2, P4, P8 (P3 recommended) |
 | M2 (writes) | P5, P6, P10, P13 |
-| M3 (multi-device, robustness) | P9, P11, P12 |
+| M3 (multi-device, robustness) | P9, P11, P12, P14, P15 |
 | M4 (performance) | P7 |
 
 ## Patches
@@ -160,6 +160,29 @@ Path prefixes: `sdk/` = `proton-drive-sdk-0.4.0/src/`, `rs2/` = `proton-sdk-rs2-
   `apiService.ts:217-221`) are missing from the result.
 - **Test:** the batching helper sends 50, 50 and 20 links for 120 ids, nothing for none, and stops at the first failure.
 
+### P14 — Conditional rename and move with a caller-supplied name hash
+- **Where:** `sdk/node/operations.rs` (`rename`, `move_single`), `sdk/client.rs` (`rename_node`, `move_node`,
+  `get_nodes_uncached`), `sdk/node/mod.rs` (`NodeMetadataResult`). Decision D038.
+- **Problem:** rename and move send the node's name hash as `OriginalHash`, which the server compares with the stored
+  hash (F11). The SDK fetches that hash fresh right before the request, so the check never fails: a rename by another
+  client after the caller last looked is silently overwritten. Decoded nodes drop the hash, so callers cannot supply it.
+- **Fix:** `rename_node_with_original_hash(uid, name, media_type, hash)` and
+  `move_node_with_original_hash(uid, parent, name, hash)` send the caller's hash. `get_nodes_uncached_with_name_hashes`
+  returns each node with its name hash; `get_nodes_uncached` is built on it. `rename_node`, `move_node` and `move_nodes`
+  keep their behaviour. Folder listings carry no hash.
+- **Test:** signature tests for the two calls; an empty fetch sends nothing. Checked against the live API in M3.1: a
+  stale hash is refused for rename and move (code 2000), the fresh one is accepted.
+
+### P15 — Trash time of v2 link details
+- **Where:** `sdk/api/links.rs` (`LinkDto.trash_time`). Decision D044.
+- **Problem:** link details come from `POST v2/volumes/{id}/links`, whose `LinkDto` names the trash timestamp
+  `TrashTime` (`cs/client/js/src/internal/apiService/driveTypes.ts`, `LinkDto`; `apiService.ts` reads
+  `link.Link.TrashTime`). The DTO reads `Trashed`, the v1 name, so `trash_time` is always `None`: `get_node`,
+  `get_nodes_uncached` and the trash listing report trashed nodes as active (F16).
+- **Fix:** `#[serde(rename = "TrashTime", alias = "Trashed")]`.
+- **Test:** a DTO with `TrashTime`, with `Trashed`, with `null` and without the field. Checked against the live API in
+  M3.1: a trashed file and folder report a trash time at once.
+
 ## Upstream tracking
 
 | Patch | Fork branch | Commit | Based on | Upstream | State |
@@ -177,17 +200,20 @@ Path prefixes: `sdk/` = `proton-drive-sdk-0.4.0/src/`, `rs2/` = `proton-sdk-rs2-
 | P11 | `feat/revision-conflict-error` | `1e777f3` | P8 | deferred (D023) | merged into `pdmount` |
 | P12 | `feat/metadata-retry` | `59fca73` | P8 | deferred (D023) | merged into `pdmount` |
 | P13 | `feat/fresh-node-batch` | `7b4dcf9` | `base/0.4.0` | deferred (D023) | merged into `pdmount` |
+| P14 | `feat/caller-name-hash` | `2137adc` | `pdmount` at `4548aa7` (needs P10, P13) | deferred (D023) | merged into `pdmount` |
+| P15 | `fix/link-trash-time` | `30c061a` | `base/0.4.0` | deferred (D023) | merged into `pdmount` |
 
 Integration: `pdmount` = `base/0.4.0` + all branches above, merged with `--no-ff`. It also contains `9176b0f`, a test-only fix
 setting the new `FolderNode` field (from P5) in a test helper added by P10. Checks on 2026-10-19: 236 SDK tests pass (baseline
 150), pdcli builds and its tests pass, and `cargo fmt --check` passes. The fork's own tests are all offline. P13 was merged on 2026-10-21 (`4548aa7`, pinned by PdMount); the
 fork's workspace tests (278) pass on it. Through PdMount, the patches ran against the live API in the M2.8 real-account matrix
-(60 of 60 runs passed, 2026-10-22).
+(60 of 60 runs passed, 2026-10-22). P14 (`e3c576a`) and P15 (`d1c8994`, pinned by PdMount) were merged on 2026-10-22;
+the fork's workspace tests (281) pass, and both ran against the live API in the M3.1 probe.
 
 ## Behaviour changes
 
 These changes differ from 0.4.0 and can affect existing callers such as pdcli. Approved by the user on 2026-10-21 (P2,
-P8, P9, P11, P12; P13 only adds an API and changes no existing behaviour):
+P8, P9, P11, P12; P13 only adds an API and changes no existing behaviour) and on 2026-10-22 (P15; P14 only adds API):
 
 | Patch | Change |
 |---|---|
@@ -196,6 +222,7 @@ P8, P9, P11, P12; P13 only adds an API and changes no existing behaviour):
 | P9 | A failed token refresh returns `Err(TokenRefreshError)` instead of `Ok(old tokens)`. `refresh_token_expired` fires on Proton code 10013. `tokens_refreshed` no longer fires after a failure. |
 | P11 | New-file drafts send `ClientUID`. With `override_existing_draft_by_other_client = true`, another client's draft that never got a committed revision is deleted and the create retried. Failures are `NodeWithSameNameExistsError` / `RevisionDraftConflictError`. |
 | P12 | Drive API requests are retried: 429 for all methods; 5xx and timeouts for idempotent methods only; connection failures. Circuit breakers fail fast for 60 s after 50 consecutive 429s or 10 consecutive 5xx. |
+| P15 | Trashed nodes report their trash time (`trash_time`) in `get_node`, `get_nodes_uncached`, folder listings and the trash listing; before, it was always `None`. |
 
 ## Known gaps after M0.2
 

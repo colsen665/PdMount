@@ -8,10 +8,7 @@ require_m1
 
 step "kill -9 the daemon"
 cat "$REMOTE/big/5MiB.bin" >/dev/null
-pid=$(daemon_pid)
-[[ -n "$pid" ]] || fail "no daemon pid in pdmount status"
-kill -9 "$pid"
-sleep 1
+kill_daemon
 if ls "$MNT" >/dev/null 2>&1; then fail "the mount still answers after kill -9"; fi
 status_text | grep -q 'Mount: *stale' || fail "status does not report a stale mount"
 echo "mount is stale, as expected"

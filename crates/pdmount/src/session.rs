@@ -59,9 +59,7 @@ fn client_options(
 /// Sets mode 0600 on a cache database and its SQLite side files.
 fn restrict_to_owner(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
-    for suffix in ["", "-wal", "-shm"] {
-        let mut file = path.as_os_str().to_owned();
-        file.push(suffix);
+    for file in pdmount_core::paths::sqlite_files(path) {
         let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600));
     }
 }
@@ -105,7 +103,7 @@ pub fn sign_in_prompt(url: &str, code: &str) -> String {
     text
 }
 
-fn present_link(url: &str, code: &str, browser: BrowserMode) {
+pub fn present_link(url: &str, code: &str, browser: BrowserMode) {
     let mut out = std::io::stdout().lock();
     let _ = write!(out, "{}", sign_in_prompt(url, code));
     if should_open_browser(browser, interactive(), graphical()) {
@@ -128,29 +126,50 @@ fn present_link(url: &str, code: &str, browser: BrowserMode) {
 /// Signs in through the browser session fork and stores the session.
 pub async fn login(paths: &ProfilePaths, browser: BrowserMode) -> anyhow::Result<LoggedIn> {
     println!("{THIRD_PARTY_NOTICE}");
-    let credentials = Credentials::new(paths);
-    let options = client_options(paths, &credentials)?;
     let mut shown = false;
-    let session = ProtonAPISession::begin_via_web(app_version(), options, |url, code| {
+    let session = begin_web_login(paths, |url, code| {
         if !shown {
             shown = true;
             present_link(url, code, browser);
         }
     })
-    .await
-    .context("sign-in did not complete")?;
-    let storage = match persist(&credentials, &session).await {
-        Ok(storage) => storage,
+    .await?;
+    store_login(paths, session).await
+}
+
+/// Waits for the sign-in in the browser; `on_sign_in(url, code)` says where
+/// to go. Nothing is stored: the caller may still refuse the account.
+pub async fn begin_web_login(
+    paths: &ProfilePaths,
+    on_sign_in: impl FnMut(&str, &str),
+) -> anyhow::Result<ProtonAPISession> {
+    let options = client_options(paths, &Credentials::new(paths))?;
+    ProtonAPISession::begin_via_web(app_version(), options, on_sign_in)
+        .await
+        .context("sign-in did not complete")
+}
+
+/// Stores a new session (D029 modes).
+pub async fn store_login(
+    paths: &ProfilePaths,
+    session: ProtonAPISession,
+) -> anyhow::Result<LoggedIn> {
+    let credentials = Credentials::new(paths);
+    match persist(&credentials, &session).await {
+        Ok(storage) => Ok(LoggedIn { session, storage }),
         Err(error) => {
             // A session that cannot be stored would stay open on the server.
-            let mut session = session;
-            if let Err(end) = session.end_from_session().await {
-                tracing::warn!(error = %format!("{end:#}"), "could not end the unstored session on the server");
-            }
-            return Err(error.context("cannot store the session; it was ended again"));
+            end_unstored(session).await;
+            Err(error.context("cannot store the session; it was ended again"))
         }
-    };
-    Ok(LoggedIn { session, storage })
+    }
+}
+
+/// Ends a session on the server that will not be kept (best effort).
+pub async fn end_unstored(mut session: ProtonAPISession) {
+    if let Err(end) = session.end_from_session().await {
+        tracing::warn!(error = %format!("{end:#}"), "could not end the unstored session on the server");
+    }
 }
 
 pub struct LoggedIn {
@@ -190,17 +209,28 @@ impl TokenSaver {
         Self { saved }
     }
 
+    /// The tokens as they are now, to hand to [`TokenSaver::save`].
+    pub async fn snapshot(
+        session: &ProtonAPISession,
+    ) -> anyhow::Result<proton_drive_sdk::proton_sdk_rs2::ser::StoredCredentials> {
+        current_credentials(session).await
+    }
+
+    /// Stores `stored` unless it is what was stored last. The keyring may
+    /// make this wait for a prompt, so it runs off the async threads.
     pub async fn save(
         &mut self,
         paths: &ProfilePaths,
-        session: &ProtonAPISession,
+        stored: proton_drive_sdk::proton_sdk_rs2::ser::StoredCredentials,
     ) -> anyhow::Result<()> {
-        let stored = current_credentials(session).await?;
         let json = serde_json::to_string(&stored)?;
         if self.saved.as_ref() == Some(&json) {
             return Ok(());
         }
-        Credentials::new(paths).save(&stored)?;
+        let paths = paths.clone();
+        tokio::task::spawn_blocking(move || Credentials::new(&paths).save(&stored))
+            .await
+            .context("the token store task failed")??;
         self.saved = Some(json);
         Ok(())
     }
@@ -214,20 +244,96 @@ pub fn device_identity(paths: &ProfilePaths, config: &Config) -> anyhow::Result<
     })
 }
 
+/// The drive client of a session, with this device's client uid.
+pub fn drive_client(
+    session: &ProtonAPISession,
+    device: &DeviceIdentity,
+) -> anyhow::Result<ProtonDriveClient> {
+    ProtonDriveClient::new(session, Some(device.client_uid()))
+}
+
 /// Drive client and backend of a signed-in session.
 pub async fn proton_backend(
     logged_in: &LoggedIn,
     device: &DeviceIdentity,
 ) -> anyhow::Result<ProtonBackend> {
-    let client = ProtonDriveClient::new(&logged_in.session, Some(device.client_uid()))?;
-    Ok(ProtonBackend::new(client, logged_in.session.username.clone()).await?)
+    let client = drive_client(&logged_in.session, device)?;
+    Ok(ProtonBackend::new(
+        client,
+        logged_in.session.token_credential.clone(),
+        logged_in.session.username.clone(),
+    )
+    .await?)
+}
+
+/// Where the drive's volume and root were last seen (`proton-root.json`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KnownRoot {
+    pub username: String,
+    pub volume: String,
+    pub root: String,
+}
+
+impl KnownRoot {
+    pub fn of(backend: &ProtonBackend, username: &str, root: &pdmount_backend::LinkId) -> Self {
+        Self {
+            username: username.to_owned(),
+            volume: backend.volume_id().to_owned(),
+            root: root.to_string(),
+        }
+    }
+
+    pub fn load(paths: &ProfilePaths) -> Option<Self> {
+        let text = std::fs::read_to_string(paths.proton_root_file()).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    /// Writes the file when it is missing or differs.
+    pub fn save(&self, paths: &ProfilePaths) -> anyhow::Result<()> {
+        if Self::load(paths).as_ref() == Some(self) {
+            return Ok(());
+        }
+        let file = paths.proton_root_file();
+        let temporary = file.with_extension("json.tmp");
+        std::fs::write(&temporary, serde_json::to_string(self)?)?;
+        std::fs::rename(&temporary, &file)?;
+        Ok(())
+    }
+}
+
+/// Drive client and backend for a mount without a connection: the volume and
+/// root come from `known`, so nothing is requested.
+pub fn proton_backend_offline(
+    logged_in: &LoggedIn,
+    device: &DeviceIdentity,
+    known: &KnownRoot,
+) -> anyhow::Result<ProtonBackend> {
+    let client = drive_client(&logged_in.session, device)?;
+    Ok(ProtonBackend::with_root(
+        client,
+        logged_in.session.token_credential.clone(),
+        known.username.clone(),
+        known.volume.clone(),
+        pdmount_backend::LinkId::new(known.root.clone()),
+    ))
 }
 
 /// Outcome of resuming the stored session.
 pub enum Resumed {
     NotLoggedIn,
-    /// The server rejected the session; a new login is required.
-    NeedsLogin(anyhow::Error),
+    /// Proton cannot be reached, so the session was not checked. The
+    /// session is built from the stored credentials.
+    Offline {
+        logged_in: Box<LoggedIn>,
+        error: anyhow::Error,
+    },
+    /// The server rejected the session; a new login is required. The session
+    /// is built from the stored credentials, for a mount that waits for it
+    /// (D042).
+    NeedsLogin {
+        logged_in: Box<LoggedIn>,
+        error: anyhow::Error,
+    },
     Active(Box<LoggedIn>),
 }
 
@@ -235,14 +341,23 @@ pub enum Resumed {
 /// latest tokens.
 pub async fn resume(paths: &ProfilePaths) -> anyhow::Result<Resumed> {
     let credentials = Credentials::new(paths);
-    let Some((stored, _)) = credentials.load()? else {
+    let Some((stored, storage)) = credentials.load()? else {
         return Ok(Resumed::NotLoggedIn);
     };
     let options = client_options(paths, &credentials)?;
     let mut session = ProtonAPISession::from_stored_credentials(stored, app_version(), options);
     if let Err(error) = session.ensure_authenticated().await {
         if is_session_rejected(&error) {
-            return Ok(Resumed::NeedsLogin(error));
+            return Ok(Resumed::NeedsLogin {
+                logged_in: Box::new(LoggedIn { session, storage }),
+                error,
+            });
+        }
+        if pdmount_backend::proton::is_connection_error(&error) {
+            return Ok(Resumed::Offline {
+                logged_in: Box::new(LoggedIn { session, storage }),
+                error,
+            });
         }
         return Err(error.context("cannot reach Proton to check the session"));
     }
@@ -251,7 +366,7 @@ pub async fn resume(paths: &ProfilePaths) -> anyhow::Result<Resumed> {
 }
 
 /// Whether the server definitively rejected the stored session.
-fn is_session_rejected(error: &anyhow::Error) -> bool {
+pub fn is_session_rejected(error: &anyhow::Error) -> bool {
     use proton_drive_sdk::proton_sdk_rs2::auth::TokenRefreshError;
     error
         .chain()
@@ -292,9 +407,7 @@ fn remove_local_state(
 ) -> anyhow::Result<()> {
     let removed = credentials.remove();
     for cache in [paths.sdk_secret_cache(), paths.sdk_entity_cache()] {
-        for suffix in ["", "-wal", "-shm"] {
-            let mut path = cache.clone().into_os_string();
-            path.push(suffix);
+        for path in pdmount_core::paths::sqlite_files(&cache) {
             let _ = std::fs::remove_file(path);
         }
     }

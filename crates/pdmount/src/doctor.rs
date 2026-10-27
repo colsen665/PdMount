@@ -78,7 +78,7 @@ fn check_fuse_device(path: &Path) -> Check {
     }
 }
 
-fn find_in_path(program: &str) -> Option<PathBuf> {
+pub(crate) fn find_in_path(program: &str) -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|path| {
         std::env::split_paths(&path)
             .map(|dir| dir.join(program))
