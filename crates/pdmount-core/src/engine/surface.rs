@@ -341,6 +341,9 @@ impl Engine {
             let access = self.access.read();
             let tree = self.tree.read();
             tree.get(ino).ok_or(CoreError::NotFound)?;
+            if self.is_read_only() {
+                return Ok(Some("ro".to_owned()));
+            }
             return Ok(Some(
                 crate::access::mode_str(access.effective(&tree, ino).0).to_owned(),
             ));

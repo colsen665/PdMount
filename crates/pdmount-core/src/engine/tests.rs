@@ -185,12 +185,13 @@ async fn listing_lookup_and_read_through_the_cache() {
     assert_eq!(
         hot(|| engine.read_local(handle, 0, 100))
             .expect("local")
-            .as_deref(),
-        Some(&b"hello world"[..])
+            .map(|(data, from)| (data.to_vec(), from)),
+        Some((b"hello world".to_vec(), ReadFrom::Ram))
     );
     assert_eq!(
         hot(|| engine.read_local(handle, 11, 5))
             .expect("eof")
+            .map(|(data, _)| data)
             .as_deref(),
         Some(&b""[..])
     );
@@ -204,6 +205,27 @@ async fn listing_lookup_and_read_through_the_cache() {
             .load(Ordering::Relaxed),
         0
     );
+}
+
+#[tokio::test]
+async fn a_remote_file_too_large_to_stage_is_efbig() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let (engine, _inval) = open(&backend, dir.path()).await;
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    let file = found(hot(|| engine.lookup(ROOT_INO, b"top.bin")).expect("lookup"));
+    // A size only the uploader's claim backs (S-5).
+    engine.tree.write().get_mut(file.ino).expect("node").size = 1 << 62;
+
+    let (handle, _) = engine.open_file(file.ino, WRITE).expect("open");
+    let error = engine
+        .write_local(handle, 1 << 61, b"x")
+        .expect_err("staged");
+    engine.release_file(handle);
+    assert!(matches!(error, CoreError::FileTooLarge), "{error:?}");
+    assert_eq!(error.errno(), nix::libc::EFBIG);
+    assert!(!engine.staging.data_path(file.ino).exists());
+    assert!(!engine.staged.lock().contains_key(&file.ino));
 }
 
 #[tokio::test]
@@ -252,6 +274,45 @@ async fn revalidation_applies_remote_changes_and_invalidates() {
             name: "new.txt".into()
         }
     );
+}
+
+#[tokio::test]
+async fn the_kernel_keeps_directory_pages_only_while_the_entries_are_unchanged() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let (engine, _inval) = open(&backend, dir.path()).await;
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    let opendir = || {
+        let (handle, keep) = engine.opendir(ROOT_INO).expect("opendir");
+        engine.releasedir(handle);
+        keep
+    };
+    assert!(!opendir(), "nothing served yet");
+    assert!(opendir(), "the same entries");
+
+    // A local change, and a remote one applied without the kernel.
+    write_file(&engine, ROOT_INO, "local.txt", b"l");
+    assert!(!opendir(), "a local change");
+    assert!(opendir());
+    let root = backend.root().await.expect("root").link_id;
+    backend
+        .upload_new(
+            &root,
+            "remote.txt",
+            UploadSource::Bytes(Bytes::from_static(b"r")),
+            meta(),
+        )
+        .await
+        .expect("upload");
+    engine.revalidate().await.expect("revalidate");
+    assert!(!opendir(), "a remote change");
+
+    // Another open handle could fill the cache from its own snapshot.
+    let (held, _) = engine.opendir(ROOT_INO).expect("opendir");
+    assert!(!opendir(), "another handle is open");
+    engine.releasedir(held);
+    assert!(!opendir(), "the pages may come from either snapshot");
+    assert!(opendir());
 }
 
 #[tokio::test]
@@ -339,6 +400,76 @@ async fn sequential_reads_trigger_readahead() {
         engine.metrics().prefetched_blocks.load(Ordering::Relaxed) > 0
     })
     .await;
+}
+
+/// Backend calls per method since the last reset (the latency counts).
+fn backend_calls(engine: &Engine) -> Vec<(&'static str, u64)> {
+    engine
+        .metrics()
+        .snapshot_latency()
+        .into_iter()
+        .filter(|(name, _)| name.starts_with("backend_"))
+        .map(|(name, summary)| (name, summary.count))
+        .collect()
+}
+
+/// The §5.7 rows that are network counts, not times: the first listing
+/// costs one listing call, once; a prefetched small file's first byte no
+/// call; a small file that was not prefetched one block map and one block.
+#[tokio::test]
+async fn first_bytes_and_listings_cost_the_slo_round_trips() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = FakeBackend::new();
+    let root = backend.root().await.expect("root").link_id;
+    for name in ["small-a", "small-b"] {
+        backend
+            .upload_new(
+                &root,
+                name,
+                UploadSource::Bytes(Bytes::from_static(b"small file")),
+                meta(),
+            )
+            .await
+            .expect("upload");
+    }
+    let (engine, _inval) = open(&backend, dir.path()).await;
+    engine.metrics().reset_latency();
+
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    engine.ensure_listed(ROOT_INO).await.expect("listed");
+    assert_eq!(backend_calls(&engine), [("backend_list_children", 1)]);
+
+    // Not prefetched: no opendir, so no prefetch.
+    engine.metrics().reset_latency();
+    let a = found(hot(|| engine.lookup(ROOT_INO, b"small-a")).expect("lookup"));
+    assert_eq!(read_file(&engine, a.ino).await, b"small file");
+    let mut calls = backend_calls(&engine);
+    calls.retain(|(name, _)| name.starts_with("backend_fetch_block"));
+    assert_eq!(calls.iter().map(|(_, n)| n).sum::<u64>(), 1, "{calls:?}");
+    assert_eq!(
+        backend_calls(&engine)
+            .into_iter()
+            .filter(|(name, _)| !name.starts_with("backend_fetch_block"))
+            .collect::<Vec<_>>(),
+        [("backend_blocks", 1)]
+    );
+
+    // Prefetched by opendir (`small-a` is cached already): the read makes
+    // no call.
+    let b = found(hot(|| engine.lookup(ROOT_INO, b"small-b")).expect("lookup"));
+    let (handle, _) = engine.open_file(b.ino, READ).expect("open");
+    engine.opendir(ROOT_INO).expect("opendir");
+    eventually("prefetch", || {
+        matches!(engine.read_local(handle, 0, 100), Ok(Some(_)))
+    })
+    .await;
+    engine.metrics().reset_latency();
+    let (data, _) = hot(|| engine.read_local(handle, 0, 100))
+        .expect("read")
+        .expect("local");
+    engine.release_file(handle);
+    assert_eq!(&data[..], b"small file");
+    assert_eq!(backend_calls(&engine), []);
 }
 
 // ---- writes ----
@@ -685,6 +816,30 @@ async fn unuploaded_changes_survive_a_crash() {
     );
 }
 
+/// A new file has no staging sidecar (D067): startup finds its staging by
+/// the data file, not as missing content to recreate empty.
+#[tokio::test]
+async fn a_pending_new_file_without_a_sidecar_survives_a_crash() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let ino = {
+        // No executor: the file is only local when the "daemon" dies.
+        let (engine, _inval) = open(&backend, dir.path()).await;
+        engine.ensure_listed(ROOT_INO).await.expect("list");
+        let ino = write_file(&engine, ROOT_INO, "new.txt", b"no sidecar");
+        engine.fsync(ino).await.expect("fsync");
+        engine.store.crash();
+        ino
+    };
+    let staging = dir.path().join("staging");
+    assert!(staging.join(ino.to_string()).exists());
+    assert!(!staging.join(format!("{ino}.state")).exists());
+    let engine = running(&backend, dir.path()).await;
+    assert_eq!(read_file(&engine, ino).await, b"no sidecar");
+    settle(&engine).await;
+    assert_eq!(fake_tree(&backend).await["/new.txt"].content, b"no sidecar");
+}
+
 /// A kill -9 loses the store writes still queued. Staging the stored rows
 /// name must outlive it: after an upload and after an unlink.
 #[tokio::test]
@@ -880,7 +1035,7 @@ async fn a_read_over_more_blocks_than_pool_slots_holds_few() {
     assert_eq!(read.await.expect("the read waited for slots"), content);
     let (handle, _) = engine.open_file(file, READ).expect("open");
     let local = hot(|| engine.read_local(handle, 0, 1600)).expect("local");
-    assert_eq!(local.as_deref(), Some(&content[..]));
+    assert_eq!(local.map(|(data, _)| data).as_deref(), Some(&content[..]));
     engine.release_file(handle);
     assert!(
         started.elapsed() < Duration::from_secs(5),
@@ -3568,4 +3723,1167 @@ async fn journal_does_not_park_while_offline() {
     tokio::spawn(async move { task.run_health().await });
     settle(&engine).await;
     assert!(fake_tree(&backend).await.contains_key("/queued.txt"));
+}
+
+// ---- pins (§5.3, D060) ----
+
+/// An engine with only the pin task running (no event polling), unpaced.
+async fn pinning(backend: &FakeBackend, dir: &std::path::Path) -> Arc<Engine> {
+    let (engine, _inval) = open(backend, dir).await;
+    engine.gate.set_interval(Duration::ZERO);
+    engine.runtime().spawn(Arc::clone(&engine).run_pins());
+    engine
+}
+
+async fn pin_complete(engine: &Arc<Engine>, path: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let pins = engine.pin_list().await.expect("list");
+        let pin = pins
+            .iter()
+            .find(|pin| pin.path.as_deref() == Some(path))
+            .unwrap_or_else(|| panic!("no pin on {path}: {pins:?}"));
+        if pin.state == pins::PinState::Complete && pin.fetched_bytes == pin.total_bytes {
+            return;
+        }
+        assert!(Instant::now() < deadline, "not complete: {pin:?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn pinned_bytes(engine: &Engine) -> u64 {
+    engine.cache_stats().pinned_bytes
+}
+
+#[tokio::test]
+async fn a_pinned_folder_is_listed_fetched_and_survives_gc_and_wipe() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let root = backend.root().await.expect("root").link_id;
+    let docs = backend
+        .list_children(&root)
+        .await
+        .expect("list")
+        .into_iter()
+        .find(|node| node.name == "docs")
+        .expect("docs")
+        .link_id;
+    let sub = backend
+        .create_folder(&docs, "sub", UNIX_EPOCH)
+        .await
+        .expect("mkdir");
+    backend
+        .upload_new(
+            &sub,
+            "deep.txt",
+            UploadSource::Bytes(Bytes::from_static(b"deep content")),
+            meta(),
+        )
+        .await
+        .expect("upload");
+    let engine = pinning(&backend, dir.path()).await;
+    engine.pin_set("/docs").await.expect("pin");
+    pin_complete(&engine, "/docs").await;
+    let pins = engine.pin_list().await.expect("list");
+    assert_eq!(pins[0].files, 2);
+    assert_eq!(pins[0].total_bytes, 11 + 12);
+    let summary = engine.pin_summary().await.expect("summary").expect("pins");
+    assert_eq!((summary.paths, summary.fetched_bytes), (1, 23));
+    let pinned = pinned_bytes(&engine);
+    assert!(pinned > 23);
+    assert_eq!(engine.cache_stats().bytes, 0, "not counted against the cap");
+    engine.cache_gc(Some(0)).await.expect("gc");
+    engine.cache_wipe(None).await.expect("wipe");
+    engine.cache_wipe(Some("/docs")).await.expect("wipe");
+    assert_eq!(pinned_bytes(&engine), pinned);
+    // A file outside the pin is not fetched.
+    assert_eq!(engine.cache_stats().blocks, 3 + 3);
+}
+
+#[tokio::test]
+async fn unpin_makes_blocks_evictable() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let engine = pinning(&backend, dir.path()).await;
+    engine.pin_set("/top.bin").await.expect("pin");
+    pin_complete(&engine, "/top.bin").await;
+    assert!(pinned_bytes(&engine) > 0);
+    engine.cache_gc(Some(0)).await.expect("gc");
+    assert!(pinned_bytes(&engine) > 0);
+    engine.pin_unset("/top.bin").await.expect("unpin");
+    eventually("the unpin", || pinned_bytes(&engine) == 0).await;
+    assert!(engine.pin_list().await.expect("list").is_empty());
+    assert!(engine.pin_summary().await.expect("summary").is_none());
+    assert!(engine.cache_gc(Some(0)).await.expect("gc").blocks > 0);
+    let not_pinned = engine.pin_unset("/top.bin").await.expect_err("not pinned");
+    assert!(
+        not_pinned.to_string().contains("not pinned"),
+        "{not_pinned}"
+    );
+}
+
+#[tokio::test]
+async fn unpin_inside_a_pinned_folder_names_the_pin() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let engine = pinning(&backend, dir.path()).await;
+    engine.pin_set("/docs").await.expect("pin");
+    let error = engine.pin_unset("/docs/a.txt").await.expect_err("inside");
+    assert!(
+        error.to_string().contains("pinned through /docs"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn a_new_remote_revision_of_a_pinned_file_is_fetched_and_the_old_one_let_go() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let engine = pinning(&backend, dir.path()).await;
+    engine.sync_events().await.expect("cursor");
+    engine.pin_set("/top.bin").await.expect("pin");
+    pin_complete(&engine, "/top.bin").await;
+    let file = found(engine.lookup(ROOT_INO, b"top.bin").expect("lookup"));
+    let (link, old) = {
+        let tree = engine.tree.read();
+        let remote = tree
+            .get(file.ino)
+            .and_then(|n| n.remote.clone())
+            .expect("remote");
+        (remote.link, remote.rev.expect("rev"))
+    };
+    let new = backend
+        .upload_revision(
+            &link,
+            &old,
+            UploadSource::Bytes(Bytes::from_static(b"a newer revision")),
+            meta(),
+        )
+        .await
+        .expect("revision");
+    engine.sync_events().await.expect("events");
+    pin_complete(&engine, "/top.bin").await;
+    assert!(engine.cache.on_disk(&BlockKey::new(&link, &new, 1)));
+    // Only the old revision's blocks can go.
+    let wiped = engine.cache_gc(Some(0)).await.expect("gc");
+    assert_eq!(wiped.blocks, 3);
+    assert!(!engine.cache.on_disk(&BlockKey::new(&link, &old, 1)));
+    assert!(engine.cache.on_disk(&BlockKey::new(&link, &new, 1)));
+}
+
+#[tokio::test]
+async fn our_own_upload_stays_pinned_without_a_download() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let engine = {
+        let engine = running(&backend, dir.path()).await;
+        engine.gate.set_interval(Duration::ZERO);
+        engine
+    };
+    engine.pin_set("/docs").await.expect("pin");
+    pin_complete(&engine, "/docs").await;
+    let docs = found(engine.lookup(ROOT_INO, b"docs").expect("lookup"));
+    write_file(&engine, docs.ino, "new.txt", b"local content");
+    settle(&engine).await;
+    let before_upload = pinned_bytes(&engine);
+    eventually("the upload's blocks pinned", || {
+        pinned_bytes(&engine) > before_upload
+    })
+    .await;
+    let calls = |engine: &Engine| {
+        backend_calls(engine)
+            .into_iter()
+            .find(|(name, _)| *name == "fetch_block")
+            .map_or(0, |(_, count)| count)
+    };
+    let before = calls(&engine);
+    engine.cache_gc(Some(0)).await.expect("gc");
+    let pins = engine.pin_list().await.expect("list");
+    assert_eq!(pins[0].files, 2);
+    assert_eq!(pins[0].fetched_bytes, 11 + 13);
+    assert_eq!(calls(&engine), before);
+}
+
+#[tokio::test]
+async fn a_pin_survives_a_restart_and_resumes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let pinned;
+    {
+        let (engine, _inval) = open(&backend, dir.path()).await;
+        // No task yet: nothing is fetched before the restart.
+        engine.pin_set("/top.bin").await.expect("pin");
+        assert_eq!(pinned_bytes(&engine), 0);
+        engine.shutdown().await.expect("shutdown");
+    }
+    {
+        let engine = pinning(&backend, dir.path()).await;
+        pin_complete(&engine, "/top.bin").await;
+        pinned = pinned_bytes(&engine);
+        assert!(pinned > 0);
+        engine.store.flush().await.expect("flush");
+        engine.shutdown().await.expect("shutdown");
+    }
+    let (engine, _inval) = open(&backend, dir.path()).await;
+    assert_eq!(pinned_bytes(&engine), pinned, "pin = 1 read back");
+}
+
+#[tokio::test]
+async fn a_rename_out_of_a_pinned_folder_unpins_and_one_in_pins() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let engine = pinning(&backend, dir.path()).await;
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    let docs = found(engine.lookup(ROOT_INO, b"docs").expect("lookup"));
+    engine.ensure_listed(docs.ino).await.expect("list");
+    engine.pin_set("/docs").await.expect("pin");
+    pin_complete(&engine, "/docs").await;
+    assert!(pinned_bytes(&engine) > 0);
+    engine
+        .rename(
+            docs.ino,
+            b"a.txt",
+            ROOT_INO,
+            b"out.txt",
+            RenameMode::Replace,
+        )
+        .expect("out");
+    eventually("the move out", || pinned_bytes(&engine) == 0).await;
+    engine
+        .rename(
+            ROOT_INO,
+            b"top.bin",
+            docs.ino,
+            b"in.bin",
+            RenameMode::Replace,
+        )
+        .expect("in");
+    pin_complete(&engine, "/docs").await;
+    eventually("the move in", || pinned_bytes(&engine) > 0).await;
+}
+
+#[tokio::test]
+async fn deleting_a_pinned_node_deletes_its_pin() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let engine = pinning(&backend, dir.path()).await;
+    engine.pin_set("/top.bin").await.expect("pin");
+    pin_complete(&engine, "/top.bin").await;
+    engine.unlink(ROOT_INO, b"top.bin").expect("unlink");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !engine.pin_list().await.expect("list").is_empty() {
+        assert!(Instant::now() < deadline, "the pin stayed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(pinned_bytes(&engine), 0);
+    engine.store.flush().await.expect("flush");
+    let rows: i64 = engine
+        .store
+        .read(|conn| conn.query_row("SELECT count(*) FROM pins", [], |row| row.get(0)))
+        .expect("read");
+    assert_eq!(rows, 0);
+}
+
+#[tokio::test]
+async fn an_atomic_save_keeps_the_pin() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let engine = pinning(&backend, dir.path()).await;
+    engine.pin_set("/top.bin").await.expect("pin");
+    pin_complete(&engine, "/top.bin").await;
+    write_file(&engine, ROOT_INO, "top.bin.tmp", b"saved");
+    engine
+        .rename(
+            ROOT_INO,
+            b"top.bin.tmp",
+            ROOT_INO,
+            b"top.bin",
+            RenameMode::Replace,
+        )
+        .expect("save");
+    let pins = engine.pin_list().await.expect("list");
+    assert_eq!(pins.len(), 1);
+    assert_eq!(pins[0].path.as_deref(), Some("/top.bin"));
+}
+
+#[tokio::test]
+async fn pin_is_refused_when_the_disk_cannot_hold_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let engine = pinning(&backend, dir.path()).await;
+    *engine.pins.test_free_bytes.lock() = Some((1 << 30) + 5);
+    let error = engine.pin_set("/top.bin").await.expect_err("too large");
+    assert!(error.to_string().contains("no space"), "{error}");
+    assert!(engine.pin_list().await.expect("list").is_empty());
+    // It fits: pinned, and the fetcher waits below the reserve.
+    *engine.pins.test_free_bytes.lock() = Some((1 << 30) + 100);
+    engine.pin_set("/top.bin").await.expect("fits");
+    pin_complete(&engine, "/top.bin").await;
+}
+
+#[tokio::test]
+async fn the_fetcher_stops_when_free_space_runs_out() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let engine = pinning(&backend, dir.path()).await;
+    // Folder contents are not known yet, so the pin is accepted on a full
+    // disk; the fetcher finds out.
+    *engine.pins.test_free_bytes.lock() = Some(1 << 20);
+    engine.pin_set("/docs").await.expect("pin");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let pins = engine.pin_list().await.expect("list");
+        if pins[0].state == pins::PinState::WaitingSpace {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{pins:?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(engine.cache_stats().blocks, 0);
+    *engine.pins.test_free_bytes.lock() = Some(1 << 40);
+    engine.pins.nudge_for_tests();
+    pin_complete(&engine, "/docs").await;
+}
+
+#[tokio::test]
+async fn pin_fetches_are_paced() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = FakeBackend::new();
+    let root = backend.root().await.expect("root").link_id;
+    let folder = backend
+        .create_folder(&root, "many", UNIX_EPOCH)
+        .await
+        .expect("mkdir");
+    for i in 0..20 {
+        backend
+            .upload_new(
+                &folder,
+                &format!("f{i}"),
+                UploadSource::Bytes(Bytes::from_static(b"x")),
+                meta(),
+            )
+            .await
+            .expect("upload");
+    }
+    let (engine, _inval) = open(&backend, dir.path()).await;
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    let many = found(engine.lookup(ROOT_INO, b"many").expect("lookup"));
+    engine.ensure_listed(many.ino).await.expect("list");
+    engine.pin_set("/many").await.expect("pin");
+    let before = engine.metrics().backend_calls.load(Ordering::Relaxed);
+    tokio::time::pause();
+    engine.runtime().spawn(Arc::clone(&engine).run_pins());
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    // Turns at most every 0.5 s, each one file with two calls (block list,
+    // block). Unpaced, all 20 files would be done.
+    let calls = engine.metrics().backend_calls.load(Ordering::Relaxed) - before;
+    assert!(calls == 6, "backend calls in 1.2 s: {calls}");
+}
+
+#[tokio::test]
+async fn offline_a_pinned_file_reads_without_the_backend_and_fetching_waits() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (backend, config) = faulty(dir.path()).await;
+    let (engine, _inval) = open_with(&backend, dir.path(), config).await;
+    engine.gate.set_interval(Duration::ZERO);
+    engine.runtime().spawn(Arc::clone(&engine).run_pins());
+    engine.pin_set("/top.bin").await.expect("pin");
+    pin_complete(&engine, "/top.bin").await;
+    pdmount_backend::fake::add_fault(&dir.path().join("fake"), offline_rule()).expect("fault");
+    engine.health().set(Connectivity::Offline);
+    let before = engine.metrics().backend_calls.load(Ordering::Relaxed);
+    let file = found(engine.lookup(ROOT_INO, b"top.bin").expect("lookup"));
+    assert_eq!(read_file(&engine, file.ino).await, b"0123456789");
+    assert_eq!(
+        engine.metrics().backend_calls.load(Ordering::Relaxed),
+        before,
+        "a pinned read needs no backend"
+    );
+    // A pin set offline, on a known path, waits for the connection.
+    engine.pin_set("/docs").await.expect("pin");
+    let pins = engine.pin_list().await.expect("list");
+    let waiting = pins
+        .iter()
+        .find(|pin| pin.path_at_set == "/docs")
+        .expect("pin");
+    assert_eq!(waiting.state, pins::PinState::WaitingOffline);
+    pdmount_backend::fake::clear_faults(&dir.path().join("fake"), None).expect("clear");
+    engine.health().set(Connectivity::Online);
+    pin_complete(&engine, "/docs").await;
+}
+
+// ---- queue tooling (D061) ----
+
+/// An engine whose executor does not run, so entries stay as they are.
+async fn queue_held(
+    backend: &FakeBackend,
+    dir: &std::path::Path,
+) -> (Arc<Engine>, mpsc::UnboundedReceiver<Invalidation>, Ino) {
+    let (engine, inval) = open(backend, dir).await;
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    let docs = found(engine.lookup(ROOT_INO, b"docs").expect("lookup")).ino;
+    engine.ensure_listed(docs).await.expect("list");
+    (engine, inval, docs)
+}
+
+/// A running engine that uploads only when forced.
+async fn queue_forced_only(backend: &FakeBackend, dir: &std::path::Path) -> (Arc<Engine>, Ino) {
+    let mut config = config();
+    config.upload.debounce = HumanDuration(Duration::from_secs(3600));
+    let (engine, _inval) = open_with(backend, dir, config).await;
+    engine.start_background();
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    let docs = found(engine.lookup(ROOT_INO, b"docs").expect("lookup")).ino;
+    engine.ensure_listed(docs).await.expect("list");
+    (engine, docs)
+}
+
+fn queue_path(path: &str) -> queue::QueueTarget {
+    queue::QueueTarget::Path(path.to_owned())
+}
+
+async fn queue_all(engine: &Arc<Engine>) -> Vec<queue::QueueEntry> {
+    engine
+        .queue_entries(&queue::QueueTarget::All)
+        .await
+        .expect("entries")
+}
+
+#[tokio::test]
+async fn queue_lists_each_kind_with_its_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let (engine, _inval, docs) = queue_held(&backend, dir.path()).await;
+    let top = found(engine.lookup(ROOT_INO, b"top.bin").expect("lookup")).ino;
+    write_file(&engine, docs, "new.txt", b"new");
+    engine.mkdir(ROOT_INO, b"made", 0o755).expect("mkdir");
+    engine
+        .rename(
+            docs,
+            b"a.txt",
+            ROOT_INO,
+            b"moved.txt",
+            RenameMode::NoReplace,
+        )
+        .expect("rename");
+    engine.unlink(ROOT_INO, b"top.bin").expect("unlink");
+    let entries = queue_all(&engine).await;
+    let kind_of = |path: &str| {
+        entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .map(|entry| entry.kind)
+    };
+    assert_eq!(kind_of("/docs/new.txt"), Some(queue::QueueKind::Upload));
+    assert_eq!(kind_of("/made"), Some(queue::QueueKind::CreateFolder));
+    assert_eq!(kind_of("/moved.txt"), Some(queue::QueueKind::Move));
+    // A deleted file is listed where its remote file is.
+    assert_eq!(kind_of("/top.bin"), Some(queue::QueueKind::Trash));
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.state == queue::QueueState::Waiting)
+    );
+
+    let under_docs = engine
+        .queue_entries(&queue_path("/docs"))
+        .await
+        .expect("entries");
+    let paths: Vec<&str> = under_docs.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(paths, ["/docs/new.txt"]);
+    let deleted = engine
+        .queue_entries(&queue_path("/top.bin"))
+        .await
+        .expect("a deleted file is found by its old path");
+    assert_eq!(deleted[0].id, top);
+    assert!(deleted[0].base_rev.is_some());
+    let by_id = engine
+        .queue_entries(&queue::QueueTarget::Id(top))
+        .await
+        .expect("entries");
+    assert_eq!(by_id.len(), 1);
+    assert!(matches!(
+        engine.queue_entries(&queue::QueueTarget::Id(999_999)).await,
+        Err(CoreError::Refused(_))
+    ));
+}
+
+#[tokio::test]
+async fn queue_lists_metadata_and_shows_dependencies() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let (engine, _inval, _docs) = queue_held(&backend, dir.path()).await;
+    let top = found(engine.lookup(ROOT_INO, b"top.bin").expect("lookup")).ino;
+    engine
+        .setattr(
+            top,
+            &SetAttr {
+                mode: Some(0o640),
+                ..SetAttr::default()
+            },
+        )
+        .expect("chmod");
+    let made = engine.mkdir(ROOT_INO, b"made", 0o755).expect("mkdir").ino;
+    write_file(&engine, made, "inner.txt", b"x");
+    let entries = queue_all(&engine).await;
+    let entry = |path: &str| {
+        entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .expect("entry")
+    };
+    assert_eq!(entry("/top.bin").kind, queue::QueueKind::Metadata);
+    assert_eq!(entry("/made/inner.txt").dependencies, ["/made"]);
+    assert!(entry("/made").dependencies.is_empty());
+}
+
+#[tokio::test]
+async fn queue_retry_uploads_a_parked_entry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    backend.inject_failure(
+        pdmount_backend::fake::FakeOp::UploadNew,
+        pdmount_backend::BackendError::QuotaExceeded,
+    );
+    let engine = running(&backend, dir.path()).await;
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    write_file(&engine, ROOT_INO, "big", b"content");
+    let counts = engine.drain(Duration::from_secs(10)).await;
+    assert_eq!(counts.parked, 1);
+    let entries = queue_all(&engine).await;
+    assert!(matches!(entries[0].state, queue::QueueState::Parked { .. }));
+    assert!(entries[0].last_error.is_some());
+
+    let retried = engine
+        .queue_retry(&queue_path("/big"))
+        .await
+        .expect("retry");
+    assert_eq!(retried[0].path, "/big");
+    settle(&engine).await;
+    let root = backend.root().await.expect("root").link_id;
+    let link = remote_child(&backend, &root, "big").await.link_id;
+    assert_eq!(backend.content(&link).expect("uploaded"), &b"content"[..]);
+}
+
+#[tokio::test]
+async fn queue_park_holds_an_entry_until_retry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let (engine, _docs) = queue_forced_only(&backend, dir.path()).await;
+    let ino = write_file(&engine, ROOT_INO, "held.txt", b"one");
+    engine
+        .queue_park(&queue::QueueTarget::Id(ino))
+        .await
+        .expect("park");
+    // Neither a force nor a local change lets it go.
+    overwrite(&engine, ino, b"two");
+    let counts = engine.drain(Duration::from_secs(10)).await;
+    assert_eq!((counts.pending, counts.parked), (0, 1));
+    assert_eq!(engine.parked()[0].1, "parked by user");
+    let root = backend.root().await.expect("root").link_id;
+    let names: Vec<String> = backend
+        .list_children(&root)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|node| node.name)
+        .collect();
+    assert!(!names.iter().any(|name| name == "held.txt"), "{names:?}");
+
+    engine
+        .queue_retry(&queue::QueueTarget::Id(ino))
+        .await
+        .expect("retry");
+    settle(&engine).await;
+    let link = remote_child(&backend, &root, "held.txt").await.link_id;
+    assert_eq!(backend.content(&link).expect("uploaded"), &b"two"[..]);
+}
+
+#[tokio::test]
+async fn queue_drop_of_a_modified_file_restores_the_remote_content() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let (engine, mut inval, docs) = queue_held(&backend, dir.path()).await;
+    let ino = found(engine.lookup(docs, b"a.txt").expect("lookup")).ino;
+    overwrite(&engine, ino, b"LOCAL");
+    assert_eq!(read_file(&engine, ino).await, b"LOCAL");
+    while inval.try_recv().is_ok() {}
+
+    // Without --yes nothing happens.
+    let preview = engine
+        .queue_drop(&queue_path("/docs/a.txt"), false)
+        .await
+        .expect("preview");
+    assert_eq!(preview.len(), 1);
+    assert_eq!(read_file(&engine, ino).await, b"LOCAL");
+    assert_eq!(queue_all(&engine).await.len(), 1);
+
+    let dropped = engine
+        .queue_drop(&queue_path("/docs/a.txt"), true)
+        .await
+        .expect("drop");
+    assert_eq!(dropped[0].refused, None);
+    assert_eq!(read_file(&engine, ino).await, b"hello world");
+    assert_eq!(
+        engine.xattr(ino, "user.pdmount.state").unwrap().as_deref(),
+        Some("clean")
+    );
+    assert!(engine.staged_entry(ino).is_none());
+    assert!(queue_all(&engine).await.is_empty());
+    let mut invalidated = false;
+    while let Ok(invalidation) = inval.try_recv() {
+        invalidated |= matches!(invalidation, Invalidation::Inode { ino: seen } if seen == ino);
+    }
+    assert!(invalidated, "the kernel must forget the local content");
+    // A later change works from the remote content.
+    overwrite(&engine, ino, b"J");
+    assert_eq!(read_file(&engine, ino).await, b"J");
+}
+
+#[tokio::test]
+async fn queue_drop_of_a_modified_file_survives_a_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let ino = {
+        let (engine, _inval, docs) = queue_held(&backend, dir.path()).await;
+        let ino = found(engine.lookup(docs, b"a.txt").expect("lookup")).ino;
+        overwrite(&engine, ino, b"LOCAL");
+        engine
+            .queue_drop(&queue::QueueTarget::Id(ino), true)
+            .await
+            .expect("drop");
+        engine.shutdown().await.expect("shutdown");
+        ino
+    };
+    let (engine, _inval) = open(&backend, dir.path()).await;
+    assert_eq!(read_file(&engine, ino).await, b"hello world");
+    assert!(queue_all(&engine).await.is_empty());
+}
+
+#[tokio::test]
+async fn queue_drop_of_a_never_uploaded_file_removes_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let (engine, mut inval, _docs) = queue_held(&backend, dir.path()).await;
+    let ino = write_file(&engine, ROOT_INO, "new.txt", b"new");
+    while inval.try_recv().is_ok() {}
+    engine
+        .queue_drop(&queue_path("/new.txt"), true)
+        .await
+        .expect("drop");
+    assert_eq!(engine.tree.read().child(ROOT_INO, "new.txt").unwrap(), None);
+    assert!(queue_all(&engine).await.is_empty());
+    let mut invalidated = false;
+    while let Ok(invalidation) = inval.try_recv() {
+        invalidated |= matches!(
+            invalidation,
+            Invalidation::Delete { child, .. } if child == ino
+        ) || matches!(invalidation, Invalidation::Entry { name, .. } if name == "new.txt");
+    }
+    assert!(invalidated, "the kernel must forget the entry");
+}
+
+#[tokio::test]
+async fn queue_drop_of_a_folder_undoes_its_subtree() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let (engine, _inval, docs) = queue_held(&backend, dir.path()).await;
+    let a = found(engine.lookup(docs, b"a.txt").expect("lookup")).ino;
+    let made = engine.mkdir(ROOT_INO, b"made", 0o755).expect("mkdir").ino;
+    let sub = engine.mkdir(made, b"sub", 0o755).expect("mkdir").ino;
+    write_file(&engine, sub, "inner.txt", b"x");
+    engine
+        .rename(docs, b"a.txt", made, b"taken.txt", RenameMode::NoReplace)
+        .expect("rename");
+    write_file(&engine, ROOT_INO, "other.txt", b"stays");
+
+    let dropped = engine
+        .queue_drop(&queue_path("/made"), true)
+        .await
+        .expect("drop");
+    assert!(
+        dropped.iter().all(|item| item.refused.is_none()),
+        "{dropped:?}"
+    );
+    let tree = engine.tree.read();
+    assert_eq!(tree.child(ROOT_INO, "made").unwrap(), None);
+    // The file moved into the folder is back in its remote place.
+    assert_eq!(tree.child(docs, "a.txt").unwrap(), Some(a));
+    assert!(!tree.placement_pending(a));
+    drop(tree);
+    assert_eq!(read_file(&engine, a).await, b"hello world");
+    let left: Vec<String> = queue_all(&engine)
+        .await
+        .into_iter()
+        .map(|e| e.path)
+        .collect();
+    assert_eq!(left, ["/other.txt"]);
+}
+
+#[tokio::test]
+async fn queue_drop_of_a_delete_brings_the_remote_file_back() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let (engine, _inval, _docs) = queue_held(&backend, dir.path()).await;
+    engine.unlink(ROOT_INO, b"top.bin").expect("unlink");
+    engine
+        .queue_drop(&queue_path("/top.bin"), true)
+        .await
+        .expect("drop");
+    let back = found(engine.lookup(ROOT_INO, b"top.bin").expect("lookup"));
+    assert_eq!(read_file(&engine, back.ino).await, b"0123456789");
+    assert!(queue_all(&engine).await.is_empty());
+}
+
+/// `mv a.txt b.txt; echo new > a.txt`: `a.txt` cannot go back while the new
+/// file has its name, and can in one drop with it.
+#[tokio::test]
+async fn queue_drop_refuses_a_taken_name_and_settles_it_with_the_holder() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let (engine, _inval, docs) = queue_held(&backend, dir.path()).await;
+    let a = found(engine.lookup(docs, b"a.txt").expect("lookup")).ino;
+    engine
+        .rename(docs, b"a.txt", docs, b"b.txt", RenameMode::NoReplace)
+        .expect("rename");
+    write_file(&engine, docs, "a.txt", b"new");
+
+    let refused = engine
+        .queue_drop(&queue::QueueTarget::Id(a), true)
+        .await
+        .expect("drop");
+    assert!(refused[0].refused.is_some(), "{refused:?}");
+    // It stays queued, and the executor may take it again.
+    assert_eq!(queue_all(&engine).await.len(), 2);
+    assert!(!engine.journal.entries().is_empty());
+    assert_eq!(engine.tree.read().child(docs, "b.txt").unwrap(), Some(a));
+
+    let dropped = engine
+        .queue_drop(&queue_path("/docs"), true)
+        .await
+        .expect("drop");
+    assert!(
+        dropped.iter().all(|item| item.refused.is_none()),
+        "{dropped:?}"
+    );
+    assert_eq!(engine.tree.read().child(docs, "a.txt").unwrap(), Some(a));
+    assert_eq!(engine.tree.read().child(docs, "b.txt").unwrap(), None);
+    assert_eq!(read_file(&engine, a).await, b"hello world");
+}
+
+#[tokio::test]
+async fn queue_drop_is_refused_while_the_upload_runs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let (engine, _docs) = queue_forced_only(&backend, dir.path()).await;
+    let ino = write_file(&engine, ROOT_INO, "new.txt", b"new");
+    let pause = backend.pause_at(FakePoint::NewBeforeCommit);
+    engine
+        .queue_retry(&queue::QueueTarget::Id(ino))
+        .await
+        .expect("force");
+    pause.reached().await;
+    assert_eq!(
+        queue_all(&engine).await[0].state,
+        queue::QueueState::Running
+    );
+    assert!(matches!(
+        engine.queue_drop(&queue::QueueTarget::All, true).await,
+        Err(CoreError::Refused(_))
+    ));
+    assert_eq!(
+        engine.tree.read().child(ROOT_INO, "new.txt").unwrap(),
+        Some(ino)
+    );
+    pause.release();
+    settle(&engine).await;
+}
+
+/// A step planned before the park or the drop must not start after it.
+#[tokio::test]
+async fn a_held_or_parked_entry_starts_no_step() {
+    let journal = Journal::new(&config().upload);
+    journal.touch(1);
+    journal.touch(2);
+    journal.park_by_user(&[1]);
+    journal.hold(&[2]).expect("hold");
+    assert!(!journal.start(1));
+    assert!(!journal.start(2));
+    assert!(journal.try_start_upload(1).is_none());
+    assert!(journal.try_start_upload(2).is_none());
+    journal.release(&[2]);
+    assert!(journal.start(2));
+    assert_eq!(journal.hold(&[1, 2]), Err(2));
+}
+
+#[tokio::test]
+async fn sync_of_a_folder_returns_after_that_subtree_alone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let (engine, docs) = queue_forced_only(&backend, dir.path()).await;
+    write_file(&engine, docs, "inside.txt", b"in");
+    write_file(&engine, ROOT_INO, "outside.txt", b"out");
+    let outcome = engine
+        .sync_path(Some("/docs"), Duration::from_secs(10))
+        .await
+        .expect("sync");
+    assert_eq!(outcome, queue::SyncOutcome::default());
+    let root = backend.root().await.expect("root").link_id;
+    let docs_link = remote_child(&backend, &root, "docs").await.link_id;
+    let names = |nodes: Vec<RemoteNode>| -> Vec<String> {
+        nodes.into_iter().map(|node| node.name).collect()
+    };
+    assert!(
+        names(backend.list_children(&docs_link).await.expect("list"))
+            .contains(&"inside.txt".to_owned())
+    );
+    assert!(
+        !names(backend.list_children(&root).await.expect("list"))
+            .contains(&"outside.txt".to_owned())
+    );
+    let left: Vec<String> = queue_all(&engine)
+        .await
+        .into_iter()
+        .map(|e| e.path)
+        .collect();
+    assert_eq!(left, ["/outside.txt"]);
+
+    // Without a path everything goes.
+    let outcome = engine
+        .sync_path(None, Duration::from_secs(10))
+        .await
+        .expect("sync");
+    assert_eq!(outcome, queue::SyncOutcome::default());
+    assert!(
+        names(backend.list_children(&root).await.expect("list"))
+            .contains(&"outside.txt".to_owned())
+    );
+}
+
+/// The folder a synced file needs is forced too, and when it is parked the
+/// sync says so at once instead of waiting for the timeout.
+#[tokio::test]
+async fn sync_reports_what_a_parked_entry_holds_up() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let (engine, _docs) = queue_forced_only(&backend, dir.path()).await;
+    let made = engine.mkdir(ROOT_INO, b"made", 0o755).expect("mkdir").ino;
+    engine
+        .queue_park(&queue::QueueTarget::Id(made))
+        .await
+        .expect("park");
+    write_file(&engine, made, "inner.txt", b"x");
+    let started = Instant::now();
+    let outcome = engine
+        .sync_path(Some("/made"), Duration::from_secs(60))
+        .await
+        .expect("sync");
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(outcome.pending, 1);
+    assert_eq!(
+        outcome.parked,
+        [("/made".to_owned(), "parked by user".to_owned())]
+    );
+    engine
+        .queue_retry(&queue_path("/made"))
+        .await
+        .expect("retry");
+    let outcome = engine
+        .sync_path(Some("/made"), Duration::from_secs(10))
+        .await
+        .expect("sync");
+    assert_eq!(outcome, queue::SyncOutcome::default());
+}
+
+#[tokio::test]
+async fn sync_gives_up_at_its_timeout() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let (engine, _docs) = queue_forced_only(&backend, dir.path()).await;
+    write_file(&engine, ROOT_INO, "new.txt", b"new");
+    let pause = backend.pause_at(FakePoint::NewBeforeCommit);
+    let outcome = engine
+        .sync_path(None, Duration::from_millis(300))
+        .await
+        .expect("sync");
+    assert_eq!(outcome.pending, 1);
+    pause.reached().await;
+    pause.release();
+    settle(&engine).await;
+}
+
+// ---- shutdown grace, read-only mounts, remote fsync paths (M4.12) ----
+
+async fn remote_names(backend: &FakeBackend) -> Vec<String> {
+    let root = backend.root().await.expect("root").link_id;
+    backend
+        .list_children(&root)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|node| node.name)
+        .collect()
+}
+
+/// A running upload finishes within the grace; nothing new starts. What did
+/// not start is still pending at the next mount.
+#[tokio::test]
+async fn shutdown_waits_for_a_running_upload_and_starts_nothing_new() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let (engine, _docs) = queue_forced_only(&backend, dir.path()).await;
+    let running = write_file(&engine, ROOT_INO, "running.txt", b"run");
+    let pause = backend.pause_at(FakePoint::NewBeforeCommit);
+    engine
+        .queue_retry(&queue::QueueTarget::Id(running))
+        .await
+        .expect("force");
+    pause.reached().await;
+    let later = write_file(&engine, ROOT_INO, "later.txt", b"later");
+    engine.stop_starting();
+    engine.journal.force(later);
+    let stopping = tokio::spawn({
+        let engine = Arc::clone(&engine);
+        async move { engine.shutdown().await }
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(!stopping.is_finished(), "it waits for the upload");
+    pause.release();
+    stopping.await.expect("join").expect("shutdown");
+    let names = remote_names(&backend).await;
+    assert!(names.contains(&"running.txt".to_owned()), "{names:?}");
+    assert!(!names.contains(&"later.txt".to_owned()), "{names:?}");
+    drop(engine);
+
+    let (engine, _docs) = queue_forced_only(&backend, dir.path()).await;
+    let left: Vec<String> = queue_all(&engine)
+        .await
+        .into_iter()
+        .map(|e| e.path)
+        .collect();
+    assert_eq!(left, ["/later.txt"]);
+    settle(&engine).await;
+    assert!(
+        remote_names(&backend)
+            .await
+            .contains(&"later.txt".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn shutdown_gives_up_on_a_running_upload_after_the_grace() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let mut config = config();
+    config.upload.debounce = HumanDuration(Duration::from_secs(3600));
+    config.timeouts.shutdown_grace = HumanDuration(Duration::from_millis(200));
+    let (engine, _inval) = open_with(&backend, dir.path(), config).await;
+    engine.start_background();
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    let ino = write_file(&engine, ROOT_INO, "slow.txt", b"slow");
+    let pause = backend.pause_at(FakePoint::NewBeforeCommit);
+    engine.journal.force(ino);
+    pause.reached().await;
+    let started = Instant::now();
+    engine.shutdown().await.expect("shutdown");
+    assert!(started.elapsed() >= Duration::from_millis(200));
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(engine.queue_counts().in_flight, 1);
+    assert!(
+        !remote_names(&backend)
+            .await
+            .contains(&"slow.txt".to_owned())
+    );
+    pause.release();
+}
+
+#[tokio::test]
+async fn a_read_only_engine_refuses_writes_and_uploads_what_is_pending() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let (top, docs) = {
+        let (engine, _inval, docs) = queue_held(&backend, dir.path()).await;
+        write_file(&engine, ROOT_INO, "pending.txt", b"pending");
+        let top = found(engine.lookup(ROOT_INO, b"top.bin").expect("lookup")).ino;
+        engine.shutdown().await.expect("shutdown");
+        (top, docs)
+    };
+    let mut options =
+        EngineOptions::in_dir(dir.path(), config(), test_device("dev-a"), fixed_clock());
+    options.read_only = true;
+    let (engine, _inval) = Engine::open(Arc::new(backend.clone()), options)
+        .await
+        .expect("engine");
+    engine.start_background();
+    let ro = |result: Result<()>| assert!(matches!(result, Err(CoreError::ReadOnly)), "{result:?}");
+    ro(engine
+        .create(ROOT_INO, b"new", 0o644, true, WRITE)
+        .map(|_| ()));
+    ro(engine.mkdir(ROOT_INO, b"made", 0o755).map(|_| ()));
+    ro(engine.unlink(ROOT_INO, b"top.bin"));
+    ro(engine.rmdir(ROOT_INO, b"docs"));
+    ro(engine.rename(ROOT_INO, b"top.bin", docs, b"t", RenameMode::Replace));
+    ro(engine.open_file(top, WRITE).map(|_| ()));
+    ro(engine.access(top, MAY_WRITE));
+    ro(engine
+        .setattr(
+            top,
+            &SetAttr {
+                mode: Some(0o640),
+                ..SetAttr::default()
+            },
+        )
+        .map(|_| ()));
+    assert_eq!(engine.getattr(top).expect("attr").perm & 0o222, 0);
+    assert_eq!(read_file(&engine, top).await, b"0123456789");
+    settle(&engine).await;
+    assert!(
+        remote_names(&backend)
+            .await
+            .contains(&"pending.txt".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn remote_fsync_paths_select_by_the_path_from_the_mount_root() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let mut config = config();
+    config.fsync.remote_paths = vec!["/docs/**".to_owned()];
+    let (engine, _inval) = open_with(&backend, dir.path(), config).await;
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    let docs = found(engine.lookup(ROOT_INO, b"docs").expect("lookup")).ino;
+    engine.ensure_listed(docs).await.expect("list");
+    let inside = write_file(&engine, docs, "x", b"x");
+    let outside = write_file(&engine, ROOT_INO, "y", b"y");
+    assert!(engine.fsync_is_remote(inside));
+    assert!(!engine.fsync_is_remote(outside));
+    // The path at fsync time counts.
+    engine
+        .rename(docs, b"x", ROOT_INO, b"z", RenameMode::NoReplace)
+        .expect("rename");
+    assert!(!engine.fsync_is_remote(inside));
+}
+
+#[tokio::test]
+async fn the_last_event_poll_is_known() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let (engine, _inval, _docs) = queue_held(&backend, dir.path()).await;
+    assert_eq!(engine.events_last_poll(), None);
+    engine.sync_events().await.expect("events");
+    assert!(engine.events_last_poll().is_some());
+}
+
+#[tokio::test]
+async fn queue_drop_leaves_a_local_only_file_alone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let (engine, _inval, _docs) = queue_held(&backend, dir.path()).await;
+    let ino = write_file(&engine, ROOT_INO, "only-here.log", b"no other copy");
+    engine.tree.write().get_mut(ino).expect("node").local_only = true;
+    engine.journal.touch(ino);
+
+    let dropped = engine
+        .queue_drop(&queue::QueueTarget::All, true)
+        .await
+        .expect("drop");
+    assert!(dropped.iter().all(|item| item.id != ino), "{dropped:?}");
+    assert_eq!(read_file(&engine, ino).await, b"no other copy");
+}
+
+#[tokio::test]
+async fn a_step_of_a_dropped_entry_does_not_start() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let (engine, _inval, _docs) = queue_held(&backend, dir.path()).await;
+    assert!(!engine.journal.start(9_999_999), "no entry, nothing to run");
+}
+
+/// A file of two staging blocks, staged with the first replaced, so the
+/// second still comes from the base.
+async fn partly_staged(backend: &FakeBackend, dir: &std::path::Path) -> (Arc<Engine>, Ino) {
+    let root = backend.root().await.expect("root").link_id;
+    backend.set_block_size(crate::staging::GRID as usize);
+    backend
+        .upload_new(
+            &root,
+            "big.bin",
+            UploadSource::Bytes(Bytes::from(vec![b'r'; crate::staging::GRID as usize + 11])),
+            meta(),
+        )
+        .await
+        .expect("upload");
+    let (engine, _inval, _docs) = queue_held(backend, dir).await;
+    let ino = found(engine.lookup(ROOT_INO, b"big.bin").expect("lookup")).ino;
+    let write = OpenMode {
+        read: true,
+        write: true,
+        truncate: false,
+    };
+    let (handle, _) = engine.open_file(ino, write).expect("open");
+    // A whole block: nothing is fetched, so nothing is read ahead either.
+    engine
+        .write_local(handle, 0, &vec![b'X'; crate::staging::GRID as usize])
+        .expect("write");
+    engine.release_file(handle);
+    (engine, ino)
+}
+
+#[tokio::test]
+async fn a_read_across_a_replaced_staging_reads_the_current_content() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let (engine, ino) = partly_staged(&backend, dir.path()).await;
+    let (handle, _) = engine.open_file(ino, READ).expect("open");
+    backend.set_latency(Duration::from_millis(500));
+    // One byte of the staging file, and one of the base, still to fetch.
+    let reader = {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move {
+            engine
+                .read(handle, crate::staging::GRID - 1, 2)
+                .await
+                .map(ReadData::into_vec)
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    engine
+        .queue_drop(&queue::QueueTarget::Id(ino), true)
+        .await
+        .expect("drop");
+    overwrite(&engine, ino, b"Y");
+    let read = reader.await.expect("reader");
+    assert_eq!(read.expect("read"), b"", "the file is one byte long now");
+}
+
+#[tokio::test]
+async fn a_late_materialize_does_not_write_into_a_newer_staging() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let (engine, ino) = partly_staged(&backend, dir.path()).await;
+    backend.set_latency(Duration::from_millis(500));
+    let late = {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move { engine.materialize(ino, &[1], Priority::Interactive).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    engine
+        .queue_drop(&queue::QueueTarget::Id(ino), true)
+        .await
+        .expect("drop");
+    overwrite(&engine, ino, b"Y");
+    late.await.expect("task").expect("materialize");
+    let on_disk = std::fs::metadata(engine.staging.data_path(ino)).expect("staging");
+    assert_eq!(
+        on_disk.len(),
+        1,
+        "the old staging's block went into the new file"
+    );
+    backend.set_latency(Duration::ZERO);
+    assert_eq!(read_file(&engine, ino).await, b"Y");
 }

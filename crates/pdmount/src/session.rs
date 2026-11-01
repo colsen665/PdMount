@@ -2,7 +2,9 @@
 //! (DESIGN.md §12).
 
 use crate::credentials::{self, Credentials, Storage};
+use crate::secret_cache::SecretCache;
 use anyhow::Context;
+use pdmount_backend::BackendError;
 use pdmount_backend::proton::ProtonBackend;
 use pdmount_core::config::BrowserMode;
 use pdmount_core::device::{self, DeviceIdentity};
@@ -37,11 +39,13 @@ fn client_options(
     credentials: &Credentials<'_, credentials::OsKeyring>,
 ) -> anyhow::Result<ProtonClientOptions> {
     let key = credentials.cache_master_key()?;
-    let open = |path: &std::path::Path, capacity| -> anyhow::Result<Arc<dyn CacheRepository>> {
+    let open = |path: &std::path::Path,
+                capacity: Option<usize>|
+     -> anyhow::Result<Arc<dyn CacheRepository>> {
         if let Some(parent) = path.parent() {
             credentials::create_private_dir(parent)?;
         }
-        let sqlite = SqliteCacheRepository::open_file(path, Some(capacity))
+        let sqlite = SqliteCacheRepository::open_file(path, capacity)
             .with_context(|| format!("cannot open cache {}", path.display()))?;
         restrict_to_owner(path);
         Ok(Arc::new(EncryptedCacheRepository::new(
@@ -49,9 +53,11 @@ fn client_options(
             key.clone(),
         )))
     };
+    let secrets = open(&paths.sdk_secret_cache(), Some(5_000))?;
+    let keys = open(&paths.sdk_key_store(), None)?;
     Ok(ProtonClientOptions {
-        entity_cache_repository: Some(open(&paths.sdk_entity_cache(), 10_000)?),
-        secret_cache_repository: Some(open(&paths.sdk_secret_cache(), 5_000)?),
+        entity_cache_repository: Some(open(&paths.sdk_entity_cache(), Some(10_000))?),
+        secret_cache_repository: Some(Arc::new(SecretCache::new(secrets, keys))),
         ..Default::default()
     })
 }
@@ -244,20 +250,51 @@ pub fn device_identity(paths: &ProfilePaths, config: &Config) -> anyhow::Result<
     })
 }
 
+/// Transfers a drive client runs at once, per direction (D033, D058).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferLimits {
+    /// Whole files: `upload.concurrency` (1-4).
+    pub files: usize,
+    /// Blocks over all files: one below the official C# SDK's 6.
+    pub blocks: usize,
+}
+
+impl TransferLimits {
+    pub const BLOCKS: usize = 5;
+
+    pub fn of(config: &Config) -> Self {
+        Self {
+            files: config.upload.concurrency as usize,
+            blocks: Self::BLOCKS,
+        }
+    }
+
+    /// Sets the limits on a client being built. The SDK has no getters for
+    /// them; the fork's `block_transfer_parallelism_applies_to_uploads_and_downloads`
+    /// tests these two builders (P7, P18).
+    pub fn apply(self, client: ProtonDriveClient) -> ProtonDriveClient {
+        client
+            .with_max_concurrent_file_transfers(self.files)
+            .with_block_transfer_parallelism(self.blocks)
+    }
+}
+
 /// The drive client of a session, with this device's client uid.
 pub fn drive_client(
     session: &ProtonAPISession,
     device: &DeviceIdentity,
+    limits: TransferLimits,
 ) -> anyhow::Result<ProtonDriveClient> {
-    ProtonDriveClient::new(session, Some(device.client_uid()))
+    Ok(limits.apply(ProtonDriveClient::new(session, Some(device.client_uid()))?))
 }
 
 /// Drive client and backend of a signed-in session.
 pub async fn proton_backend(
     logged_in: &LoggedIn,
     device: &DeviceIdentity,
+    limits: TransferLimits,
 ) -> anyhow::Result<ProtonBackend> {
-    let client = drive_client(&logged_in.session, device)?;
+    let client = drive_client(&logged_in.session, device, limits)?;
     Ok(ProtonBackend::new(
         client,
         logged_in.session.token_credential.clone(),
@@ -307,8 +344,9 @@ pub fn proton_backend_offline(
     logged_in: &LoggedIn,
     device: &DeviceIdentity,
     known: &KnownRoot,
+    limits: TransferLimits,
 ) -> anyhow::Result<ProtonBackend> {
-    let client = drive_client(&logged_in.session, device)?;
+    let client = drive_client(&logged_in.session, device, limits)?;
     Ok(ProtonBackend::with_root(
         client,
         logged_in.session.token_credential.clone(),
@@ -374,6 +412,18 @@ pub fn is_session_rejected(error: &anyhow::Error) -> bool {
         .is_some_and(TokenRefreshError::is_refresh_token_expired)
 }
 
+/// Whether a call on a session that resumed failed because only a new login
+/// can help: the server rejected it, or its keys cannot be unlocked (D085).
+pub fn needs_login(error: &anyhow::Error) -> bool {
+    is_session_rejected(error)
+        || error.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<BackendError>(),
+                Some(BackendError::Unauthorized)
+            )
+        })
+}
+
 /// Ends the session on the server (best effort) and removes local secrets.
 pub async fn logout(paths: &ProfilePaths) -> anyhow::Result<LogoutOutcome> {
     let credentials = Credentials::new(paths);
@@ -406,7 +456,11 @@ fn remove_local_state(
     credentials: &Credentials<'_, credentials::OsKeyring>,
 ) -> anyhow::Result<()> {
     let removed = credentials.remove();
-    for cache in [paths.sdk_secret_cache(), paths.sdk_entity_cache()] {
+    for cache in [
+        paths.sdk_secret_cache(),
+        paths.sdk_key_store(),
+        paths.sdk_entity_cache(),
+    ] {
         for path in pdmount_core::paths::sqlite_files(&cache) {
             let _ = std::fs::remove_file(path);
         }
@@ -417,6 +471,28 @@ fn remove_local_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_unauthorized_backend_means_a_new_login() {
+        let locked = anyhow::Error::from(BackendError::Unauthorized).context("status");
+        assert!(needs_login(&locked));
+        assert!(!needs_login(&anyhow::Error::from(BackendError::NotFound)));
+        assert!(!needs_login(&anyhow::anyhow!("other")));
+    }
+
+    #[test]
+    fn transfer_limits_stay_below_the_official_sdks() {
+        let mut config = Config::default();
+        assert_eq!(
+            TransferLimits::of(&config),
+            TransferLimits {
+                files: 4,
+                blocks: 5
+            }
+        );
+        config.upload.concurrency = 2;
+        assert_eq!(TransferLimits::of(&config).files, 2);
+    }
 
     #[test]
     fn browser_opens_only_when_asked_or_in_an_interactive_desktop() {

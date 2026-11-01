@@ -25,8 +25,11 @@ dirs = "6"
 futures = "0.3"
 fuser = "0.18"
 globset = "0.4"
+hdrhistogram = { version = "7.6", default-features = false }
 hex = "0.4"
 keyring = { version = "3.6", features = ["linux-native", "sync-secret-service"] }
+# Test only: the SDK logs through `log`, bridged into tracing.
+log = "0.4"
 lru = "0.16"
 nix = { version = "0.30", features = ["fs", "mman", "resource", "signal", "user"] }
 parking_lot = "0.12"
@@ -46,6 +49,7 @@ thiserror = "2.0"
 tokio = { version = "1.51", features = ["full"] }
 toml = "0.9"
 tracing = "0.1"
+tracing-log = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 
@@ -60,8 +64,8 @@ unwrap_used = "warn"
 # The community SDK is used through a patched fork (decisions D002, D022).
 # Patches and their status: docs/sdk-patches.md.
 [patch.crates-io]
-proton-drive-sdk = { git = "https://github.com/colsen665/proton-sdk-rs2", rev = "c837e031507686d782777c6d15ce9dfc57f2baf8" }
-proton-sdk-rs2 = { git = "https://github.com/colsen665/proton-sdk-rs2", rev = "c837e031507686d782777c6d15ce9dfc57f2baf8" }
+proton-drive-sdk = { git = "https://github.com/colsen665/proton-sdk-rs2", rev = "caafaea683116e71957d8e6b86de1450afc97ac1" }
+proton-sdk-rs2 = { git = "https://github.com/colsen665/proton-sdk-rs2", rev = "caafaea683116e71957d8e6b86de1450afc97ac1" }
 
 [profile.dev]
 panic = "unwind"

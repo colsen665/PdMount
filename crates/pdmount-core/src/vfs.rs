@@ -1912,6 +1912,40 @@ impl Tree {
         Some(())
     }
 
+    /// `queue drop` of a node that never reached the server: it leaves with
+    /// its subtree (D061).
+    pub fn remove_never_uploaded(&mut self, top: Ino) -> Changes {
+        let ((), changes) = self.mutate(|tree, fx| {
+            if let Some(parent) = tree.nodes.get(&top).map(|node| node.parent) {
+                tree.name_freed(top, parent);
+            }
+            tree.remove_subtree(fx, top);
+        });
+        changes
+    }
+
+    /// `queue drop`: the file goes back to its known remote revision and
+    /// attributes. `false` without a remote node.
+    pub fn revert_to_remote(&mut self, ino: Ino) -> bool {
+        let Some(node) = self.nodes.get_mut(&ino) else {
+            return false;
+        };
+        let Some(remote) = node.remote.clone() else {
+            return false;
+        };
+        if node.kind == NodeKind::File {
+            node.adopt_remote_attrs(&remote);
+            node.atime = None;
+            node.content = Content::of(&remote);
+            node.content_epoch += 1;
+        }
+        node.gens.uploaded_content = node.gens.content;
+        node.gens.uploaded_meta = node.gens.meta;
+        node.deferred_error = None;
+        node.remote_newer = false;
+        true
+    }
+
     /// The subtree at `top` was removed remotely: keeps only the pending
     /// items and the folders that lead to them, as nodes to create again
     /// (no remote state), and removes the rest (§10.5). `top` is never the

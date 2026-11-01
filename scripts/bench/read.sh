@@ -29,12 +29,14 @@ export PDMOUNT=${PDMOUNT:-$repo/target/release/pdmount}
 export PROFILE=${PROFILE:-fake-bench-read}
 # shellcheck source=../../tests/scenarios/lib.sh
 source "$repo/tests/scenarios/lib.sh"
+private_root "$FAKE_DIR"
 if [[ ! -f "$FAKE_DIR/.seeded-$file_mib" ]]; then
     if is_mounted; then pd unmount "$MNT" >/dev/null; fi
     seed=$(mktemp -d)
     mkdir -p "$seed/pdmount-test/bench-read"
     head -c "$((file_mib << 20))" /dev/urandom >"$seed/pdmount-test/bench-read/data.bin"
-    rm -rf "$FAKE_DIR"
+    remove_fake_dir "$FAKE_DIR"
+    private_root "$FAKE_DIR"
     "$PDMOUNT" fake seed --from "$seed" "$FAKE_DIR" >/dev/null
     rm -rf "$seed"
     touch "$FAKE_DIR/.seeded-$file_mib"

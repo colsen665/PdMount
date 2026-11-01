@@ -43,6 +43,38 @@
 set -euo pipefail
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+
+# A directory only this user can enter: created 0700, refused when it is a
+# symlink or another user's, since another user can create any name in
+# /dev/shm first (S-8). Also used for the soak and bench roots.
+private_root() { # <dir>
+    # Only the root itself must be private; parents keep their modes.
+    # shellcheck disable=SC2174
+    mkdir -p -m 0700 "$1"
+    if [[ -L $1 || ! -O $1 ]]; then
+        echo "refusing $1: it is a symlink or belongs to another user" >&2
+        exit 1
+    fi
+    chmod 0700 "$1"
+}
+
+# Removes a fake drive, and nothing else: an empty directory or one with the
+# fake's own layout (snapshot.json, or a .seeded* marker). FAKE_DIR may be
+# set to any directory (S-7).
+remove_fake_dir() { # <dir>
+    local dir=$1
+    [[ -e $dir || -L $dir ]] || return 0
+    if [[ -L $dir || ! -d $dir ]]; then
+        echo "refusing to remove FAKE_DIR=$dir: not a directory" >&2
+        exit 1
+    fi
+    if [[ -n $(ls -A "$dir") && ! -f $dir/snapshot.json ]] && ! compgen -G "$dir/.seeded*" >/dev/null; then
+        echo "refusing to remove FAKE_DIR=$dir: not empty and not a fake drive (no snapshot.json or .seeded* marker)" >&2
+        exit 1
+    fi
+    rm -rf "$dir"
+}
+
 BACKEND=${BACKEND:-proton}
 VERIFY_MODE=${VERIFY_MODE:-live}
 # Test data lives in tmpfs when there is one, to spare the disks.
@@ -53,7 +85,7 @@ if [[ -z "${SCENARIO_ROOT:-}" ]]; then
         SCENARIO_ROOT=$HOME/.cache/pdmount-scenarios
     fi
 fi
-mkdir -p "$SCENARIO_ROOT"
+private_root "$SCENARIO_ROOT"
 case $BACKEND in
     proton)
         PROFILE=${PROFILE:-default}
@@ -141,10 +173,15 @@ kill_daemon() {
     while kill -0 "$pid" 2>/dev/null; do sleep 0.1; done
 }
 
+# Only the generator's own output, $DATASET/pdmount-m1, is ever removed:
+# DATASET may be set to any directory (S-7).
 ensure_dataset() {
     if [[ ! -f "$LOCAL/MANIFEST.sha256" ]]; then
+        if [[ -d $DATASET && ! -e $LOCAL && -n $(ls -A "$DATASET") ]]; then
+            fail "DATASET=$DATASET is not empty and holds no pdmount-m1; set DATASET to a new or empty directory"
+        fi
         step "generating the local dataset in $DATASET"
-        rm -rf "$DATASET"
+        rm -rf "$LOCAL"
         mkdir -p "$DATASET"
         "$repo/scripts/testdata/make-m1-dataset.sh" "${dataset_flags[@]}" "$DATASET"
     fi
@@ -161,7 +198,7 @@ ensure_fake_drive() {
         if is_mounted; then pd unmount "$MNT"; fi
         if is_mounted_second; then pd2 unmount "$MNT2"; fi
         ensure_dataset
-        rm -rf "$FAKE_DIR"
+        remove_fake_dir "$FAKE_DIR"
         "$PDMOUNT" fake seed --from "$DATASET" "$FAKE_DIR"
         touch "$FAKE_DIR/.seeded-m1"
         pd reset --keep-login >/dev/null

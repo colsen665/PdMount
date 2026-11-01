@@ -6,6 +6,7 @@ use anyhow::Context;
 use anyhow::bail;
 use pdmount_core::ProfilePaths;
 use pdmount_core::config::AccessMode;
+use pdmount_core::engine::queue::{QueueEntry, QueueState, QueueTarget};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -26,7 +27,12 @@ const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 pub enum Request {
     Ping,
     Status,
-    Stats,
+    /// Counters, gauges and latencies; `reset` clears the latency
+    /// histograms after reading them.
+    Stats {
+        #[serde(default)]
+        reset: bool,
+    },
     /// Start a web login in the daemon and answer with its link (D042).
     Login,
     /// Upload everything pending, then answer (`unmount --wait`).
@@ -61,6 +67,43 @@ pub enum Request {
         target: String,
         choice: pdmount_core::conflicts::Resolution,
     },
+    /// Pins (DESIGN.md §5.3); paths are relative to the mount root.
+    PinSet {
+        path: String,
+    },
+    PinUnset {
+        path: String,
+    },
+    PinList,
+    /// The journal (DESIGN.md §8.2, D061).
+    QueueList {
+        target: QueueTarget,
+    },
+    QueueRetry {
+        target: QueueTarget,
+    },
+    QueuePark {
+        target: QueueTarget,
+    },
+    /// Without `yes` it only says what it would discard.
+    QueueDrop {
+        target: QueueTarget,
+        yes: bool,
+    },
+    /// Remote barrier (§5.6); `path` is relative to the mount root.
+    Sync {
+        path: Option<String>,
+        timeout_secs: u64,
+    },
+    /// The block cache (DESIGN.md §14.2).
+    CacheStats,
+    CacheGc {
+        target: Option<u64>,
+    },
+    /// `path` is relative to the mount root; `None`: the whole cache.
+    CacheWipe {
+        path: Option<String>,
+    },
 }
 
 // A reply is `{"ok": true, ...}` with the fields of the request's reply type
@@ -80,6 +123,13 @@ pub struct StatusReply {
     pub mountpoint: PathBuf,
     pub queue_pending: u64,
     pub queue_parked: u64,
+    /// How long the oldest pending entry has been dirty.
+    pub queue_oldest_secs: Option<u64>,
+    /// How long ago the event stream was last read to its end.
+    pub events_last_poll_secs: Option<u64>,
+    pub events_refreshing: bool,
+    /// `mount -o ro`.
+    pub read_only: bool,
     /// Conflicts waiting for the user.
     pub conflicts: u64,
     pub connectivity: pdmount_core::health::Connectivity,
@@ -98,6 +148,16 @@ pub struct StatusReply {
     pub inodes: u64,
     pub cache_bytes: u64,
     pub cache_blocks: u64,
+    /// `None` without pins.
+    pub pinned: Option<PinnedReply>,
+}
+
+/// All pins together, in `StatusReply`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct PinnedReply {
+    pub paths: u64,
+    pub fetched_bytes: u64,
+    pub total_bytes: u64,
 }
 
 /// `Login`.
@@ -202,6 +262,21 @@ pub struct StatsReply {
     /// By name, as `Metrics` counts them.
     pub counters: std::collections::BTreeMap<String, u64>,
     pub pool: Vec<PoolClassReply>,
+    /// Current values, by name (`Engine::gauges`).
+    pub gauges: std::collections::BTreeMap<String, u64>,
+    /// Operations recorded since the last reset, in `Op` order.
+    pub latency: Vec<LatencyReply>,
+}
+
+/// One latency histogram, in µs (DESIGN.md §5.8).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LatencyReply {
+    pub name: String,
+    pub count: u64,
+    pub p50_us: u64,
+    pub p90_us: u64,
+    pub p99_us: u64,
+    pub max_us: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -210,6 +285,126 @@ pub struct PoolClassReply {
     pub class: String,
     pub slots: usize,
     pub in_use: usize,
+}
+
+/// `PinList`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PinListReply {
+    pub pins: Vec<PinReply>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PinReply {
+    /// `None`: not reachable right now.
+    pub path: Option<String>,
+    pub set_as: String,
+    pub files: u64,
+    pub fetched_bytes: u64,
+    pub total_bytes: u64,
+    /// `fetching`, `complete`, `waiting-offline` or `waiting-space`.
+    pub state: String,
+}
+
+/// `QueueList`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct QueueListReply {
+    pub entries: Vec<QueueEntryReply>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct QueueEntryReply {
+    pub id: u64,
+    pub path: String,
+    pub kind: String,
+    /// `waiting`, `running`, `backoff` or `parked`.
+    pub state: String,
+    /// Unix seconds when a back-off ends.
+    pub until: Option<i64>,
+    pub reason: Option<String>,
+    pub attempts: u32,
+    pub age_secs: u64,
+    pub last_error: Option<String>,
+    pub base_rev: Option<String>,
+    pub dependencies: Vec<String>,
+}
+
+impl From<QueueEntry> for QueueEntryReply {
+    fn from(entry: QueueEntry) -> Self {
+        let (state, until, reason) = match entry.state {
+            QueueState::Waiting => ("waiting", None, None),
+            QueueState::Running => ("running", None, None),
+            QueueState::Backoff { until } => {
+                let until = until
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_secs() as i64);
+                ("backoff", Some(until), None)
+            }
+            QueueState::Parked { reason } => ("parked", None, Some(reason)),
+        };
+        Self {
+            id: entry.id,
+            path: entry.path,
+            kind: entry.kind.as_str().to_owned(),
+            state: state.to_owned(),
+            until,
+            reason,
+            attempts: entry.attempts,
+            age_secs: entry.age.as_secs(),
+            last_error: entry.last_error,
+            base_rev: entry.base_rev,
+            dependencies: entry.dependencies,
+        }
+    }
+}
+
+/// `QueueRetry` and `QueuePark`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct QueueActedReply {
+    /// Id and path.
+    pub items: Vec<(u64, String)>,
+}
+
+/// `QueueDrop`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct QueueDropReply {
+    pub items: Vec<QueueDropItem>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct QueueDropItem {
+    pub id: u64,
+    pub path: String,
+    pub effect: String,
+    pub refused: Option<String>,
+}
+
+/// `Sync`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SyncReply {
+    pub pending: u64,
+    /// Path and reason.
+    pub parked: Vec<(String, String)>,
+}
+
+/// `CacheStats`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CacheStatsReply {
+    /// Against `max_bytes`; pinned blocks are apart.
+    pub bytes: u64,
+    pub max_bytes: u64,
+    pub blocks: u64,
+    pub pinned_bytes: u64,
+    pub protected_revisions: u64,
+    pub pool: Vec<PoolClassReply>,
+}
+
+/// `CacheGc` and `CacheWipe`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CacheFreedReply {
+    pub blocks: u64,
+    pub bytes: u64,
+    /// Against the cap, afterwards.
+    pub left_bytes: u64,
 }
 
 /// `Unmount`, and requests that answer only whether they worked.
@@ -414,11 +609,15 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
-        let response = call(&socket, Request::Stats, Duration::from_secs(5))
-            .await
-            .expect("call")
-            .expect("daemon");
-        assert_eq!(response["echo"], "Stats");
+        let response = call(
+            &socket,
+            Request::Stats { reset: true },
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("call")
+        .expect("daemon");
+        assert_eq!(response["echo"], "Stats { reset: true }");
         server.abort();
     }
 

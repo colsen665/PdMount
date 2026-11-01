@@ -24,12 +24,17 @@ Status, the next action, open questions and handoff notes are in **`TODO.md`**.
 
 | File | Use it for |
 |---|---|
-| `TODO.md` | Status, next action, milestone and task checklist, open questions (Q*), handoff notes |
+| `TODO.md` | Status, next action, milestone and task checklist, open questions (Q*), handoff notes, known gaps |
+| `docs/handoff-log.md` | Full handoff history, one entry per session, newest first; M0–M3 checklists. Not read at session start |
 | `docs/decisions.md` | Decision log (D*): what was decided, by whom, and why |
 | `DESIGN.md` | The specification |
+| `docs/user-guide.md` | The user guide: task-oriented, points to `DESIGN.md` for reference |
 | `docs/sdk-patches.md` | SDK fork patches P1–P13: targets, fixes, upstream tracking |
 | `docs/pdcli-evaluation.md` | Why the project is not a pdcli fork; what is reused from it |
 | `docs/plans/m3.md` | M3 task specifications (D039); work one task per session, status stays in `TODO.md` |
+| `docs/plans/m4.md` | M4 task specifications (D056); one task or a recommended batch per session, status stays in `TODO.md` |
+| `docs/plans/m5.md`, `docs/plans/m6.md` | M5 (D074–D076, D078–D081) and M6 (D077) task specifications; status stays in `TODO.md` |
+| `docs/security/` | Threat model (D070) and security review reports (`<date>-review/`: area reports, `verification.md`) |
 
 `DESIGN.md` sections:
 
@@ -41,7 +46,7 @@ Status, the next action, open questions and handoff notes are in **`TODO.md`**.
 | 4 | Concurrency (fuser facts, hot/slow path, locking) | 13 | Storage paths, SQLite schema |
 | 5 | Low latency: caching, fsync modes, SLOs | 14 | CLI commands, control socket, unmount safety |
 | 6 | Read path: block map, cache, integrity | 15 | Tests: layers, rsync/git semantics, scenarios R/G/N/A/M |
-| 7 | Write path: staging, upload job, atomic-save rename, `.pdignore` | 16 | Milestones M0–M5 and exit criteria |
+| 7 | Write path: staging, upload job, atomic-save rename, `.pdignore` | 16 | Milestones M0–M7 and exit criteria |
 | 8 | Namespace ops: journal, rename flags, setattr, unsupported ops | 17 | Risks |
 | 9 | Sync engine: events, refresh, invalidation, offline | App. A/B | errno mapping, config reference |
 
@@ -51,7 +56,8 @@ Status, the next action, open questions and handoff notes are in **`TODO.md`**.
   Entries with `proposed` / `claude` are open for review.
 - **Keeping documents in sync:** every design change updates `DESIGN.md`, `docs/decisions.md` (new or superseding entry) and
   `TODO.md` in the same commit.
-- **End of every session:** update `TODO.md`: the "Last updated" line, the Next action, the checkboxes, and a rewrite of Handoff notes.
+- **End of every session:** update `TODO.md`: the "Last updated" line, the Next action, the checkboxes, and a rewrite of Handoff notes
+  (current state and standing notes only, kept short). Add the session's full entry at the top of `docs/handoff-log.md`.
 - **Single source of truth:** each fact lives in one place. Specifications go in `DESIGN.md`, reasons in `docs/decisions.md`, status in
   `TODO.md`. This file and `README.md` only point to them.
 - **Conventions (accepted):**
@@ -82,8 +88,12 @@ scratchpad directory that depends on the exact versions and run `cargo fetch`. T
 - Remote: `origin` = a local bare repo, branch `master`, until the user says otherwise.
 - **No GitHub use** (repos, forks, PRs, issues, Actions) until the user says otherwise (D023).
 - SDK fork: `<fork>` (local bare repo, D022). See docs/sdk-patches.md, "Fork repository".
-- Commit or push only when the user asks. Exception during M3 (D039): commit after each task of `docs/plans/m3.md`
-  once `scripts/ci.sh` passes, one commit per task, message `M3.n: <title>`; never push.
+- Commit or push only when the user asks. Exception during M3 (D039) and M4 (D056): commit after each task of
+  `docs/plans/m3.md` / `docs/plans/m4.md` once CI passes (next bullet), one commit per task, message `M3.n: <title>` /
+  `M4.n: <title>`; never push. In M4 a session may do several tasks (the plan's "Sessions" table), each its own commit.
+- **Which CI (D084):** `scripts/ci.sh --quick` before a commit by default, plus any scenario the task adds or changes. The full run for
+  tasks marked `[full]` in `TODO.md`, or any that touch the journal, engine, tree, staging, store, cache, events, FUSE layer, backend
+  adapters, the daemon's start or stop, or the scenario harness. Nothing goes to `master` until a full run has passed on what is pushed.
 - Author: the repository's local git config (`user.name=Claus`, `user.email=colsen665@proton.me`), set for the sandbox user.
 - Commit message trailer: the `Co-Authored-By` line of the model that made the change, e.g.
   `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
@@ -101,23 +111,26 @@ scratchpad directory that depends on the exact versions and run `cargo fetch`. T
 
 ## Commands
 
-- `scripts/ci.sh`: local CI (fmt, clippy `-D warnings`, tests, release build). Run it before every commit.
-  `scripts/ci.sh --quick` skips the release build.
+- `scripts/ci.sh`: local CI (fmt, clippy `-D warnings`, tests, release build, scenarios; about 35 min).
+  `scripts/ci.sh --quick` skips the release build and the scenarios. Which to run: Git, "Which CI".
 - `cargo test --workspace` / `cargo test -p pdmount-backend fake`: tests only.
 - `cargo run -p pdmount -- doctor | status | login [--browser|--no-browser] | logout`, with `--profile <name>` to select a profile
   and, as the sandbox user, `--force-file-secrets` (D029).
-- `pdmount mount [--foreground] [<mnt>] | unmount [--force] [<mnt>] | stats | reset --keep-login | trash empty --yes`
+- `pdmount mount [--foreground] [<mnt>] | unmount [--force] [<mnt>] | stats [--json] [--reset] | reset --keep-login | trash empty --yes`
   (D036). The daemon logs to `~/.local/state/pdmount/<profile>.log`.
 - `scripts/repro/keyring-d024.sh [case ...]`: keyring tests (D024 hang, D029 modes) against gnome-keyring in a private D-Bus
   session (about 2 min). Not part of `scripts/ci.sh`.
 - `scripts/testdata/make-m1-dataset.sh <dir>`: the deterministic M1 dataset (upload it with the official client).
 - Scenario scripts: `[BACKEND=fake] VERIFY_MODE=live|remount|crash|fresh tests/scenarios/<name>.sh` (R1–R7 `r1`…`r7`, G1–G7
-  `g1`…`g7` plus `g6_read`, `n1`, `a1`…`a6`, `e1`, `sha`, `kill9`); `tests/scenarios/run-all.sh [names]` runs a matrix
+  `g1`…`g7` plus `g6_read`, `n1`, `a1`…`a6`, `e1`, `sha`, `queue`, `ops`, `kill9`); `tests/scenarios/run-all.sh [names]` runs a matrix
   (`MODES`, `SCENARIOS`; `STOP_ON`, default `429,fail` on the real account, none on the fake; `TRASH_MIN_FREE`, D036).
   The default backend is the real account; `BACKEND=fake` needs `cargo build -p pdmount --features fake-backend` and
   keeps its profile, mountpoint and fake drive in tmpfs under `SCENARIO_ROOT` (default `/dev/shm/pdmount-tests`).
   Writes go only to `<mount>/pdmount-test/<scenario>` (D028). Sizes: `R_FILES`, `R_BIG_MIB`, `G3_COMMITS`,
-  `G4_BLOBS`. `second` follows in M3.
+  `G4_BLOBS`.
+  The scripts remove only their own output: a non-empty `DATASET` without `pdmount-m1/`, or a `FAKE_DIR` that is not
+  a fake drive (`snapshot.json` or a `.seeded*` marker), is refused; `SCENARIO_ROOT` and the bench `FAKE_DIR`s are
+  made 0700 and refused when they are a symlink or another user's (`tests/scenarios/selftest-lib.sh`, run by `scripts/ci.sh`).
 - `tests/pjdfstest.sh [<dir>/<nn>.t | <dir> ...]`: the pjdfstest subset on the fake (about 75 s); expected failures in
   `tests/pjdfstest.list`. `FSX_DURATION=<s> tests/fsx.sh`: fsx with mmap on the fake (default 6 h). Both use the scenario
   setup (`SCENARIO_ROOT`, `PROFILE`); give a long fsx run its own `SCENARIO_ROOT` and `PROFILE` so other fake runs can
@@ -130,6 +143,11 @@ scratchpad directory that depends on the exact versions and run `cargo fetch`. T
   (M3.19.1; same release build).
 - `scripts/bench/latency.sh [clients] [iterations]`: client-side p50/p99/max of namespace operations on a fake mount, for
   the §5.7 SLOs (release build with `--features fake-backend`; `SCENARIO_ROOT` on disk to measure the disk).
+- `pdmount fake profile [--rtt <ms>] [--up <B/s>] [--down <B/s>] <dir>` / `fake profile clear <dir>` (test builds): a
+  simulated network for the daemons on a fake drive (DESIGN §15.1), picked up at their next call.
+- `scripts/bench/m4.sh [git|untar|read|slo|gc|all]`: the M4 exit benchmarks on a fake mount with the 80 ms / 20 MB/s
+  profile (D057); about 15 min plus the first clone of git.git from kernel.org. State in `BENCH_ROOT` (default
+  `~/.cache/pdmount-bench`), report in `target/bench/m4-<date>/report.md`; exit 1 if a row fails.
 - Mounted fake-backend tests (`crates/pdmount-fuse/tests/`) need `/dev/fuse` and `fusermount3`; they skip otherwise.
 
 Workspace layout:

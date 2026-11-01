@@ -171,6 +171,12 @@ impl ProfilePaths {
         self.data_dir.join("sdk-secrets.db")
     }
 
+    /// Encrypted account key passphrases, kept out of the secret cache's
+    /// eviction (D085). Losing it requires a new login.
+    pub fn sdk_key_store(&self) -> PathBuf {
+        self.data_dir.join("sdk-keys.db")
+    }
+
     /// Encrypted SDK entity cache (rebuildable).
     pub fn sdk_entity_cache(&self) -> PathBuf {
         self.cache_dir.join("sdk-entities.db")
@@ -263,6 +269,10 @@ mod tests {
         assert_eq!(
             paths.sdk_secret_cache(),
             Path::new("/home/u/.local/share/pdmount/work/sdk-secrets.db")
+        );
+        assert_eq!(
+            paths.sdk_key_store(),
+            Path::new("/home/u/.local/share/pdmount/work/sdk-keys.db")
         );
         assert_eq!(
             paths.sdk_entity_cache(),

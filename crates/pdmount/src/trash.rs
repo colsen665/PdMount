@@ -22,7 +22,8 @@ pub async fn empty(paths: &ProfilePaths, config: &Config) -> anyhow::Result<Exit
         }
     };
     let device = session::device_identity(paths, config)?;
-    let backend = session::proton_backend(&logged_in, &device).await?;
+    let backend =
+        session::proton_backend(&logged_in, &device, session::TransferLimits::of(config)).await?;
     let before = backend.storage_info().await?;
     backend.empty_trash().await?;
     // The server may account for the deletion a little later.

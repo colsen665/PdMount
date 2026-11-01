@@ -377,7 +377,11 @@ async fn dev(
     logged_in: &session::LoggedIn,
     client_uid: String,
 ) -> anyhow::Result<Dev> {
-    let client = ProtonDriveClient::new(&logged_in.session, Some(client_uid))?;
+    let limits = session::TransferLimits::of(&pdmount_core::Config::default());
+    let client = limits.apply(ProtonDriveClient::new(
+        &logged_in.session,
+        Some(client_uid),
+    )?);
     let backend = ProtonBackend::new(
         client.clone(),
         logged_in.session.token_credential.clone(),

@@ -334,6 +334,7 @@ pub async fn run(paths: &ProfilePaths) -> Vec<Check> {
         check_free_space("data space", &paths.data_dir),
         check_free_space("cache space", &paths.cache_dir),
         check_clock().await,
+        Check::new("autostart", Level::Ok, crate::autostart::state_text(paths)),
     ]
 }
 

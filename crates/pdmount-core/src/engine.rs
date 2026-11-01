@@ -39,7 +39,8 @@
 use crate::Config;
 use crate::access::{Rule, RuleSource, RuleView, Rules};
 use crate::cache::{
-    BlockCache, BlockKey, CacheOptions, Layout, Priority, READ_BLOCKS_HELD, ReadData,
+    BlockCache, BlockKey, CacheOptions, DiskStats, Evicted, Layout, Priority, READ_BLOCKS_HELD,
+    ReadData, ReadFrom,
 };
 use crate::config::AccessMode;
 use crate::conflicts::{
@@ -52,7 +53,7 @@ use crate::gate::Gate;
 use crate::health::{Connectivity, Health, Monitored};
 use crate::journal::Journal;
 use crate::lock_order::{self, Rank};
-use crate::metrics::{Metrics, check_not_hot};
+use crate::metrics::{Metrics, TimedBackend, check_not_hot};
 use crate::pdignore::IgnoreMatcher;
 use crate::rows::{load_rows, write_rows};
 use crate::singleflight::SingleFlight;
@@ -65,6 +66,7 @@ use crate::vfs::{
 use futures::StreamExt;
 use pdmount_backend::{Backend, EventId, LinkId, NodeKind, RemoteNode, RevisionId, StorageInfo};
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -84,12 +86,17 @@ const STATFS_REFRESH: Duration = Duration::from_secs(60);
 /// How long the sum of pending upload bytes is reused.
 const PENDING_BYTES_TTL: Duration = Duration::from_secs(1);
 const ACCESS_FLUSH: Duration = Duration::from_secs(60);
+/// `meta` key of the directories to list again (D069), space-separated.
+const RELIST_KEY: &str = "relist";
 /// Staging removals wait this long to share one store fsync: each fsync
 /// stalls the WAL writes that FUSE replies wait for (D032).
 const STAGING_REMOVAL_DELAY: Duration = Duration::from_secs(1);
 /// Plans of a staged read before giving up on writes that keep moving its
 /// base pieces.
 const STAGED_READ_ATTEMPTS: usize = 8;
+/// The largest file that can be staged: 2^20 blocks of 4 MiB, 4 TiB (§7.1).
+/// Above it, writes to a remote file fail with EFBIG.
+pub const MAX_STAGED_SIZE: u64 = crate::cache::BLOCK_SIZE << 20;
 
 pub struct EngineOptions {
     pub state_db: PathBuf,
@@ -102,6 +109,8 @@ pub struct EngineOptions {
     pub device: DeviceIdentity,
     /// The time source for conflict names.
     pub clock: Clock,
+    /// `mount -o ro`: every write path answers EROFS; pending work uploads.
+    pub read_only: bool,
 }
 
 impl EngineOptions {
@@ -121,6 +130,7 @@ impl EngineOptions {
             config,
             device,
             clock,
+            read_only: false,
         }
     }
 }
@@ -162,6 +172,14 @@ pub struct SetAttr {
     /// The handle the kernel passed (`ftruncate`): one opened for writing
     /// allows a truncation whatever the mode says now.
     pub handle: Option<u64>,
+}
+
+/// Open directory handles, and per directory a digest of the entries the
+/// kernel was last given (`FOPEN_KEEP_CACHE`, §5.4).
+#[derive(Default)]
+struct DirHandles {
+    open: HashMap<u64, (Ino, Arc<Vec<DirEntry>>)>,
+    served: HashMap<Ino, u64>,
 }
 
 /// An open file handle.
@@ -208,7 +226,7 @@ pub struct Engine {
     listings: SingleFlight<Ino, (u64, Result<()>)>,
     listing_epoch: AtomicU64,
     pub(crate) invalidations: mpsc::UnboundedSender<Invalidation>,
-    dirs: parking_lot::Mutex<HashMap<u64, Arc<Vec<DirEntry>>>>,
+    dirs: parking_lot::Mutex<DirHandles>,
     files: parking_lot::Mutex<HashMap<u64, OpenFile>>,
     next_handle: AtomicU64,
     pub(crate) staging: StagingDir,
@@ -236,9 +254,17 @@ pub struct Engine {
     /// Newly registered conflicts, for the notification hook.
     notices: tokio::sync::broadcast::Sender<ConflictNotice>,
     pub(crate) gate: Gate,
+    /// Files and folders kept offline (§5.3).
+    pub(crate) pins: pins::Pins,
     /// Where the event stream continues (§9.1); held while syncing.
     pub(crate) event_cursor: tokio::sync::Mutex<Option<EventId>>,
     pub(crate) refresh: parking_lot::Mutex<crate::events::RefreshState>,
+    /// When the event stream was last read to its end.
+    pub(crate) last_poll: parking_lot::Mutex<Option<std::time::Instant>>,
+    /// `mount -o ro`.
+    read_only: bool,
+    /// `fsync.remote_paths`, compiled.
+    fsync_remote: globset::GlobSet,
     background: parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     runtime: tokio::runtime::Handle,
 }
@@ -282,10 +308,12 @@ impl Engine {
         options: EngineOptions,
     ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<Invalidation>)> {
         let health = Arc::new(Health::default());
-        let monitored = Arc::new(Monitored::new(backend, Arc::clone(&health)));
+        let metrics = Arc::new(Metrics::default());
+        // Timed inside the monitor: calls the monitor refuses are not timed.
+        let timed = Arc::new(TimedBackend::new(backend, Arc::clone(&metrics)));
+        let monitored = Arc::new(Monitored::new(timed, Arc::clone(&health)));
         let backend: Arc<dyn Backend> = monitored.clone();
         let store = Arc::new(Store::open(&options.state_db)?);
-        let metrics = Arc::new(Metrics::default());
         let account = backend.account().await?;
         let stored_root = store.meta_get("root_link")?;
         match stored_root {
@@ -305,6 +333,7 @@ impl Engine {
             clock: Arc::clone(&options.clock),
         });
         let cursor = crate::events::load_cursor(&store)?;
+        let pins = pins::Pins::load(&store)?;
         let access = store.read(|conn| Rules::load(conn, options.config.access.default))?;
         let conflicts = store.read(Conflicts::load)?;
         let cache = BlockCache::open(
@@ -312,9 +341,15 @@ impl Engine {
             Arc::clone(&store),
             Arc::clone(&metrics),
             options.cache,
+            staging.protections().clone(),
         )?;
         let (sender, receiver) = mpsc::unbounded_channel();
         let journal = Journal::new(&options.config.upload);
+        let fsync_remote = options
+            .config
+            .fsync
+            .remote_matcher()
+            .map_err(|error| CoreError::Internal(format!("fsync.remote_paths: {error}")))?;
         let local_ignore = options
             .local_ignore
             .as_ref()
@@ -360,8 +395,12 @@ impl Engine {
             conflicts: lock_order::Mutex::new(Rank::Leaf, conflicts),
             notices: tokio::sync::broadcast::channel(64).0,
             gate: Gate::new(BACKGROUND_INTERVAL),
+            pins,
             event_cursor: tokio::sync::Mutex::new(cursor),
             refresh: parking_lot::Mutex::default(),
+            last_poll: parking_lot::Mutex::default(),
+            read_only: options.read_only,
+            fsync_remote,
             background: parking_lot::Mutex::default(),
             runtime: tokio::runtime::Handle::current(),
         });
@@ -486,6 +525,64 @@ impl Engine {
         self.cache.usage()
     }
 
+    /// `cache stats`: the disk cache, without the pool slots.
+    pub fn cache_stats(&self) -> DiskStats {
+        self.cache.disk_stats()
+    }
+
+    /// `cache gc`: evicts down to `target` bytes, by default the lower
+    /// watermark. Never pinned or protected blocks.
+    pub async fn cache_gc(&self, target: Option<u64>) -> Result<Evicted> {
+        let cache = Arc::clone(&self.cache);
+        let target = target.unwrap_or_else(|| cache.disk_stats().max_bytes / 10 * 8);
+        tokio::task::spawn_blocking(move || cache.gc(target))
+            .await
+            .map_err(|error| CoreError::Internal(format!("cache gc: {error}")))
+    }
+
+    /// `cache wipe [<path>]`: evicts every block that may go, or with a path
+    /// only those of files at or below it.
+    pub async fn cache_wipe(self: &Arc<Self>, path: Option<&str>) -> Result<Evicted> {
+        let links = match path {
+            None => None,
+            Some(path) => {
+                let top = self.resolve(path).await?;
+                let tree = self.tree.read();
+                let links: HashSet<LinkId> = tree
+                    .subtree(top)
+                    .filter_map(|ino| tree.get(ino))
+                    .filter(|node| !node.is_dir())
+                    .filter_map(|node| node.link().cloned())
+                    .collect();
+                Some(links)
+            }
+        };
+        let cache = Arc::clone(&self.cache);
+        tokio::task::spawn_blocking(move || cache.wipe(links.as_ref()))
+            .await
+            .map_err(|error| CoreError::Internal(format!("cache wipe: {error}")))
+    }
+
+    /// Clears what a crash left in the disk cache; once per mount (§6.2).
+    async fn sweep_cache(&self) {
+        if let Err(error) = self.store.flush().await {
+            tracing::warn!(%error, "cache sweep skipped: the store did not commit");
+            return;
+        }
+        let cache = Arc::clone(&self.cache);
+        match tokio::task::spawn_blocking(move || cache.sweep()).await {
+            Ok(Ok(swept)) => tracing::info!(
+                orphan_files = swept.orphan_files,
+                dangling_rows = swept.dangling_rows,
+                "cache sweep finished"
+            ),
+            Ok(Err(error)) => tracing::warn!(%error, "cache sweep failed"),
+            Err(error) => tracing::warn!(%error, "cache sweep did not finish"),
+        }
+        // Pinned blocks may have been among the dangling rows.
+        self.pins_changed();
+    }
+
     pub fn inode_count(&self) -> usize {
         self.tree.read().len()
     }
@@ -495,12 +592,56 @@ impl Engine {
         *self.storage.lock()
     }
 
+    /// Asks for `dirs` to be listed again, in the background. The store
+    /// keeps them until each is listed, so a stop or crash before that
+    /// lists them at the next start (D069).
+    pub(crate) fn list_later(&self, dirs: Vec<Ino>) {
+        self.journal.list_later(dirs, |open| self.save_relist(open));
+    }
+
+    /// Replaces the directories the store keeps to list again; queued like
+    /// the rows of the change that asked for them.
+    pub(crate) fn save_relist(&self, dirs: Vec<Ino>) {
+        let value = dirs
+            .iter()
+            .map(Ino::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.store
+            .write(move |conn| crate::store::meta_set(conn, RELIST_KEY, &value));
+    }
+
+    /// The directories the last run left to list again, if they are still
+    /// listed folders. The store forgets them: queuing saves them again.
+    fn saved_relist(&self) -> Vec<Ino> {
+        let saved = self.store.meta_get(RELIST_KEY).unwrap_or_else(|error| {
+            tracing::warn!(%error, "the directories to list again could not be read");
+            None
+        });
+        let saved = saved.unwrap_or_default();
+        if saved.is_empty() {
+            return Vec::new();
+        }
+        self.save_relist(Vec::new());
+        let tree = self.tree.read();
+        saved
+            .split_whitespace()
+            .filter_map(|dir| dir.parse().ok())
+            .filter(|&dir| {
+                tree.get(dir)
+                    .is_some_and(|node| node.attached && node.is_dir() && node.listed)
+            })
+            .collect()
+    }
+
     /// Starts the event task (which also catches up after mounting), the
     /// journal executor, quota refresh and cache bookkeeping.
     pub fn start_background(self: &Arc<Self>) {
-        // Remote nodes a yield left hidden before the last stop (D055).
-        self.journal
-            .list_later(self.folders_missing_an_other_copy());
+        // Remote nodes a yield left hidden before the last stop (D055), and
+        // listings it cut short (D069).
+        let mut dirs = self.folders_missing_an_other_copy();
+        dirs.extend(self.saved_relist());
+        self.list_later(dirs);
         let mut tasks = self.background.lock();
         let this = Arc::clone(self);
         tasks.push(self.runtime.spawn(async move { this.run_events().await }));
@@ -522,6 +663,10 @@ impl Engine {
                 this.cache.flush_access();
             }
         }));
+        let this = Arc::clone(self);
+        tasks.push(self.runtime.spawn(async move { this.sweep_cache().await }));
+        let this = Arc::clone(self);
+        tasks.push(self.runtime.spawn(async move { this.run_pins().await }));
         let this = Arc::clone(self);
         tasks.push(
             self.runtime
@@ -594,7 +739,24 @@ impl Engine {
 
     /// Stops background work and commits the store. Pending journal work
     /// stays in the store and continues at the next mount.
+    /// No journal step starts from now on (D062); `shutdown` waits for those
+    /// running.
+    pub fn stop_starting(&self) {
+        self.journal.stop_starting();
+    }
+
     pub async fn shutdown(&self) -> Result<()> {
+        self.journal.stop_starting();
+        let deadline = std::time::Instant::now() + self.config.timeouts.shutdown_grace.0;
+        while !self.journal.idle() {
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    "steps still run after timeouts.shutdown_grace; the next mount retries them"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         for task in self.background.lock().drain(..) {
             task.abort();
         }
@@ -649,21 +811,43 @@ impl Engine {
     }
 
     /// Opens a listed directory; `NeedsListing` when it was never listed.
-    pub fn opendir(self: &Arc<Self>, ino: Ino) -> Result<u64> {
+    /// Returns the handle and whether the kernel may keep the directory
+    /// pages it cached: the entries are the ones it was given at the last
+    /// open, and no other handle of the directory is open, whose older
+    /// snapshot could fill the cache after a change (§5.4).
+    pub fn opendir(self: &Arc<Self>, ino: Ino) -> Result<(u64, bool)> {
         self.ensure_allowed(ino, MAY_READ)?;
         let entries = self.tree.read().dir_entries(ino)?;
+        let digest = {
+            let mut hasher = std::hash::DefaultHasher::new();
+            for entry in &entries {
+                (entry.ino, entry.kind == NodeKind::Folder, &entry.name).hash(&mut hasher);
+            }
+            hasher.finish()
+        };
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        self.dirs.lock().insert(handle, Arc::new(entries));
+        let keep_cache = {
+            let mut dirs = self.dirs.lock();
+            let alone = !dirs.open.values().any(|(open, _)| *open == ino);
+            dirs.open.insert(handle, (ino, Arc::new(entries)));
+            if alone {
+                dirs.served.insert(ino, digest) == Some(digest)
+            } else {
+                dirs.served.remove(&ino);
+                false
+            }
+        };
         self.prefetch_dir(ino);
-        Ok(handle)
+        Ok((handle, keep_cache))
     }
 
     /// The snapshot taken by `opendir`.
     pub fn dir_snapshot(&self, handle: u64) -> Result<Arc<Vec<DirEntry>>> {
         self.dirs
             .lock()
+            .open
             .get(&handle)
-            .cloned()
+            .map(|(_, entries)| Arc::clone(entries))
             .ok_or(CoreError::NotFound)
     }
 
@@ -674,7 +858,7 @@ impl Engine {
     }
 
     pub fn releasedir(&self, handle: u64) {
-        self.dirs.lock().remove(&handle);
+        self.dirs.lock().open.remove(&handle);
     }
 
     pub fn statfs(&self) -> StatFs {
@@ -781,11 +965,10 @@ impl Engine {
             let ino = tree.remove_entry(parent, name, dir, now())?;
             (ino, tree.is_droppable(ino), tree.take_relist())
         };
-        if !relist.is_empty() {
-            self.journal.list_later(relist);
-        }
+        self.list_later(relist);
         self.persist(&[ino, parent]);
         self.journal.touch(ino);
+        self.pins_changed();
         if droppable {
             self.drop_detached(ino);
         }
@@ -835,11 +1018,14 @@ impl Engine {
             let mut tree = self.tree.write();
             let renamed = tree.rename(parent, name, new_parent, new_name, mode, now())?;
             let adopted_rev = self.adopt_on_replace(&mut tree, &renamed, ignored);
+            // With the tree: the pin task must not see the replaced root
+            // detached and still pinned, and delete the pin.
+            if let Some(replaced) = renamed.replaced {
+                self.move_pin(replaced, renamed.ino);
+            }
             (renamed, adopted_rev, tree.take_relist())
         };
-        if !relist.is_empty() {
-            self.journal.list_later(relist);
-        }
+        self.list_later(relist);
         let mut reclassified = self.reclassify(renamed.ino);
         if let Some(rev) = adopted_rev
             && let Some(staged) = self.staged_entry(renamed.ino)
@@ -853,6 +1039,7 @@ impl Engine {
         for &ino in &rows {
             self.journal.touch(ino);
         }
+        self.pins_changed();
         if let Some(replaced) = renamed.replaced {
             let droppable = self.tree.read().is_droppable(replaced);
             if droppable {
@@ -1048,6 +1235,10 @@ impl Engine {
         }
         // Handles opened before a switch to `ro` are refused too (§11.4).
         self.ensure_writable(file.ino)?;
+        // Changes nothing (POSIX): not the size, not the times.
+        if data.is_empty() {
+            return Ok(0);
+        }
         let current = self.tree.read().get(file.ino).map_or(0, |n| n.size);
         self.check_quota((offset + data.len() as u64).saturating_sub(current))?;
         let first_change = self.with_staged(file.ino, false, |staged| {
@@ -1147,14 +1338,15 @@ impl Engine {
         ))
     }
 
-    /// Serves a read from RAM, staging or the disk cache. `None` means a
-    /// block is missing and the slow path ([`Engine::read`]) must run.
+    /// Serves a read from RAM, staging or the disk cache, and says which.
+    /// `None` means a block is missing and the slow path ([`Engine::read`])
+    /// must run.
     pub fn read_local(
         self: &Arc<Self>,
         handle: u64,
         offset: u64,
         size: u32,
-    ) -> Result<Option<ReadData>> {
+    ) -> Result<Option<(ReadData, ReadFrom)>> {
         let file = self.file(handle)?;
         match self.read_source(file.ino)? {
             ReadSource::Remote {
@@ -1163,16 +1355,16 @@ impl Engine {
                 size: file_size,
             } => {
                 let Some((rev, len)) = read_range(rev, file_size, offset, size) else {
-                    return Ok(Some(ReadData::empty()));
+                    return Ok(Some((ReadData::empty(), ReadFrom::Ram)));
                 };
                 let Some(layout) = self.cache.layout_local(&link, &rev, file_size) else {
                     return Ok(None);
                 };
-                let Some(data) = self.read_blocks_local(&link, &rev, &layout, offset, len) else {
+                let Some(read) = self.read_blocks_local(&link, &rev, &layout, offset, len) else {
                     return Ok(None);
                 };
                 self.readahead(handle, &link, &rev, &layout, offset, len);
-                Ok(Some(data))
+                Ok(Some(read))
             }
             ReadSource::Staged(staged) => {
                 let staged = staged.lock();
@@ -1195,7 +1387,7 @@ impl Engine {
                         }
                     }
                 }
-                Ok(Some(ReadData::Owned(out)))
+                Ok(Some((ReadData::Owned(out), ReadFrom::Staging)))
             }
         }
     }
@@ -1204,91 +1396,127 @@ impl Engine {
     pub async fn read(self: &Arc<Self>, handle: u64, offset: u64, size: u32) -> Result<ReadData> {
         let _foreground = self.gate.foreground();
         let file = self.file(handle)?;
-        match self.read_source(file.ino)? {
-            ReadSource::Remote {
-                link,
-                rev,
-                size: file_size,
-            } => {
-                let Some((rev, len)) = read_range(rev, file_size, offset, size) else {
-                    return Ok(ReadData::empty());
-                };
-                let layout = self.cache.layout(&link, &rev, file_size).await?;
-                let data = self
-                    .read_layout(&link, &rev, &layout, offset, len, Priority::Interactive)
-                    .await?;
-                self.readahead(handle, &link, &rev, &layout, offset, len);
-                Ok(data)
-            }
-            ReadSource::Staged(staged) => {
-                // Fetch base pieces without holding the lock, then assemble. A
-                // write or truncate meanwhile can split or move the base
-                // pieces: plan again and fetch only what is still missing.
-                let mut fetched: Vec<(u64, ReadData)> = Vec::new();
-                let mut fetched_from: Option<Base> = None;
-                for _ in 0..STAGED_READ_ATTEMPTS {
-                    let (pieces, base) = {
-                        let staged = staged.lock();
-                        (
-                            staged.plan_read(offset, u64::from(size)),
-                            staged.base().cloned(),
-                        )
+        for _ in 0..STAGED_READ_ATTEMPTS {
+            let staged = match self.read_source(file.ino)? {
+                ReadSource::Remote {
+                    link,
+                    rev,
+                    size: file_size,
+                } => {
+                    let Some((rev, len)) = read_range(rev, file_size, offset, size) else {
+                        return Ok(ReadData::empty());
                     };
-                    if base != fetched_from {
-                        fetched.clear();
-                        fetched_from.clone_from(&base);
-                    }
-                    for piece in &pieces {
-                        if let (Piece::Base { offset, len }, Some(base)) = (piece, &base)
-                            && covering(&fetched, *offset, *len).is_none()
-                        {
-                            let data = self
-                                .read_revision(base, *offset, *len, Priority::Interactive)
-                                .await?;
-                            fetched.push((*offset, data));
-                        }
-                    }
-                    let staged = staged.lock();
-                    if staged.base() != fetched_from.as_ref() {
-                        continue;
-                    }
-                    let mut out = Vec::new();
-                    let mut complete = true;
-                    for piece in staged.plan_read(offset, u64::from(size)) {
-                        match piece {
-                            Piece::Staging { offset, len } => {
-                                let start = out.len();
-                                out.resize(start + len as usize, 0);
-                                staged.read_at(offset, &mut out[start..])?;
-                            }
-                            Piece::Base { offset, len } => match covering(&fetched, offset, len) {
-                                Some(data) => out.extend_from_slice(data),
-                                None => {
-                                    complete = false;
-                                    break;
-                                }
-                            },
-                        }
-                    }
-                    if complete {
-                        return Ok(ReadData::Owned(out));
-                    }
+                    let layout = self.cache.layout(&link, &rev, file_size).await?;
+                    let data = self
+                        .read_layout(&link, &rev, &layout, offset, len, Priority::Interactive)
+                        .await?;
+                    self.readahead(handle, &link, &rev, &layout, offset, len);
+                    return Ok(data);
                 }
-                Err(CoreError::Internal(
-                    "staged read kept changing while fetching".into(),
-                ))
+                ReadSource::Staged(staged) => staged,
+            };
+            if let Some(data) = self.read_staged(file.ino, &staged, offset, size).await? {
+                return Ok(data);
             }
         }
+        Err(CoreError::Internal(
+            "the file's staging kept changing while reading".into(),
+        ))
+    }
+
+    /// A read through `staged`; `None` when that is no longer the inode's
+    /// staging, and the source has to be looked up again.
+    async fn read_staged(
+        &self,
+        ino: Ino,
+        staged: &Arc<StagingLock>,
+        offset: u64,
+        size: u32,
+    ) -> Result<Option<ReadData>> {
+        // Fetch base pieces without holding the lock, then assemble. A
+        // write or truncate meanwhile can split or move the base
+        // pieces: plan again and fetch only what is still missing.
+        let mut fetched: Vec<(u64, ReadData)> = Vec::new();
+        let mut fetched_from: Option<Base> = None;
+        for _ in 0..STAGED_READ_ATTEMPTS {
+            let (pieces, base) = {
+                let staged = staged.lock();
+                (
+                    staged.plan_read(offset, u64::from(size)),
+                    staged.base().cloned(),
+                )
+            };
+            if base != fetched_from {
+                fetched.clear();
+                fetched_from.clone_from(&base);
+            }
+            for piece in &pieces {
+                if let (Piece::Base { offset, len }, Some(base)) = (piece, &base)
+                    && covering(&fetched, *offset, *len).is_none()
+                {
+                    let data = self
+                        .read_revision(base, *offset, *len, Priority::Interactive)
+                        .await?;
+                    fetched.push((*offset, data));
+                }
+            }
+            let guard = staged.lock();
+            if !self.is_current_staging(ino, staged) {
+                return Ok(None);
+            }
+            let staged = guard;
+            if staged.base() != fetched_from.as_ref() {
+                continue;
+            }
+            let mut out = Vec::new();
+            let mut complete = true;
+            for piece in staged.plan_read(offset, u64::from(size)) {
+                match piece {
+                    Piece::Staging { offset, len } => {
+                        let start = out.len();
+                        out.resize(start + len as usize, 0);
+                        staged.read_at(offset, &mut out[start..])?;
+                    }
+                    Piece::Base { offset, len } => match covering(&fetched, offset, len) {
+                        Some(data) => out.extend_from_slice(data),
+                        None => {
+                            complete = false;
+                            break;
+                        }
+                    },
+                }
+            }
+            if complete {
+                return Ok(Some(ReadData::Owned(out)));
+            }
+        }
+        Err(CoreError::Internal(
+            "staged read kept changing while fetching".into(),
+        ))
     }
 
     /// `fsync` in `local` mode (§5.6): staging data and the store are on
     /// disk when it returns.
     pub async fn fsync(&self, ino: Ino) -> Result<()> {
         if let Some(staged) = self.staged_entry(ino) {
-            let staged = Arc::clone(&staged);
-            tokio::task::spawn_blocking(move || staged.lock().sync())
-                .await
-                .map_err(|e| CoreError::Internal(e.to_string()))??;
+            let map = Arc::clone(&self.staged);
+            let store = Arc::clone(&self.store);
+            tokio::task::spawn_blocking(move || {
+                let mut guard = staged.lock();
+                // One replaced meanwhile was clean or dropped: nothing of it
+                // needs to reach the disk.
+                let current = map
+                    .lock()
+                    .get(&ino)
+                    .is_some_and(|entry| Arc::ptr_eq(entry, &staged));
+                if current {
+                    store.outside_wal_sync(|| guard.sync())
+                } else {
+                    Ok(())
+                }
+            })
+            .await
+            .map_err(|e| CoreError::Internal(e.to_string()))??;
         }
         // Taken before the commit, so the cleared error is on disk too.
         let error = self
@@ -1302,6 +1530,22 @@ impl Engine {
             Some(errno) => Err(CoreError::Errno(errno)),
             None => Ok(()),
         }
+    }
+
+    /// Whether `fsync` of `ino` waits for the upload (§5.6).
+    pub fn fsync_is_remote(&self, ino: Ino) -> bool {
+        self.config.fsync.mode == crate::config::FsyncMode::Remote
+            || (!self.fsync_remote.is_empty()
+                && self
+                    .tree
+                    .read()
+                    .path(ino)
+                    .is_some_and(|path| self.fsync_remote.is_match(path)))
+    }
+
+    /// `mount -o ro`.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// `fsyncdir`: the store is on disk when it returns.
@@ -1428,6 +1672,9 @@ impl Engine {
             self.refresh_ignore();
         }
         self.persist(&rows);
+        if !rows.is_empty() {
+            self.pins_changed();
+        }
         for ino in &rows {
             if self.journal_relevant(*ino) {
                 self.journal.touch(*ino);
@@ -1772,6 +2019,18 @@ impl Engine {
         self.staged.lock().get(&ino).cloned()
     }
 
+    /// Whether `staged` still is the staging of `ino`. A [`Staged`] goes
+    /// through the path and the descriptor of its inode, which by then may
+    /// be a newer staging's: whoever held one across a wait checks this
+    /// with its lock held before touching the file. An upload commit or
+    /// `queue drop` replaces it under the same lock.
+    fn is_current_staging(&self, ino: Ino, staged: &Arc<StagingLock>) -> bool {
+        self.staged
+            .lock()
+            .get(&ino)
+            .is_some_and(|entry| Arc::ptr_eq(entry, staged))
+    }
+
     /// The staging of a file, created from its remote content if needed
     /// (local disk only).
     pub(crate) fn ensure_staged(&self, ino: Ino) -> Result<Arc<StagingLock>> {
@@ -1793,12 +2052,7 @@ impl Engine {
         for _ in 0..8 {
             let staged = self.stage(ino, empty)?;
             let mut guard = staged.lock();
-            let current = self
-                .staged
-                .lock()
-                .get(&ino)
-                .is_some_and(|entry| Arc::ptr_eq(entry, &staged));
-            if current {
+            if self.is_current_staging(ino, &staged) {
                 return change(&mut guard);
             }
         }
@@ -1836,6 +2090,11 @@ impl Engine {
                 _ => (remote_rev, None, if empty { 0 } else { node.size }),
             }
         };
+        // The size comes from the uploader's claim (§7.1); the sparse file
+        // and the materialization must stay within reason.
+        if size > MAX_STAGED_SIZE {
+            return Err(CoreError::FileTooLarge);
+        }
         let staged = Arc::new(StagingLock::new(
             Rank::Staging,
             self.staging.create(ino, base_rev, base, size)?,
@@ -1869,7 +2128,11 @@ impl Engine {
             let data = self
                 .read_revision(&base, start, end - start, priority)
                 .await?;
-            staged.lock().materialize(index, &base, &data)?;
+            let mut guard = staged.lock();
+            if !self.is_current_staging(ino, &staged) {
+                return Ok(());
+            }
+            guard.materialize(index, &base, &data)?;
         }
         Ok(())
     }
@@ -1880,6 +2143,7 @@ impl Engine {
             .cache
             .layout_local(&base.link, &base.rev, base.rev_size)?;
         self.read_blocks_local(&base.link, &base.rev, &layout, offset, len)
+            .map(|(data, _)| data)
     }
 
     /// Bytes `[offset, offset + len)` of a revision from RAM or disk: a
@@ -1892,20 +2156,23 @@ impl Engine {
         layout: &Layout,
         offset: u64,
         len: u64,
-    ) -> Option<ReadData> {
+    ) -> Option<(ReadData, ReadFrom)> {
         let key = |index| BlockKey::new(link, rev, index);
         match layout.spans(offset, len) {
-            [] => Some(ReadData::empty()),
+            [] => Some((ReadData::empty(), ReadFrom::Ram)),
             [span] => {
-                let data = self.cache.get_local(&key(span.index))?;
-                Some(ReadData::of_block(span, data, offset, len))
+                let (data, from) = self.cache.get_local_from(&key(span.index))?;
+                Some((ReadData::of_block(span, data, offset, len), from))
             }
             spans => {
                 let mut out = self.cache.read_buf_now(offset, len);
+                let mut from = ReadFrom::Ram;
                 for span in spans {
-                    out.append(span, &self.cache.get_local(&key(span.index))?);
+                    let (data, source) = self.cache.get_local_from(&key(span.index))?;
+                    out.append(span, &data);
+                    from = from.max(source);
                 }
-                Some(out.finish())
+                Some((out.finish(), from))
             }
         }
     }
@@ -2079,6 +2346,9 @@ impl Engine {
 
     /// EROFS when `ino` is in a `ro` subtree (D019).
     fn ensure_writable(&self, ino: Ino) -> Result<()> {
+        if self.read_only {
+            return Err(CoreError::ReadOnly);
+        }
         let access = self.access.read();
         if access.is_empty() {
             return Ok(());
@@ -2092,6 +2362,10 @@ impl Engine {
 
     /// Reported attributes lose their write bits in `ro` subtrees (§11.2).
     fn masked(&self, mut attr: Attr) -> Attr {
+        if self.read_only {
+            attr.perm &= !0o222;
+            return attr;
+        }
         let access = self.access.read();
         if !access.is_empty() && access.is_read_only(&self.tree.read(), attr.ino) {
             attr.perm &= !0o222;
@@ -2754,8 +3028,10 @@ fn load(store: &Store, staging: &StagingDir) -> Result<(Tree, Ino, StagedMap)> {
     Ok((tree, reserved, staged))
 }
 
+pub mod pins;
 #[cfg(test)]
 mod proptests;
+pub mod queue;
 mod surface;
 #[cfg(test)]
 mod tests;

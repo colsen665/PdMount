@@ -201,6 +201,18 @@ pub enum BackendError {
 }
 
 impl BackendError {
+    /// A failed local file operation of the backend (`context` names it). Out
+    /// of descriptors is a shortage that passes, so it is `Transient`: as
+    /// `Other` it parked the entry, and the entries behind it, for good.
+    pub fn local_io(context: impl std::fmt::Display, error: std::io::Error) -> Self {
+        use nix::errno::Errno;
+        let message = format!("{context}: {error}");
+        match error.raw_os_error().map(Errno::from_raw) {
+            Some(Errno::EMFILE | Errno::ENFILE) => Self::Transient(message),
+            _ => Self::Other(message),
+        }
+    }
+
     /// Whether repeating the operation later may succeed.
     pub fn is_retryable(&self) -> bool {
         matches!(
@@ -239,20 +251,6 @@ pub type Result<T> = std::result::Result<T, BackendError>;
 
 /// The largest plaintext block Proton Drive stores (and PdMount uploads).
 pub const MAX_BLOCK_BYTES: usize = 4 << 20;
-
-/// Copies a fetched block into the caller's buffer (`fetch_block_into` of
-/// a backend that gets its blocks as owned bytes).
-pub fn copy_block(data: &[u8], buf: &mut [u8], index: u32, revision: &RevisionId) -> Result<usize> {
-    let capacity = buf.len();
-    let target = buf.get_mut(..data.len()).ok_or_else(|| {
-        BackendError::Integrity(format!(
-            "block {index} of {revision} has {} bytes, more than the {capacity} expected",
-            data.len()
-        ))
-    })?;
-    target.copy_from_slice(data);
-    Ok(data.len())
-}
 
 /// Operations PdMount needs from Proton Drive "My Files".
 #[async_trait::async_trait]
@@ -347,4 +345,18 @@ pub trait Backend: Send + Sync + 'static {
     async fn poll_events(&self, since: &EventId) -> Result<EventPage>;
 
     async fn storage_info(&self) -> Result<StorageInfo>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn running_out_of_descriptors_is_retryable() {
+        let emfile = BackendError::local_io("open", std::io::Error::from_raw_os_error(24));
+        assert!(emfile.is_retryable(), "{emfile}");
+        let missing =
+            BackendError::local_io("open", std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(matches!(missing, BackendError::Other(_)));
+    }
 }

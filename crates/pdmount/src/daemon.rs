@@ -1,4 +1,4 @@
-//! Mount daemon and mount management: `mount`, `unmount`, `stats`, `reset`
+//! Mount daemon and mount management: `mount`, `unmount`, `reset`
 //! (DESIGN.md §14).
 //!
 //! `pdmount mount` starts `pdmount mount --foreground` as a detached child in
@@ -40,9 +40,12 @@ const LOGIN_POLL: Duration = Duration::from_secs(5);
 const START_TIMEOUT: Duration = Duration::from_secs(90);
 const TOKEN_SAVE_INTERVAL: Duration = Duration::from_secs(60);
 const SESSION_END_TIMEOUT: Duration = Duration::from_secs(10);
-/// `unmount --force` sends SIGKILL after this: longer than the daemon's own
-/// wait for the session plus its store commit and last token save.
-const FORCE_KILL_AFTER: Duration = Duration::from_secs(30);
+/// `unmount --force` sends SIGKILL this long after `timeouts.shutdown_grace`:
+/// longer than the daemon's own wait for the session plus its store commit
+/// and last token save.
+const FORCE_KILL_MARGIN: Duration = Duration::from_secs(30);
+/// A log above this is moved to `<profile>.log.1` at a background `mount`.
+const LOG_ROTATE_BYTES: u64 = 16 << 20;
 /// How long `unmount` waits for pending uploads.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(600);
 /// Largest descriptor table grown at startup (about 0.5 MiB of kernel memory).
@@ -121,6 +124,42 @@ pub fn mountpoint(config: &Config, home: &Path, arg: Option<PathBuf>) -> PathBuf
     }
 }
 
+/// Opens the daemon log for appending: 0600 in a 0700 directory (DESIGN.md
+/// §13.1), also when an older version created them with the umask's modes.
+/// Keeps one old log: renames a log above `limit` to `<log>.1`, replacing
+/// it. The daemon's output goes to a new file then.
+fn rotate_log(path: &Path, limit: u64) -> std::io::Result<()> {
+    let size = match std::fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if size <= limit {
+        return Ok(());
+    }
+    let mut old = path.as_os_str().to_owned();
+    old.push(".1");
+    std::fs::rename(path, old)
+}
+
+fn open_log(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    if let Some(dir) = path.parent() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)?;
+    log.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(log)
+}
+
 /// `pdmount mount` without `--foreground`.
 pub async fn mount_background(
     paths: &ProfilePaths,
@@ -128,6 +167,7 @@ pub async fn mount_background(
     backend: &BackendChoice,
     verbose: u8,
     login: Option<BrowserMode>,
+    read_only: bool,
 ) -> anyhow::Result<ExitCode> {
     preflight(paths, mountpoint).await?;
     // Reading the session here makes a keyring unlock dialog appear while this
@@ -147,14 +187,10 @@ pub async fn mount_background(
         );
     }
     let log_path = paths.log_file();
-    if let Some(dir) = log_path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    if let Err(error) = rotate_log(&log_path, LOG_ROTATE_BYTES) {
+        eprintln!("warning: cannot rotate {}: {error}", log_path.display());
     }
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .with_context(|| format!("cannot open {}", log_path.display()))?;
+    let log = open_log(&log_path).with_context(|| format!("cannot open {}", log_path.display()))?;
     let log_start = log.metadata().map_or(0, |m| m.len());
     let mut command =
         Command::new(std::env::current_exe().context("cannot find the pdmount executable")?);
@@ -168,6 +204,7 @@ pub async fn mount_background(
         .arg("--foreground")
         .arg("--backend")
         .arg(backend.arg())
+        .args(read_only.then_some(["-o", "ro"]).into_iter().flatten())
         .arg(mountpoint)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
@@ -252,9 +289,10 @@ async fn preflight(paths: &ProfilePaths, mountpoint: &Path) -> anyhow::Result<()
 }
 
 /// Raises the soft open-file limit to the hard one and grows the descriptor
-/// table to it now. Every staged file holds a descriptor, and each time the
-/// kernel grows the table, every thread that opens a file waits for an RCU
-/// grace period (30-80 ms measured, all FUSE threads at once).
+/// table to it now. Staging keeps up to a quarter of the limit open (D063;
+/// the engine reads it after this), and each time the kernel grows the
+/// table, every thread that opens a file waits for an RCU grace period
+/// (30-80 ms measured, all FUSE threads at once).
 fn grow_fd_table() {
     use nix::fcntl::{FcntlArg, fcntl};
     use nix::sys::resource::{Resource, getrlimit, setrlimit};
@@ -284,19 +322,23 @@ fn grow_fd_table() {
     tracing::debug!(limit, "open-file limit");
 }
 
-/// `pdmount mount --foreground`: runs until unmounted.
+/// `pdmount mount --foreground`: runs until unmounted. `textfile` is the
+/// Prometheus textfile, if one is configured.
 pub async fn run_foreground(
     paths: &ProfilePaths,
     config: &Config,
     mountpoint: &Path,
     choice: &BackendChoice,
+    textfile: Option<PathBuf>,
+    read_only: bool,
 ) -> anyhow::Result<ExitCode> {
     preflight(paths, mountpoint).await?;
     std::fs::create_dir_all(mountpoint)
         .with_context(|| format!("cannot create {}", mountpoint.display()))?;
     grow_fd_table();
     let device = session::device_identity(paths, config)?;
-    let opened = open_backend(paths, choice, &device).await?;
+    let limits = session::TransferLimits::of(config);
+    let opened = open_backend(paths, choice, &device, limits).await?;
     let master_key: [u8; 32] = Credentials::new(paths)
         .cache_master_key()?
         .try_into()
@@ -316,6 +358,7 @@ pub async fn run_foreground(
             config: config.clone(),
             device: device.clone(),
             clock: system_clock(),
+            read_only,
         },
     )
     .await
@@ -334,6 +377,7 @@ pub async fn run_foreground(
             let auth = Auth::new(
                 paths.clone(),
                 device.clone(),
+                limits,
                 proton,
                 Arc::clone(engine.health()),
                 *logged_in,
@@ -348,6 +392,9 @@ pub async fn run_foreground(
         }
     };
     let notices = tokio::spawn(announce_conflicts(engine.subscribe_conflicts()));
+    let textfile = textfile.map(|path| {
+        crate::stats::spawn_textfile(Arc::clone(&engine), path, paths.profile.to_string())
+    });
     tracing::info!(mountpoint = %mountpoint.display(), "mounted");
 
     let pid_file = paths.pid_file();
@@ -375,6 +422,9 @@ pub async fn run_foreground(
     tracing::info!(reason, "shutting down");
     server.abort();
     notices.abort();
+    if let Some(textfile) = textfile {
+        textfile.abort();
+    }
     control::remove(&socket);
     let stopped = shutdown(&engine, mounted, auth.as_ref(), mountpoint).await;
     let _ = std::fs::remove_file(&pid_file);
@@ -399,9 +449,10 @@ async fn open_backend(
     paths: &ProfilePaths,
     choice: &BackendChoice,
     device: &DeviceIdentity,
+    limits: session::TransferLimits,
 ) -> anyhow::Result<Opened> {
     let dir = match choice {
-        BackendChoice::Proton => return open_proton(paths, device).await,
+        BackendChoice::Proton => return open_proton(paths, device, limits).await,
         BackendChoice::Fake(dir) => dir,
     };
     let fake = FakeBackend::open(dir)
@@ -419,10 +470,26 @@ async fn open_backend(
     })
 }
 
+/// The stored root of a profile that has mounted before, so that it can come
+/// up and wait for the sign-in (D042); for any other profile, an error that
+/// asks for a login.
+fn known_root_for_login(
+    paths: &ProfilePaths,
+    error: &anyhow::Error,
+) -> anyhow::Result<session::KnownRoot> {
+    session::KnownRoot::load(paths)
+        .filter(|_| paths.state_db().exists())
+        .with_context(|| format!("the session has expired; run `pdmount login` ({error:#})"))
+}
+
 /// Resumes the session; without the network, or with a rejected session,
 /// a profile mounted online before starts from its stored root.
-async fn open_proton(paths: &ProfilePaths, device: &DeviceIdentity) -> anyhow::Result<Opened> {
-    let (logged_in, known, start_state) = match session::resume(paths).await? {
+async fn open_proton(
+    paths: &ProfilePaths,
+    device: &DeviceIdentity,
+    limits: session::TransferLimits,
+) -> anyhow::Result<Opened> {
+    let (logged_in, known, mut start_state) = match session::resume(paths).await? {
         Resumed::Active(logged_in) => (logged_in, None, Connectivity::Online),
         Resumed::Offline { logged_in, error } => {
             let Some(known) = session::KnownRoot::load(paths) else {
@@ -440,25 +507,38 @@ async fn open_proton(paths: &ProfilePaths, device: &DeviceIdentity) -> anyhow::R
         Resumed::NeedsLogin { logged_in, error } => {
             // A mount that has run before comes up and waits for the
             // sign-in: local work goes on (D042).
-            let known = session::KnownRoot::load(paths)
-                .filter(|_| paths.state_db().exists())
-                .with_context(|| {
-                    format!("the session has expired; run `pdmount login` ({error:#})")
-                })?;
+            let known = known_root_for_login(paths, &error)?;
             tracing::warn!(error = %format!("{error:#}"), "the session was rejected; mounting until the sign-in");
             (logged_in, Some(known), Connectivity::NeedsLogin)
         }
     };
     let backend = match &known {
-        Some(known) => session::proton_backend_offline(&logged_in, device, known)?,
+        Some(known) => session::proton_backend_offline(&logged_in, device, known, limits)?,
         None => {
-            let backend = session::proton_backend(&logged_in, device).await?;
-            let root = backend.account().await?.root;
-            let known = session::KnownRoot::of(&backend, &logged_in.session.username, &root);
-            if let Err(error) = known.save(paths) {
-                tracing::warn!(%error, "cannot store the drive's root for offline mounts");
+            let online = async {
+                let backend = session::proton_backend(&logged_in, device, limits).await?;
+                let root = backend.account().await?.root;
+                anyhow::Ok((backend, root))
             }
-            backend
+            .await;
+            match online {
+                Ok((backend, root)) => {
+                    let known =
+                        session::KnownRoot::of(&backend, &logged_in.session.username, &root);
+                    if let Err(error) = known.save(paths) {
+                        tracing::warn!(%error, "cannot store the drive's root for offline mounts");
+                    }
+                    backend
+                }
+                // The session resumed, but its keys cannot be unlocked (D085).
+                Err(error) if session::needs_login(&error) => {
+                    let known = known_root_for_login(paths, &error)?;
+                    tracing::warn!(error = %format!("{error:#}"), "a new login is needed; mounting until the sign-in");
+                    start_state = Connectivity::NeedsLogin;
+                    session::proton_backend_offline(&logged_in, device, &known, limits)?
+                }
+                Err(error) => return Err(error),
+            }
         }
     };
     let backend = Arc::new(backend);
@@ -529,6 +609,7 @@ async fn shutdown(
     auth: Option<&Arc<Auth>>,
     mountpoint: &Path,
 ) -> pdmount_core::errors::Result<()> {
+    engine.stop_starting();
     if matches!(mounts::find(mountpoint), Ok(Some(_))) {
         // Busy mounts are detached; the kernel finishes them when unused.
         if fusermount(mountpoint, false).is_err() {
@@ -668,11 +749,16 @@ fn request_handler(
                     let storage = engine.storage();
                     let queue = engine.queue_counts();
                     let sign_in = auth.as_ref().and_then(|auth| auth.sign_in());
+                    let pinned = engine.pin_summary().await.ok().flatten();
                     control::ok(control::StatusReply {
                         pid: std::process::id(),
                         mountpoint,
                         queue_pending: queue.pending as u64,
                         queue_parked: queue.parked as u64,
+                        queue_oldest_secs: engine.queue_oldest().map(|age| age.as_secs()),
+                        events_last_poll_secs: engine.events_last_poll().map(|age| age.as_secs()),
+                        events_refreshing: engine.events_refreshing(),
+                        read_only: engine.is_read_only(),
                         conflicts: engine.conflict_open_count() as u64,
                         connectivity: engine.health().state(),
                         connectivity_since: engine
@@ -690,6 +776,11 @@ fn request_handler(
                         inodes: engine.inode_count() as u64,
                         cache_bytes,
                         cache_blocks: cache_blocks as u64,
+                        pinned: pinned.map(|pinned| control::PinnedReply {
+                            paths: pinned.paths,
+                            fetched_bytes: pinned.fetched_bytes,
+                            total_bytes: pinned.total_bytes,
+                        }),
                     })
                 }
                 Request::Login => login_reply(auth.as_ref()).await,
@@ -759,27 +850,92 @@ fn request_handler(
                         }
                     }))
                 }
-                Request::Stats => control::ok(control::StatsReply {
-                    counters: engine
-                        .metrics()
-                        .snapshot()
-                        .into_iter()
-                        .map(|(name, value)| (name.to_owned(), value))
-                        .collect(),
-                    pool: engine
-                        .cache_pool_usage()
-                        .into_iter()
-                        .map(|class| control::PoolClassReply {
-                            class: if class.scratch {
-                                "scratch".to_owned()
-                            } else {
-                                ByteSize(class.capacity as u64).to_string()
-                            },
-                            slots: class.slots,
-                            in_use: class.in_use,
-                        })
-                        .collect(),
-                }),
+                Request::Stats { reset } => control::ok(crate::stats::reply(&engine, reset)),
+                Request::PinSet { path } => {
+                    control::reply(engine.pin_set(&path).await.map(|()| control::Done {}))
+                }
+                Request::PinUnset { path } => {
+                    control::reply(engine.pin_unset(&path).await.map(|()| control::Done {}))
+                }
+                Request::PinList => control::reply(engine.pin_list().await.map(|pins| {
+                    control::PinListReply {
+                        pins: pins
+                            .into_iter()
+                            .map(|pin| control::PinReply {
+                                path: pin.path,
+                                set_as: pin.path_at_set,
+                                files: pin.files,
+                                fetched_bytes: pin.fetched_bytes,
+                                total_bytes: pin.total_bytes,
+                                state: pin.state.as_str().to_owned(),
+                            })
+                            .collect(),
+                    }
+                })),
+                Request::QueueList { target } => {
+                    control::reply(engine.queue_entries(&target).await.map(|entries| {
+                        control::QueueListReply {
+                            entries: entries.into_iter().map(Into::into).collect(),
+                        }
+                    }))
+                }
+                Request::QueueRetry { target } => {
+                    control::reply(engine.queue_retry(&target).await.map(queue_acted))
+                }
+                Request::QueuePark { target } => {
+                    control::reply(engine.queue_park(&target).await.map(queue_acted))
+                }
+                Request::QueueDrop { target, yes } => {
+                    control::reply(engine.queue_drop(&target, yes).await.map(|items| {
+                        control::QueueDropReply {
+                            items: items
+                                .into_iter()
+                                .map(|item| control::QueueDropItem {
+                                    id: item.id,
+                                    path: item.path,
+                                    effect: item.effect.to_owned(),
+                                    refused: item.refused,
+                                })
+                                .collect(),
+                        }
+                    }))
+                }
+                Request::Sync { path, timeout_secs } => control::reply(
+                    engine
+                        .sync_path(path.as_deref(), Duration::from_secs(timeout_secs))
+                        .await
+                        .map(|outcome| control::SyncReply {
+                            pending: outcome.pending as u64,
+                            parked: outcome.parked,
+                        }),
+                ),
+                Request::CacheStats => {
+                    let stats = engine.cache_stats();
+                    control::ok(control::CacheStatsReply {
+                        bytes: stats.bytes,
+                        max_bytes: stats.max_bytes,
+                        blocks: stats.blocks,
+                        pinned_bytes: stats.pinned_bytes,
+                        protected_revisions: stats.protected_revisions,
+                        pool: crate::stats::pool_reply(&engine),
+                    })
+                }
+                Request::CacheGc { target } => {
+                    let freed = engine.cache_gc(target).await;
+                    control::reply(freed.map(|freed| control::CacheFreedReply {
+                        blocks: freed.blocks,
+                        bytes: freed.bytes,
+                        left_bytes: engine.cache_stats().bytes,
+                    }))
+                }
+                Request::CacheWipe { path } => {
+                    let freed = engine.cache_wipe(path.as_deref()).await;
+                    control::reply(freed.map(|freed| control::CacheFreedReply {
+                        blocks: freed.blocks,
+                        bytes: freed.bytes,
+                        left_bytes: engine.cache_stats().bytes,
+                    }))
+                }
                 Request::Unmount => {
                     let result =
                         tokio::task::spawn_blocking(move || fusermount(&mountpoint, false)).await;
@@ -825,7 +981,7 @@ pub async fn unmount(
     drain(&socket).await?;
     match control::call_ok::<control::Done>(&socket, Request::Unmount, CONTROL_TIMEOUT).await {
         Ok(Some(_)) => {
-            wait_for_daemon_exit(paths, Duration::from_secs(60)).await?;
+            wait_for_daemon_exit(paths, stop_limit(paths).max(Duration::from_secs(60))).await?;
             println!("Unmounted {}.", mountpoint.display());
             Ok(ExitCode::SUCCESS)
         }
@@ -852,6 +1008,12 @@ pub async fn unmount(
                 Ok(ExitCode::SUCCESS)
             }
         },
+    }
+}
+
+fn queue_acted(items: Vec<pdmount_core::engine::queue::QueueItem>) -> control::QueueActedReply {
+    control::QueueActedReply {
+        items: items.into_iter().map(|item| (item.id, item.path)).collect(),
     }
 }
 
@@ -924,6 +1086,13 @@ pub async fn login_via_daemon(
     }
 }
 
+/// How long a stopping daemon may take: its grace for running steps and a
+/// margin. An unreadable config counts as the default.
+fn stop_limit(paths: &ProfilePaths) -> Duration {
+    let config = Config::load(&paths.config_file()).unwrap_or_default();
+    config.timeouts.shutdown_grace.0 + FORCE_KILL_MARGIN
+}
+
 /// Waits until the daemon process is gone, not just its socket: it closes
 /// the socket first and may need a few seconds to finish.
 async fn wait_for_daemon_exit(paths: &ProfilePaths, timeout: Duration) -> anyhow::Result<()> {
@@ -956,7 +1125,7 @@ async fn force_unmount(paths: &ProfilePaths, mountpoint: &Path) -> anyhow::Resul
     }
     if let Some(pid) = daemon_pid(paths) {
         let _ = kill(pid, Signal::SIGTERM);
-        let deadline = Instant::now() + FORCE_KILL_AFTER;
+        let deadline = Instant::now() + stop_limit(paths);
         while kill(pid, None).is_ok() && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -1033,36 +1202,6 @@ fn is_pdmount_process(pid: nix::unistd::Pid) -> bool {
                 .is_some_and(|name| name == "pdmount")
         })
         .unwrap_or(false)
-}
-
-/// `pdmount stats`.
-pub async fn stats(paths: &ProfilePaths) -> anyhow::Result<ExitCode> {
-    let Some(reply) = control::call_ok::<control::StatsReply>(
-        &paths.control_socket(),
-        Request::Stats,
-        CONTROL_TIMEOUT,
-    )
-    .await?
-    else {
-        eprintln!("Profile {} is not mounted.", paths.profile);
-        return Ok(ExitCode::FAILURE);
-    };
-    let mut rows: Vec<(String, String)> = reply
-        .counters
-        .into_iter()
-        .map(|(name, value)| (name, value.to_string()))
-        .collect();
-    for class in reply.pool {
-        rows.push((
-            format!("cache_pool_slots_{}", class.class),
-            format!("{} of {} in use", class.in_use, class.slots),
-        ));
-    }
-    let width = rows.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
-    for (name, value) in rows {
-        println!("{name:width$}  {value}");
-    }
-    Ok(ExitCode::SUCCESS)
 }
 
 /// `pdmount reset --keep-login`: deletes the state database and the block
@@ -1147,6 +1286,43 @@ fn dir_size(dir: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_large_log_moves_aside_and_replaces_the_old_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("p.log");
+        let old = dir.path().join("p.log.1");
+        rotate_log(&log, 4).expect("no log yet");
+        std::fs::write(&log, "1234").expect("write");
+        rotate_log(&log, 4).expect("at the limit");
+        assert!(log.exists() && !old.exists());
+        std::fs::write(&log, "12345").expect("write");
+        rotate_log(&log, 4).expect("over the limit");
+        assert!(!log.exists());
+        assert_eq!(std::fs::read_to_string(&old).expect("old"), "12345");
+        std::fs::write(&log, "abcdef").expect("write");
+        rotate_log(&log, 4).expect("again");
+        assert_eq!(std::fs::read_to_string(&old).expect("old"), "abcdef");
+    }
+
+    #[test]
+    fn the_log_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode =
+            |path: &Path| std::fs::metadata(path).expect("stat").permissions().mode() & 0o777;
+        let old = nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o022));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("state/pdmount");
+        let log = dir.join("work.log");
+        open_log(&log).expect("open");
+        assert_eq!((mode(&dir), mode(&log)), (0o700, 0o600));
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        open_log(&log).expect("reopen");
+        nix::sys::stat::umask(old);
+        assert_eq!((mode(&dir), mode(&log)), (0o700, 0o600));
+    }
 
     #[test]
     fn relative_mountpoints_are_made_absolute() {

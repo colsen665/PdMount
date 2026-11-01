@@ -23,7 +23,7 @@ if [[ -n "${LOG_DIR:-}" ]]; then
     LOG_DIR=$(cd "$LOG_DIR" && pwd)
 fi
 cd "$(dirname "$0")"
-default="r1 r2 r3 r4 r5 r6 r7 g1 g2 g3 g4 g5 g6 g6_read g7 n1 a1 a2 a3 a4 a5 a6 e1 e2 m1 m3 m4 m5 m6 m7 sha"
+default="r1 r2 r3 r4 r5 r6 r7 g1 g2 g3 g4 g5 g6 g6_read g7 n1 a1 a2 a3 a4 a5 a6 e1 e2 m1 m3 m4 m5 m6 m7 queue ops sha"
 scenarios=("$@")
 ((${#scenarios[@]})) || read -ra scenarios <<<"${SCENARIOS:-$default}"
 read -ra modes <<<"${MODES:-live remount crash fresh}"

@@ -25,11 +25,17 @@
 //! checks off. For a daemon running in another process, `faults.json` in
 //! the fake's directory makes calls fail as if offline or signed out.
 //!
+//! A network profile ([`NetProfile`]; `profile.json` in the fake's
+//! directory for running daemons, [`FakeBackend::set_profile`] in memory)
+//! gives every call round trips and every transfer a share of one pipe per
+//! direction. The cost is slept after the fault checks and before the call
+//! changes or reads the drive, outside the state lock.
+//!
 //! Growth is bounded for long runs (fsx, the scenario matrix): files keep
 //! their last revisions (`PDMOUNT_FAKE_KEEP_REVISIONS`, default 16), the
 //! most recent trashed nodes are kept, and the event and change logs are
-//! trimmed, keeping absolute sequence numbers. Injected failures and
-//! latency stay per process.
+//! trimmed, keeping absolute sequence numbers. Injected failures,
+//! latency and the network's pipes stay per process.
 
 use crate::{
     AccountInfo, Backend, BackendError, BlockInfo, EventId, EventKind, EventPage, FileMeta, LinkId,
@@ -40,7 +46,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha1::Digest;
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -57,6 +63,11 @@ const KEEP_EVENTS: usize = 10_000;
 const KEEP_CHANGES: usize = 50_000;
 /// Journal size that triggers a compaction.
 const COMPACT_BYTES: u64 = 8 << 20;
+/// Children per listing page, and ids per `get_nodes` batch: each costs a
+/// round trip under a network profile.
+const NET_PAGE: usize = 150;
+/// Round trips of an upload: draft, blocks, commit.
+const UPLOAD_RTTS: u32 = 3;
 
 /// Operations of the [`Backend`] trait, for fault injection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,6 +225,120 @@ fn edit_faults(dir: &Path, edit: impl FnOnce(&mut Vec<FaultRule>)) -> Result<()>
     write_replace(&path, &json).map_err(|e| io_error("save faults", e))
 }
 
+/// A simulated network (DESIGN.md §15.1). Every call costs `rtt`, listings
+/// and node batches one per 150 entries, uploads three; block transfers
+/// also take `len / bandwidth` on a pipe the process's calls share.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NetProfile {
+    pub rtt: Duration,
+    /// Upload bandwidth; `None` is unlimited.
+    pub up_bytes_per_sec: Option<u64>,
+    /// Download bandwidth; `None` is unlimited.
+    pub down_bytes_per_sec: Option<u64>,
+}
+
+/// `profile.json`: `{"rtt_ms":80,"up_bytes_per_sec":20000000,"down_bytes_per_sec":20000000}`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ProfileFile {
+    #[serde(default)]
+    rtt_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    up_bytes_per_sec: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    down_bytes_per_sec: Option<u64>,
+}
+
+fn read_profile_file(path: &Path) -> NetProfile {
+    let Ok(json) = std::fs::read(path) else {
+        return NetProfile::default();
+    };
+    match serde_json::from_slice::<ProfileFile>(&json) {
+        Ok(file) => NetProfile {
+            rtt: Duration::from_millis(file.rtt_ms),
+            up_bytes_per_sec: file.up_bytes_per_sec.filter(|rate| *rate > 0),
+            down_bytes_per_sec: file.down_bytes_per_sec.filter(|rate| *rate > 0),
+        },
+        Err(error) => {
+            tracing::warn!(%error, "fake backend: ignoring a malformed profile.json");
+            NetProfile::default()
+        }
+    }
+}
+
+/// The profile in `dir/profile.json`; none (no cost) without the file.
+pub fn read_profile(dir: &Path) -> NetProfile {
+    read_profile_file(&dir.join("profile.json"))
+}
+
+/// Writes `dir/profile.json`; daemons on this fake use it from their next
+/// call.
+pub fn write_profile(dir: &Path, profile: NetProfile) -> Result<()> {
+    std::fs::create_dir_all(dir).map_err(|e| io_error("create dir", e))?;
+    let file = ProfileFile {
+        rtt_ms: profile.rtt.as_millis() as u64,
+        up_bytes_per_sec: profile.up_bytes_per_sec,
+        down_bytes_per_sec: profile.down_bytes_per_sec,
+    };
+    let json = serde_json::to_vec(&file)
+        .map_err(|e| BackendError::Other(format!("fake backend: encode profile: {e}")))?;
+    write_replace(&dir.join("profile.json"), &json).map_err(|e| io_error("save profile", e))
+}
+
+/// Removes `dir/profile.json`: calls cost nothing again.
+pub fn clear_profile(dir: &Path) -> Result<()> {
+    match std::fs::remove_file(dir.join("profile.json")) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(io_error("remove profile", error))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The pipes of a [`NetProfile`], one per direction, shared by every handle
+/// of a process: each holds the time it is busy until. Two daemons on one
+/// fake each have their own.
+struct Links {
+    up: Mutex<tokio::time::Instant>,
+    down: Mutex<tokio::time::Instant>,
+}
+
+impl Links {
+    fn new() -> Self {
+        let now = tokio::time::Instant::now();
+        Self {
+            up: Mutex::new(now),
+            down: Mutex::new(now),
+        }
+    }
+}
+
+/// Sleeps for `len` bytes at `rate` on `link`, after the transfers that
+/// reserved it before.
+async fn transfer(link: &Mutex<tokio::time::Instant>, len: u64, rate: Option<u64>) {
+    let Some(rate) = rate.filter(|rate| *rate > 0) else {
+        return;
+    };
+    let took = Duration::from_secs_f64(len as f64 / rate as f64);
+    let end = {
+        let mut busy = link.lock();
+        *busy = (*busy).max(tokio::time::Instant::now()) + took;
+        *busy
+    };
+    tokio::time::sleep_until(end).await;
+}
+
+/// Sleeps for `count` round trips.
+async fn round_trips(profile: &NetProfile, count: u32) {
+    if !profile.rtt.is_zero() && count > 0 {
+        tokio::time::sleep(profile.rtt * count).await;
+    }
+}
+
+/// Round trips for `entries` listed or fetched in pages.
+fn pages(entries: usize) -> u32 {
+    entries.div_ceil(NET_PAGE).max(1) as u32
+}
+
 /// A remote change applied by the fake, in order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FakeChange {
@@ -307,7 +432,7 @@ fn default_keep_revisions() -> usize {
 }
 
 fn io_error(context: &str, error: std::io::Error) -> BackendError {
-    BackendError::Other(format!("fake backend: {context}: {error}"))
+    BackendError::local_io(format_args!("fake backend: {context}"), error)
 }
 
 /// Settings and counters, journaled as one record.
@@ -404,6 +529,20 @@ struct State {
     /// `faults.json` as last read: (modified, length) and its rules.
     #[serde(skip)]
     fault_cache: Option<((SystemTime, u64), Vec<FaultRule>)>,
+    /// The network profile of this process's calls.
+    #[serde(skip)]
+    profile: NetProfile,
+    /// `profile.json` as last read: (modified, length).
+    #[serde(skip)]
+    profile_stamp: Option<(SystemTime, u64)>,
+    /// Children that are not trashed, by parent and name; kept in step by
+    /// [`State::put_node`] and [`State::remove_node`], rebuilt on load.
+    #[serde(skip)]
+    children: HashMap<LinkId, BTreeMap<String, LinkId>>,
+    /// Bytes of every kept revision (the quota's use), kept in step like
+    /// `children`.
+    #[serde(skip)]
+    used: u64,
     #[serde(skip)]
     delta: Delta,
 }
@@ -449,6 +588,10 @@ impl State {
             commit_checks_revision: true,
             name_hash_enforced: true,
             fault_cache: None,
+            profile: NetProfile::default(),
+            profile_stamp: None,
+            children: HashMap::new(),
+            used: 0,
             delta: Delta::default(),
         }
     }
@@ -499,6 +642,25 @@ impl State {
         Ok(())
     }
 
+    /// Re-reads `profile.json` when it changed; a missing file is no cost.
+    fn check_profile_file(&mut self) {
+        let Some(dir) = &self.dir else {
+            return;
+        };
+        let path = dir.join("profile.json");
+        let stamp = std::fs::metadata(&path)
+            .and_then(|m| Ok((m.modified()?, m.len())))
+            .ok();
+        if stamp != self.profile_stamp {
+            self.profile = if stamp.is_some() {
+                read_profile_file(&path)
+            } else {
+                NetProfile::default()
+            };
+            self.profile_stamp = stamp;
+        }
+    }
+
     fn node(&self, link: &LinkId) -> Result<&Node> {
         self.nodes
             .get(link)
@@ -515,9 +677,57 @@ impl State {
     }
 
     fn child_named(&self, parent: &LinkId, name: &str) -> Option<&Node> {
-        self.nodes
-            .values()
-            .find(|n| !n.trashed && n.parent.as_ref() == Some(parent) && n.name == name)
+        let link = self.children.get(parent)?.get(name)?;
+        self.nodes.get(link)
+    }
+
+    /// Inserts or replaces a node, keeping the child index and the used
+    /// total in step. Every change of a node goes through here.
+    fn put_node(&mut self, node: Node) {
+        self.remove_node(&node.link);
+        self.used += node.revisions.iter().map(|r| r.size).sum::<u64>();
+        if !node.trashed
+            && let Some(parent) = &node.parent
+        {
+            self.children
+                .entry(parent.clone())
+                .or_default()
+                .insert(node.name.clone(), node.link.clone());
+        }
+        self.nodes.insert(node.link.clone(), node);
+    }
+
+    fn remove_node(&mut self, link: &LinkId) -> Option<Node> {
+        let node = self.nodes.remove(link)?;
+        self.used -= node.revisions.iter().map(|r| r.size).sum::<u64>();
+        if let Some(parent) = &node.parent
+            && let Some(children) = self.children.get_mut(parent)
+            && children.get(&node.name) == Some(link)
+        {
+            children.remove(&node.name);
+            if children.is_empty() {
+                self.children.remove(parent);
+            }
+        }
+        Some(node)
+    }
+
+    /// Changes a node through [`State::put_node`].
+    fn update_node(&mut self, link: &LinkId, change: impl FnOnce(&mut Node)) {
+        if let Some(mut node) = self.remove_node(link) {
+            change(&mut node);
+            self.put_node(node);
+        }
+    }
+
+    /// Rebuilds the child index and the used total from the nodes.
+    fn reindex(&mut self) {
+        let nodes = std::mem::take(&mut self.nodes);
+        self.children.clear();
+        self.used = 0;
+        for node in nodes.into_values() {
+            self.put_node(node);
+        }
     }
 
     fn ensure_name_free(&self, parent: &LinkId, name: &str, except: Option<&LinkId>) -> Result<()> {
@@ -529,16 +739,8 @@ impl State {
         }
     }
 
-    fn used(&self) -> u64 {
-        self.nodes
-            .values()
-            .flat_map(|n| &n.revisions)
-            .map(|r| r.size)
-            .sum()
-    }
-
     fn ensure_quota(&self, extra: u64) -> Result<()> {
-        if self.used() + extra > self.quota_max {
+        if self.used + extra > self.quota_max {
             Err(BackendError::QuotaExceeded)
         } else {
             Ok(())
@@ -587,52 +789,40 @@ impl State {
             .map(|dir| dir.join("blobs").join(&revision.0))
     }
 
-    /// `len` bytes of a revision from `start`.
-    fn read_range(&self, revision: &Revision, start: u64, len: u64) -> Result<Bytes> {
+    /// Where `len` bytes of a revision from `start` are.
+    fn locate(&self, revision: &Revision, start: u64, len: u64) -> Result<BlockRead> {
         if let Some(content) = &revision.content {
             let end = (start + len).min(content.len() as u64);
-            return Ok(content.slice(start as usize..end as usize));
+            return Ok(BlockRead::Memory(
+                content.slice(start as usize..end as usize),
+            ));
         }
         let path = self
             .blob(&revision.id)
             .ok_or_else(|| BackendError::Other(format!("no content for {}", revision.id)))?;
-        let mut file = std::fs::File::open(&path).map_err(|e| io_error("open blob", e))?;
-        file.seek(SeekFrom::Start(start))
-            .map_err(|e| io_error("seek blob", e))?;
-        let mut out = Vec::with_capacity(len as usize);
-        file.take(len)
-            .read_to_end(&mut out)
-            .map_err(|e| io_error("read blob", e))?;
-        Ok(Bytes::from(out))
+        Ok(BlockRead::Blob { path, start, len })
     }
 
-    /// [`State::read_range`] into `buf`, without allocating.
-    fn read_range_into(
-        &self,
-        revision: &Revision,
-        start: u64,
-        len: u64,
-        buf: &mut [u8],
-    ) -> Result<usize> {
-        let capacity = buf.len();
-        let target = buf.get_mut(..len as usize).ok_or_else(|| {
-            BackendError::Integrity(format!(
-                "block has {len} bytes, more than the {capacity} expected"
-            ))
-        })?;
-        if let Some(content) = &revision.content {
-            let end = (start + len).min(content.len() as u64);
-            let source = &content[start as usize..end as usize];
-            target[..source.len()].copy_from_slice(source);
-            return Ok(source.len());
+    /// Block `index` (from 1) of a file's revision.
+    fn block(&self, file: &LinkId, revision: &RevisionId, index: u32) -> Result<BlockRead> {
+        let node = self.nodes.get(file).ok_or(BackendError::NotFound)?;
+        let rev = node.revision(revision)?;
+        let block = self.block_size as u64;
+        let start = u64::from(index)
+            .checked_sub(1)
+            .map(|i| i * block)
+            .filter(|&start| start < rev.size)
+            .ok_or(BackendError::NotFound)?;
+        self.locate(rev, start, block.min(rev.size - start))
+    }
+
+    /// `len` bytes of a revision from `start`, read under the lock (test
+    /// helpers only; calls read after releasing it).
+    fn read_range(&self, revision: &Revision, start: u64, len: u64) -> Result<Bytes> {
+        match self.locate(revision, start, len)? {
+            BlockRead::Memory(bytes) => Ok(bytes),
+            BlockRead::Blob { path, start, len } => read_blob(&path, start, len),
         }
-        let path = self
-            .blob(&revision.id)
-            .ok_or_else(|| BackendError::Other(format!("no content for {}", revision.id)))?;
-        let file = std::fs::File::open(&path).map_err(|e| io_error("open blob", e))?;
-        std::os::unix::fs::FileExt::read_exact_at(&file, target, start)
-            .map_err(|e| io_error("read blob", e))?;
-        Ok(target.len())
     }
 
     fn content(&self, revision: &Revision) -> Result<Bytes> {
@@ -691,11 +881,15 @@ impl State {
         let mut dropped = Vec::new();
         let keep = self.keep_revisions.max(1);
         for link in self.delta.nodes.clone() {
-            if let Some(node) = self.nodes.get_mut(&link)
-                && node.revisions.len() > keep
+            if self
+                .nodes
+                .get(&link)
+                .is_some_and(|node| node.revisions.len() > keep)
             {
-                let excess = node.revisions.len() - keep;
-                dropped.extend(node.revisions.drain(..excess).map(|r| r.id));
+                self.update_node(&link, |node| {
+                    let excess = node.revisions.len() - keep;
+                    dropped.extend(node.revisions.drain(..excess).map(|r| r.id));
+                });
             }
         }
         if self.delta.trashed {
@@ -708,7 +902,7 @@ impl State {
             if trashed.len() > KEEP_TRASHED * 2 {
                 trashed.sort();
                 for (_, link) in &trashed[..trashed.len() - KEEP_TRASHED] {
-                    if let Some(node) = self.nodes.remove(link) {
+                    if let Some(node) = self.remove_node(link) {
                         dropped.extend(node.revisions.into_iter().map(|r| r.id));
                     }
                     self.delta.nodes.insert(link.clone());
@@ -820,11 +1014,9 @@ impl State {
 
     fn apply(&mut self, record: Record) {
         match record {
-            Record::Node(node) => {
-                self.nodes.insert(node.link.clone(), node);
-            }
+            Record::Node(node) => self.put_node(node),
             Record::Removed(link) => {
-                self.nodes.remove(&link);
+                self.remove_node(&link);
             }
             Record::Event(event) => self.events.push(event),
             Record::Change(change) => self.changes.push(change),
@@ -919,6 +1111,8 @@ impl State {
             quota_max,
             block_size,
             keep_revisions,
+            children,
+            used,
             ..
         } = loaded;
         self.generation = generation;
@@ -935,6 +1129,8 @@ impl State {
         self.quota_max = quota_max;
         self.block_size = block_size;
         self.keep_revisions = keep_revisions;
+        self.children = children;
+        self.used = used;
     }
 }
 
@@ -964,12 +1160,39 @@ fn load_state(dir: &Path) -> Result<State> {
     };
     state.dir = Some(dir.to_owned());
     state.epoch = read_epoch(dir)?;
+    state.reindex();
     match std::fs::read(dir.join("journal.jsonl")) {
         Ok(journal) => state.journal_offset = state.replay(&journal, 0),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(io_error("read journal", error)),
     }
     Ok(state)
+}
+
+/// A block's bytes as located under the lock, read after it is released.
+enum BlockRead {
+    Memory(Bytes),
+    Blob { path: PathBuf, start: u64, len: u64 },
+}
+
+impl BlockRead {
+    fn len(&self) -> u64 {
+        match self {
+            BlockRead::Memory(bytes) => bytes.len() as u64,
+            BlockRead::Blob { len, .. } => *len,
+        }
+    }
+}
+
+fn read_blob(path: &Path, start: u64, len: u64) -> Result<Bytes> {
+    let mut file = std::fs::File::open(path).map_err(|e| io_error("open blob", e))?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(|e| io_error("seek blob", e))?;
+    let mut out = Vec::with_capacity(len as usize);
+    file.take(len)
+        .read_to_end(&mut out)
+        .map_err(|e| io_error("read blob", e))?;
+    Ok(Bytes::from(out))
 }
 
 /// Replaces `path` atomically (a killed process leaves the old content).
@@ -1022,6 +1245,7 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct FakeBackend {
     state: Arc<Mutex<State>>,
     client: Arc<FakeClient>,
+    links: Arc<Links>,
 }
 
 impl Default for FakeBackend {
@@ -1037,6 +1261,7 @@ impl FakeBackend {
         Self {
             state: Arc::new(Mutex::new(State::empty())),
             client: Arc::default(),
+            links: Arc::new(Links::new()),
         }
     }
 
@@ -1045,12 +1270,13 @@ impl FakeBackend {
         Self {
             state: Arc::clone(&self.state),
             client: Arc::new(client),
+            links: Arc::clone(&self.links),
         }
     }
 
     /// Opens the fake persisted in `dir`, creating an empty drive there if
-    /// needed. `PDMOUNT_FAKE_KEEP_REVISIONS` sets how many revisions files
-    /// keep.
+    /// needed, with the network profile of `dir/profile.json`.
+    /// `PDMOUNT_FAKE_KEEP_REVISIONS` sets how many revisions files keep.
     pub fn open(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir.join("blobs")).map_err(|e| io_error("create dir", e))?;
         let _lock = lock_dir(dir)?;
@@ -1068,9 +1294,11 @@ impl FakeBackend {
             state.delta.meta = true;
             state.finish()?;
         }
+        state.check_profile_file();
         Ok(Self {
             state: Arc::new(Mutex::new(state)),
             client: Arc::default(),
+            links: Arc::new(Links::new()),
         })
     }
 
@@ -1085,7 +1313,7 @@ impl FakeBackend {
     }
 
     pub fn set_quota(&self, max: u64) {
-        let _ = self.with_state(None, |s| {
+        let _ = self.with_state(|s| {
             s.quota_max = max;
             s.delta.meta = true;
             Ok(())
@@ -1094,7 +1322,7 @@ impl FakeBackend {
 
     pub fn set_block_size(&self, block_size: usize) {
         assert!(block_size > 0, "block size must be positive");
-        let _ = self.with_state(None, |s| {
+        let _ = self.with_state(|s| {
             s.block_size = block_size;
             s.delta.meta = true;
             Ok(())
@@ -1104,7 +1332,7 @@ impl FakeBackend {
     /// How many revisions each file keeps (older ones are deleted).
     pub fn set_revision_limit(&self, keep: usize) {
         assert!(keep > 0, "files keep at least one revision");
-        let _ = self.with_state(None, |s| {
+        let _ = self.with_state(|s| {
             s.keep_revisions = keep;
             s.delta.meta = true;
             Ok(())
@@ -1156,7 +1384,7 @@ impl FakeBackend {
     /// SHA-1 of every kept revision of every node, trashed ones included:
     /// what is still reachable on the server.
     pub fn all_revision_sha1s(&self) -> HashSet<[u8; 20]> {
-        self.with_state(None, |s| {
+        self.with_state(|s| {
             Ok(s.nodes
                 .values()
                 .flat_map(|n| &n.revisions)
@@ -1164,6 +1392,12 @@ impl FakeBackend {
                 .collect())
         })
         .unwrap_or_default()
+    }
+
+    /// The network profile of an in-memory fake (a persisted one reads
+    /// `profile.json`, which replaces this when it changes).
+    pub fn set_profile(&self, profile: NetProfile) {
+        self.state.lock().profile = profile;
     }
 
     /// Delays every read call (root, listings, blocks) by `latency`.
@@ -1185,7 +1419,7 @@ impl FakeBackend {
 
     /// Content of the active revision of a file.
     pub fn content(&self, file: &LinkId) -> Option<Bytes> {
-        self.with_state(None, |s| {
+        self.with_state(|s| {
             let Some(revision) = s.nodes.get(file).and_then(Node::active) else {
                 return Ok(None);
             };
@@ -1197,22 +1431,20 @@ impl FakeBackend {
 
     /// Revisions a file still keeps.
     pub fn revision_count(&self, file: &LinkId) -> usize {
-        self.with_state(None, |s| {
-            Ok(s.nodes.get(file).map_or(0, |n| n.revisions.len()))
-        })
-        .unwrap_or(0)
+        self.with_state(|s| Ok(s.nodes.get(file).map_or(0, |n| n.revisions.len())))
+            .unwrap_or(0)
     }
 
     /// The changes still kept, in order.
     pub fn changes(&self) -> Vec<FakeChange> {
-        self.with_state(None, |s| Ok(s.changes.clone()))
+        self.with_state(|s| Ok(s.changes.clone()))
             .unwrap_or_default()
     }
 
     /// Kept changes with sequence numbers above `after`. Numbers start at 1
     /// and survive trimming, so callers can remember where they were.
     pub fn changes_since(&self, after: u64) -> Vec<(u64, FakeChange)> {
-        self.with_state(None, |s| {
+        self.with_state(|s| {
             Ok(s.changes
                 .iter()
                 .enumerate()
@@ -1257,22 +1489,49 @@ impl FakeBackend {
     }
 
     /// Runs `f` on the locked, current state and journals what it changed.
-    /// With `op`, an injected failure for it fires first.
-    fn with_state<T>(
-        &self,
-        op: Option<FakeOp>,
-        f: impl FnOnce(&mut State) -> Result<T>,
-    ) -> Result<T> {
+    fn with_state<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
         let mut state = self.state.lock();
         let _lock = state.dir.as_deref().map(lock_dir).transpose()?;
         state.refresh()?;
-        if let Some(op) = op {
-            state.check_fault_file(self.client.uid.as_deref())?;
-            state.take_fault(op)?;
-        }
         let result = f(&mut state);
         state.finish()?;
         result
+    }
+
+    /// The start of a call of `op`: its failures (`faults.json`, then an
+    /// injected one), then `rtts` round trips of the network profile, slept
+    /// without the lock. Returns the profile for the call's other costs.
+    async fn enter(&self, op: FakeOp, rtts: u32) -> Result<NetProfile> {
+        let profile = {
+            let mut state = self.state.lock();
+            state.check_fault_file(self.client.uid.as_deref())?;
+            state.take_fault(op)?;
+            state.check_profile_file();
+            state.profile
+        };
+        round_trips(&profile, rtts).await;
+        Ok(profile)
+    }
+
+    /// The rest of an upload's cost after the draft: the blocks' round trip
+    /// and transfer, then the commit's round trip.
+    async fn send_blocks(&self, profile: &NetProfile, size: u64) {
+        round_trips(profile, 1).await;
+        transfer(&self.links.up, size, profile.up_bytes_per_sec).await;
+        round_trips(profile, UPLOAD_RTTS - 2).await;
+    }
+
+    /// Reads a block located under the lock, after it was released.
+    async fn read_block(&self, block: BlockRead, profile: &NetProfile) -> Result<Bytes> {
+        transfer(&self.links.down, block.len(), profile.down_bytes_per_sec).await;
+        match block {
+            BlockRead::Memory(bytes) => Ok(bytes),
+            BlockRead::Blob { path, start, len } => {
+                tokio::task::spawn_blocking(move || read_blob(&path, start, len))
+                    .await
+                    .map_err(|e| BackendError::Other(format!("fake backend: read task: {e}")))?
+            }
+        }
     }
 
     /// Reads upload content: into memory, or into a temporary blob for a
@@ -1347,7 +1606,8 @@ impl Backend for FakeBackend {
     }
 
     async fn account(&self) -> Result<AccountInfo> {
-        self.with_state(Some(FakeOp::Account), |s| {
+        self.enter(FakeOp::Account, 1).await?;
+        self.with_state(|s| {
             Ok(AccountInfo {
                 username: s.username.clone(),
                 root: s.root.clone(),
@@ -1357,28 +1617,33 @@ impl Backend for FakeBackend {
 
     async fn root(&self) -> Result<RemoteNode> {
         self.delay().await;
-        self.with_state(Some(FakeOp::Root), |s| Ok(s.nodes[&s.root].to_remote()))
+        self.enter(FakeOp::Root, 1).await?;
+        self.with_state(|s| Ok(s.nodes[&s.root].to_remote()))
     }
 
     async fn list_children(&self, folder: &LinkId) -> Result<Vec<RemoteNode>> {
         self.delay().await;
         self.checkpoint(FakePoint::ListBeforeRead).await;
-        self.with_state(Some(FakeOp::ListChildren), |s| {
+        let profile = self.enter(FakeOp::ListChildren, 1).await?;
+        let children = self.with_state(|s| {
             s.folder(folder)?;
-            let mut children: Vec<_> = s
-                .nodes
-                .values()
-                .filter(|n| !n.trashed && n.parent.as_ref() == Some(folder))
-                .map(Node::to_remote)
-                .collect();
-            children.sort_by(|a, b| a.name.cmp(&b.name));
-            Ok(children)
-        })
+            // By name, as the index keeps them.
+            Ok(s.children.get(folder).map_or_else(Vec::new, |children| {
+                children
+                    .values()
+                    .map(|link| s.nodes[link].to_remote())
+                    .collect()
+            }))
+        })?;
+        // The pages after the first.
+        round_trips(&profile, pages(children.len()) - 1).await;
+        Ok(children)
     }
 
     async fn get_nodes(&self, ids: &[LinkId]) -> Result<Vec<Option<RemoteNode>>> {
         self.delay().await;
-        self.with_state(Some(FakeOp::GetNodes), |s| {
+        self.enter(FakeOp::GetNodes, pages(ids.len())).await?;
+        self.with_state(|s| {
             Ok(ids
                 .iter()
                 .map(|id| s.nodes.get(id).map(Node::to_remote))
@@ -1388,7 +1653,8 @@ impl Backend for FakeBackend {
 
     async fn blocks(&self, file: &LinkId, revision: &RevisionId) -> Result<Vec<BlockInfo>> {
         self.delay().await;
-        self.with_state(Some(FakeOp::Blocks), |s| {
+        self.enter(FakeOp::Blocks, 1).await?;
+        self.with_state(|s| {
             let node = s.nodes.get(file).ok_or(BackendError::NotFound)?;
             let rev = node.revision(revision)?;
             let block = s.block_size as u64;
@@ -1403,17 +1669,9 @@ impl Backend for FakeBackend {
 
     async fn fetch_block(&self, file: &LinkId, revision: &RevisionId, index: u32) -> Result<Bytes> {
         self.delay().await;
-        self.with_state(Some(FakeOp::FetchBlock), |s| {
-            let node = s.nodes.get(file).ok_or(BackendError::NotFound)?;
-            let rev = node.revision(revision)?;
-            let block = s.block_size as u64;
-            let start = u64::from(index)
-                .checked_sub(1)
-                .map(|i| i * block)
-                .filter(|&start| start < rev.size)
-                .ok_or(BackendError::NotFound)?;
-            s.read_range(rev, start, block.min(rev.size - start))
-        })
+        let profile = self.enter(FakeOp::FetchBlock, 1).await?;
+        let block = self.with_state(|s| s.block(file, revision, index))?;
+        self.read_block(block, &profile).await
     }
 
     async fn fetch_block_into(
@@ -1424,17 +1682,34 @@ impl Backend for FakeBackend {
         buf: &mut [u8],
     ) -> Result<usize> {
         self.delay().await;
-        self.with_state(Some(FakeOp::FetchBlock), |s| {
-            let node = s.nodes.get(file).ok_or(BackendError::NotFound)?;
-            let rev = node.revision(revision)?;
-            let block = s.block_size as u64;
-            let start = u64::from(index)
-                .checked_sub(1)
-                .map(|i| i * block)
-                .filter(|&start| start < rev.size)
-                .ok_or(BackendError::NotFound)?;
-            s.read_range_into(rev, start, block.min(rev.size - start), buf)
-        })
+        let profile = self.enter(FakeOp::FetchBlock, 1).await?;
+        let block = self.with_state(|s| s.block(file, revision, index))?;
+        let (len, capacity) = (block.len(), buf.len());
+        let target = buf.get_mut(..len as usize).ok_or_else(|| {
+            BackendError::Integrity(format!(
+                "block has {len} bytes, more than the {capacity} expected"
+            ))
+        })?;
+        transfer(&self.links.down, len, profile.down_bytes_per_sec).await;
+        match block {
+            BlockRead::Memory(bytes) => target.copy_from_slice(&bytes),
+            BlockRead::Blob { path, start, .. } => {
+                // `buf` is borrowed, so not `spawn_blocking`: the read
+                // moves this worker's other tasks away instead.
+                let mut read = || -> Result<()> {
+                    let file = std::fs::File::open(&path).map_err(|e| io_error("open blob", e))?;
+                    std::os::unix::fs::FileExt::read_exact_at(&file, target, start)
+                        .map_err(|e| io_error("read blob", e))
+                };
+                match tokio::runtime::Handle::current().runtime_flavor() {
+                    tokio::runtime::RuntimeFlavor::MultiThread => {
+                        tokio::task::block_in_place(read)?
+                    }
+                    _ => read()?,
+                }
+            }
+        }
+        Ok(len as usize)
     }
 
     async fn upload_new(
@@ -1445,32 +1720,31 @@ impl Backend for FakeBackend {
         meta: FileMeta,
     ) -> Result<(LinkId, RevisionId)> {
         let staged = self.stage(source).await?;
+        let profile = self.enter(FakeOp::UploadNew, 1).await?;
         // Draft: the server checks the name when the draft is created ...
-        self.with_state(Some(FakeOp::UploadNew), |s| {
+        self.with_state(|s| {
             s.folder(parent)?;
             s.ensure_name_free(parent, name, None)
         })?;
+        self.send_blocks(&profile, staged.size).await;
         self.checkpoint(FakePoint::NewBeforeCommit).await;
         // ... and again when the file is committed.
-        self.with_state(None, |s| {
+        self.with_state(|s| {
             s.folder(parent)?;
             s.ensure_name_free(parent, name, None)?;
             s.ensure_quota(staged.size)?;
             let link = LinkId::new(s.new_id("link-"));
             let (revision, rev) = s.new_revision(staged, &meta, &self.client)?;
-            s.nodes.insert(
-                link.clone(),
-                Node {
-                    link: link.clone(),
-                    parent: Some(parent.clone()),
-                    name: name.to_owned(),
-                    kind: NodeKind::File,
-                    trashed: false,
-                    folder_mtime: None,
-                    revisions: vec![rev],
-                    trashed_at: 0,
-                },
-            );
+            s.put_node(Node {
+                link: link.clone(),
+                parent: Some(parent.clone()),
+                name: name.to_owned(),
+                kind: NodeKind::File,
+                trashed: false,
+                folder_mtime: None,
+                revisions: vec![rev],
+                trashed_at: 0,
+            });
             s.touch(&link);
             s.push_event(EventKind::Create, &link);
             s.push_change(FakeChange::CreatedFile {
@@ -1489,8 +1763,9 @@ impl Backend for FakeBackend {
         meta: FileMeta,
     ) -> Result<RevisionId> {
         let staged = self.stage(source).await?;
+        let profile = self.enter(FakeOp::UploadRevision, 1).await?;
         // Draft: the base must be the active revision.
-        self.with_state(Some(FakeOp::UploadRevision), |s| {
+        self.with_state(|s| {
             let node = s.node(file)?;
             if node.kind != NodeKind::File {
                 return Err(BackendError::Other(format!("{file} is not a file")));
@@ -1501,17 +1776,16 @@ impl Backend for FakeBackend {
             }
             Ok(())
         })?;
+        self.send_blocks(&profile, staged.size).await;
         self.checkpoint(FakePoint::RevisionBeforeCommit).await;
-        self.with_state(None, |s| {
+        self.with_state(|s| {
             let current = s.node(file)?.active().map(|r| r.id.clone());
             if s.commit_checks_revision && current.as_ref() != Some(base) {
                 return Err(BackendError::RevisionConflict { current });
             }
             s.ensure_quota(staged.size)?;
             let (revision, rev) = s.new_revision(staged, &meta, &self.client)?;
-            if let Some(node) = s.nodes.get_mut(file) {
-                node.revisions.push(rev);
-            }
+            s.update_node(file, |node| node.revisions.push(rev));
             s.touch(file);
             s.push_event(EventKind::UpdateContent, file);
             s.push_change(FakeChange::NewRevision {
@@ -1529,23 +1803,21 @@ impl Backend for FakeBackend {
         mtime: SystemTime,
     ) -> Result<LinkId> {
         self.checkpoint(FakePoint::CreateFolderBeforeCommit).await;
-        self.with_state(Some(FakeOp::CreateFolder), |s| {
+        self.enter(FakeOp::CreateFolder, 1).await?;
+        self.with_state(|s| {
             s.folder(parent)?;
             s.ensure_name_free(parent, name, None)?;
             let link = LinkId::new(s.new_id("link-"));
-            s.nodes.insert(
-                link.clone(),
-                Node {
-                    link: link.clone(),
-                    parent: Some(parent.clone()),
-                    name: name.to_owned(),
-                    kind: NodeKind::Folder,
-                    trashed: false,
-                    folder_mtime: Some(mtime),
-                    revisions: Vec::new(),
-                    trashed_at: 0,
-                },
-            );
+            s.put_node(Node {
+                link: link.clone(),
+                parent: Some(parent.clone()),
+                name: name.to_owned(),
+                kind: NodeKind::Folder,
+                trashed: false,
+                folder_mtime: Some(mtime),
+                revisions: Vec::new(),
+                trashed_at: 0,
+            });
             s.touch(&link);
             s.push_event(EventKind::Create, &link);
             s.push_change(FakeChange::CreatedFolder {
@@ -1564,7 +1836,8 @@ impl Backend for FakeBackend {
         expected: Option<&NameHash>,
     ) -> Result<()> {
         self.checkpoint(FakePoint::RenameBeforeCommit).await;
-        self.with_state(Some(FakeOp::Rename), |s| {
+        self.enter(FakeOp::Rename, 1).await?;
+        self.with_state(|s| {
             if node == &s.root {
                 return Err(BackendError::PermissionDenied);
             }
@@ -1586,10 +1859,10 @@ impl Backend for FakeBackend {
                 return Err(BackendError::InvalidMove);
             }
             s.ensure_name_free(&parent, new_name, Some(node))?;
-            if let Some(entry) = s.nodes.get_mut(node) {
+            s.update_node(node, |entry| {
                 entry.parent = Some(parent);
                 entry.name = new_name.to_owned();
-            }
+            });
             s.touch(node);
             s.push_event(EventKind::UpdateMetadata, node);
             s.push_change(FakeChange::Renamed {
@@ -1602,7 +1875,8 @@ impl Backend for FakeBackend {
 
     async fn trash(&self, nodes: &[LinkId]) -> Result<Vec<Result<()>>> {
         self.checkpoint(FakePoint::TrashBeforeCommit).await;
-        self.with_state(Some(FakeOp::Trash), |s| {
+        self.enter(FakeOp::Trash, 1).await?;
+        self.with_state(|s| {
             Ok(nodes
                 .iter()
                 .map(|link| {
@@ -1611,10 +1885,10 @@ impl Backend for FakeBackend {
                     }
                     s.node(link)?;
                     let at = s.generation + 1;
-                    if let Some(entry) = s.nodes.get_mut(link) {
+                    s.update_node(link, |entry| {
                         entry.trashed = true;
                         entry.trashed_at = at;
-                    }
+                    });
                     s.touch(link);
                     s.delta.trashed = true;
                     s.push_event(EventKind::Delete, link);
@@ -1626,7 +1900,8 @@ impl Backend for FakeBackend {
     }
 
     async fn revisions(&self, file: &LinkId) -> Result<Vec<RevisionMeta>> {
-        self.with_state(Some(FakeOp::Revisions), |s| {
+        self.enter(FakeOp::Revisions, 1).await?;
+        self.with_state(|s| {
             let node = s.nodes.get(file).ok_or(BackendError::NotFound)?;
             if node.kind != NodeKind::File {
                 return Err(BackendError::Other(format!("{file} is not a file")));
@@ -1649,13 +1924,13 @@ impl Backend for FakeBackend {
     }
 
     async fn latest_event_id(&self) -> Result<EventId> {
-        self.with_state(Some(FakeOp::LatestEventId), |s| {
-            Ok(EventId::new(s.latest_event().to_string()))
-        })
+        self.enter(FakeOp::LatestEventId, 1).await?;
+        self.with_state(|s| Ok(EventId::new(s.latest_event().to_string())))
     }
 
     async fn poll_events(&self, since: &EventId) -> Result<EventPage> {
-        self.with_state(Some(FakeOp::PollEvents), |s| {
+        self.enter(FakeOp::PollEvents, 1).await?;
+        self.with_state(|s| {
             let latest = s.latest_event();
             let since: u64 = since
                 .as_str()
@@ -1684,9 +1959,10 @@ impl Backend for FakeBackend {
     }
 
     async fn storage_info(&self) -> Result<StorageInfo> {
-        self.with_state(Some(FakeOp::StorageInfo), |s| {
+        self.enter(FakeOp::StorageInfo, 1).await?;
+        self.with_state(|s| {
             Ok(StorageInfo {
-                used: s.used(),
+                used: s.used,
                 max: s.quota_max,
             })
         })
@@ -2558,5 +2834,229 @@ mod tests {
         daemon.root().await.expect("a missing file is no faults");
         std::fs::write(dir.path().join("faults.json"), b"not json").expect("write");
         daemon.root().await.expect("a malformed file is ignored");
+    }
+
+    fn rtt(ms: u64) -> NetProfile {
+        NetProfile {
+            rtt: Duration::from_millis(ms),
+            ..NetProfile::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn round_trips_cost_time_but_overlap() {
+        let fake = FakeBackend::new();
+        let root = root(&fake).await;
+        fake.set_profile(rtt(50));
+        let start = std::time::Instant::now();
+        fake.list_children(&root).await.expect("list");
+        assert!(start.elapsed() >= Duration::from_millis(50));
+        let start = std::time::Instant::now();
+        let (a, b) = tokio::join!(fake.list_children(&root), fake.list_children(&root));
+        a.and(b).expect("lists");
+        let both = start.elapsed();
+        assert!(
+            both >= Duration::from_millis(50) && both < Duration::from_millis(100),
+            "{both:?}"
+        );
+        // An upload is three round trips; a long listing one per 150 children.
+        let start = std::time::Instant::now();
+        fake.upload_new(&root, "f", bytes(b"x"), meta())
+            .await
+            .expect("upload");
+        assert!(start.elapsed() >= Duration::from_millis(150));
+        fake.set_profile(NetProfile::default());
+        for i in 0..300 {
+            fake.create_folder(&root, &format!("d{i}"), SystemTime::UNIX_EPOCH)
+                .await
+                .expect("mkdir");
+        }
+        fake.set_profile(rtt(50));
+        let start = std::time::Instant::now();
+        assert_eq!(fake.list_children(&root).await.expect("list").len(), 301);
+        assert!(start.elapsed() >= Duration::from_millis(150), "3 pages");
+    }
+
+    #[tokio::test]
+    async fn transfers_share_one_pipe_per_direction() {
+        let fake = FakeBackend::new();
+        fake.set_block_size(1_000_000);
+        let root = root(&fake).await;
+        let data = Bytes::from(vec![7u8; 2_000_000]);
+        let (file, rev) = fake
+            .upload_new(&root, "f", UploadSource::Bytes(data), meta())
+            .await
+            .expect("upload");
+        fake.set_profile(NetProfile {
+            down_bytes_per_sec: Some(10_000_000),
+            ..NetProfile::default()
+        });
+        let start = std::time::Instant::now();
+        let mut buf = vec![0u8; 1_000_000];
+        let (first, second) = tokio::join!(
+            fake.fetch_block(&file, &rev, 1),
+            fake.fetch_block_into(&file, &rev, 2, &mut buf)
+        );
+        assert_eq!(first.expect("block 1").len(), 1_000_000);
+        assert_eq!(second, Ok(1_000_000));
+        let both = start.elapsed();
+        assert!(
+            both >= Duration::from_millis(195) && both < Duration::from_millis(300),
+            "two 100 ms transfers one after the other: {both:?}"
+        );
+        // Uploads use the other direction: unlimited here.
+        let start = std::time::Instant::now();
+        fake.upload_revision(&file, &rev, bytes(b"y"), meta())
+            .await
+            .expect("revision");
+        assert!(start.elapsed() < Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn a_daemon_picks_up_a_changed_profile_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_profile(dir.path(), rtt(40)).expect("profile");
+        let daemon = FakeBackend::open(dir.path()).expect("open");
+        let timed = || async {
+            let start = std::time::Instant::now();
+            daemon.root().await.expect("root");
+            start.elapsed()
+        };
+        assert!(timed().await >= Duration::from_millis(40), "read at open");
+        clear_profile(dir.path()).expect("clear");
+        assert!(timed().await < Duration::from_millis(40), "cleared");
+        let profile = NetProfile {
+            rtt: Duration::from_millis(60),
+            up_bytes_per_sec: Some(20_000_000),
+            down_bytes_per_sec: None,
+        };
+        write_profile(dir.path(), profile).expect("profile");
+        assert_eq!(read_profile(dir.path()), profile);
+        assert!(timed().await >= Duration::from_millis(60), "changed");
+        std::fs::write(dir.path().join("profile.json"), b"not json").expect("write");
+        assert!(
+            timed().await < Duration::from_millis(40),
+            "malformed: no cost"
+        );
+    }
+
+    #[tokio::test]
+    async fn faults_fire_before_the_round_trip() {
+        let fake = FakeBackend::new();
+        fake.set_profile(rtt(200));
+        fake.inject_failure(FakeOp::Root, BackendError::Transient("503".into()));
+        let start = std::time::Instant::now();
+        assert!(fake.root().await.is_err());
+        assert!(start.elapsed() < Duration::from_millis(200));
+    }
+
+    /// The child index and the used total equal a full scan.
+    fn assert_index_consistent(fake: &FakeBackend) {
+        let state = fake.state.lock();
+        let mut scanned: HashMap<LinkId, BTreeMap<String, LinkId>> = HashMap::new();
+        for node in state.nodes.values().filter(|n| !n.trashed) {
+            if let Some(parent) = &node.parent {
+                let previous = scanned
+                    .entry(parent.clone())
+                    .or_default()
+                    .insert(node.name.clone(), node.link.clone());
+                assert!(previous.is_none(), "duplicate name {}", node.name);
+            }
+        }
+        assert_eq!(state.children, scanned);
+        let used: u64 = state
+            .nodes
+            .values()
+            .flat_map(|n| &n.revisions)
+            .map(|r| r.size)
+            .sum();
+        assert_eq!(state.used, used);
+    }
+
+    #[tokio::test]
+    async fn the_child_index_follows_random_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = FakeBackend::open(dir.path()).expect("open");
+        // A second process on the same drive applies the first one's journal.
+        let other = FakeBackend::open(dir.path()).expect("open");
+        fake.set_revision_limit(2);
+        let root = root(&fake).await;
+        let mut folders = vec![root.clone()];
+        let mut files: Vec<(LinkId, RevisionId)> = Vec::new();
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for step in 0..400 {
+            let handle = if next(3) == 0 { &other } else { &fake };
+            let parent = folders[next(folders.len())].clone();
+            let name = format!("n{}", next(12));
+            // Failures (a taken name, a trashed parent, a cycle) are fine.
+            match next(6) {
+                0 => {
+                    if let Ok(link) = handle
+                        .create_folder(&parent, &name, SystemTime::UNIX_EPOCH)
+                        .await
+                    {
+                        folders.push(link);
+                    }
+                }
+                1 => {
+                    let data = Bytes::from(vec![0u8; next(100)]);
+                    if let Ok(file) = handle
+                        .upload_new(&parent, &name, UploadSource::Bytes(data), meta())
+                        .await
+                    {
+                        files.push(file);
+                    }
+                }
+                2 if !files.is_empty() => {
+                    let i = next(files.len());
+                    let data = Bytes::from(vec![1u8; next(100)]);
+                    let (file, base) = files[i].clone();
+                    if let Ok(revision) = handle
+                        .upload_revision(&file, &base, UploadSource::Bytes(data), meta())
+                        .await
+                    {
+                        files[i].1 = revision;
+                    }
+                }
+                3 => {
+                    let node = if next(2) == 0 && !files.is_empty() {
+                        files[next(files.len())].0.clone()
+                    } else {
+                        folders[next(folders.len())].clone()
+                    };
+                    let _ = handle.rename(&node, Some(&parent), &name, None).await;
+                }
+                4 if step % 3 == 0 => {
+                    let node = if next(2) == 0 && !files.is_empty() {
+                        files[next(files.len())].0.clone()
+                    } else {
+                        folders[next(folders.len())].clone()
+                    };
+                    let _ = handle.trash(&[node]).await;
+                }
+                _ => {
+                    let _ = handle.list_children(&parent).await;
+                }
+            }
+            if step % 50 == 0 {
+                fake.state.lock().compact().expect("compact");
+            }
+            // Both handles catch up at their next call.
+            fake.storage_info().await.expect("info");
+            other.storage_info().await.expect("info");
+            assert_index_consistent(&fake);
+            assert_index_consistent(&other);
+        }
+        assert!(
+            folders.len() > 20 && files.len() > 20,
+            "the steps did something"
+        );
+        assert_index_consistent(&FakeBackend::open(dir.path()).expect("reopen"));
     }
 }

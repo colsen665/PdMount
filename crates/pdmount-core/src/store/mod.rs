@@ -6,16 +6,18 @@
 //! savepoint, so a failing write does not undo the others in its batch.
 //! Reads use a separate connection (WAL allows both).
 //!
-//! The writer never waits for the disk: it commits with `synchronous=NORMAL`
-//! and leaves automatic checkpoints off. A sync thread acknowledges durable
-//! writes after it has fsync'd the WAL (what `synchronous=FULL` does at
-//! commit), and runs checkpoints. So a fsync never delays the commits that
-//! FUSE replies wait for.
+//! The writer does not sync: it commits with `synchronous=NORMAL` and leaves
+//! automatic checkpoints off. A sync thread acknowledges durable writes after
+//! it has fsync'd the WAL (what `synchronous=FULL` does at commit), and runs
+//! checkpoints. A commit can still wait for the file system while a WAL fsync
+//! overlaps a fsync of another file on btrfs, which is why the two take turns
+//! ([`Store::outside_wal_sync`], D087).
 //!
 //! Every write gets a sequence number in queue order, so "committed up to
 //! `n`" covers every write queued before `n`. [`Store::after`] runs a
 //! callback once a sequence number is committed; the FUSE layer sends its
-//! replies that way (§5.6).
+//! replies that way (§5.6). The callback waits in a list that the writer
+//! drains after each commit, so waiting adds no write of its own.
 
 use rusqlite::{Connection, OptionalExtension, Transaction};
 use std::cell::Cell;
@@ -81,6 +83,15 @@ struct WriteRequest {
     done: Option<DoneFn>,
 }
 
+/// Callbacks of [`Store::after`] waiting for a commit, in the order they
+/// were added. Shared by the store and its writer.
+#[derive(Default)]
+struct Waiters {
+    list: Vec<(u64, DoneFn)>,
+    /// The writer has exited: nothing will commit any more.
+    closed: bool,
+}
+
 thread_local! {
     /// The last sequence number queued from this thread (any store).
     static QUEUED_HERE: Cell<u64> = const { Cell::new(0) };
@@ -93,12 +104,14 @@ pub struct Store {
     writer: parking_lot::Mutex<(u64, Option<mpsc::Sender<WriteRequest>>)>,
     /// The highest sequence number whose batch has committed (or failed).
     committed: Arc<AtomicU64>,
+    waiters: Arc<parking_lot::Mutex<Waiters>>,
     thread: Option<JoinHandle<()>>,
     syncer: Option<JoinHandle<()>>,
     reader: parking_lot::Mutex<Connection>,
     /// Set by tests: the writer commits nothing more, as after a kill -9.
-    #[cfg_attr(not(test), allow(dead_code))]
     crashed: Arc<AtomicBool>,
+    /// Held exclusively by a WAL fsync (D087).
+    sync_gate: Arc<parking_lot::RwLock<()>>,
 }
 
 impl Store {
@@ -114,6 +127,8 @@ impl Store {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "wal_autocheckpoint", 0)?;
         conn.pragma_update(None, "foreign_keys", "OFF")?;
+        // The writes' `prepare_cached` statements (`rows.rs`, `cache.rs`: 10)
+        // fit SQLite's default statement cache of 16 per connection.
         migrate(&mut conn, path)?;
 
         let reader = Connection::open(path)?;
@@ -124,31 +139,26 @@ impl Store {
         let (sync_sender, sync_receiver) = mpsc::channel();
         let crashed = Arc::new(AtomicBool::new(false));
         let committed = Arc::new(AtomicU64::new(0));
+        let waiters = Arc::new(parking_lot::Mutex::new(Waiters::default()));
         let truncate = Arc::new(AtomicBool::new(false));
-        let (writer_crashed, writer_committed, writer_truncate) = (
-            Arc::clone(&crashed),
-            Arc::clone(&committed),
-            Arc::clone(&truncate),
-        );
+        let shared = Shared {
+            crashed: Arc::clone(&crashed),
+            committed: Arc::clone(&committed),
+            waiters: Arc::clone(&waiters),
+            truncate: Arc::clone(&truncate),
+        };
         let thread = std::thread::Builder::new()
             .name("pdmount-store".into())
-            .spawn(move || {
-                writer_loop(
-                    conn,
-                    receiver,
-                    &sync_sender,
-                    &writer_crashed,
-                    &writer_committed,
-                    &writer_truncate,
-                );
-            })
+            .spawn(move || writer_loop(conn, &receiver, &sync_sender, &shared))
             .map_err(|e| StoreError::Io(path.to_owned(), e))?;
+        let sync_gate = Arc::new(parking_lot::RwLock::new(()));
         let syncer = Syncer {
             db: path.to_owned(),
             wal: None,
             conn: checkpointer,
             committed: Arc::clone(&committed),
             truncate,
+            gate: Arc::clone(&sync_gate),
         };
         let syncer = std::thread::Builder::new()
             .name("pdmount-store-sync".into())
@@ -158,10 +168,12 @@ impl Store {
             path: path.to_owned(),
             writer: parking_lot::Mutex::new((0, Some(sender))),
             committed,
+            waiters,
             thread: Some(thread),
             syncer: Some(syncer),
             reader: parking_lot::Mutex::new(reader),
             crashed,
+            sync_gate,
         })
     }
 
@@ -209,10 +221,32 @@ impl Store {
     /// thread after the commit, so `then` must be short.
     pub fn after(&self, seq: u64, then: impl FnOnce(Result<()>) + Send + 'static) {
         if self.committed.load(Ordering::Acquire) >= seq {
-            then(Ok(()));
-        } else {
-            self.send(Box::new(|_| Ok(())), false, Some(Box::new(then)));
+            return then(Ok(()));
         }
+        // A thread's last sequence number may come from another store.
+        let seq = seq.min(self.queued());
+        let mut waiters = self.waiters.lock();
+        // Checked again under the lock the writer drains under: a commit
+        // stored after the check above is seen here, or the writer finds
+        // the callback in the list.
+        let result = if self.committed.load(Ordering::Acquire) >= seq {
+            Ok(())
+        } else if waiters.closed || self.crashed.load(Ordering::SeqCst) {
+            Err(StoreError::Closed)
+        } else {
+            waiters.list.push((seq, Box::new(then)));
+            return;
+        };
+        drop(waiters);
+        then(result);
+    }
+
+    /// Runs a fsync of another file so that it does not overlap a WAL fsync;
+    /// such fsyncs may overlap each other. On btrfs the overlap stalls commits
+    /// for milliseconds, and FUSE replies wait for commits (D087). Blocks.
+    pub fn outside_wal_sync<T>(&self, sync: impl FnOnce() -> T) -> T {
+        let _gate = self.sync_gate.read();
+        sync()
     }
 
     /// Resolves once everything queued before it is durably committed.
@@ -311,14 +345,48 @@ fn migrate(conn: &mut Connection, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The state the writer shares with [`Store`].
+struct Shared {
+    crashed: Arc<AtomicBool>,
+    committed: Arc<AtomicU64>,
+    waiters: Arc<parking_lot::Mutex<Waiters>>,
+    truncate: Arc<AtomicBool>,
+}
+
+impl Shared {
+    /// Runs, in order, the waiters for sequence numbers up to `last` (all
+    /// of them with `None`), outside the lock.
+    fn wake(&self, last: Option<u64>, result: &Result<()>) {
+        let ready: Vec<DoneFn> = {
+            let mut waiters = self.waiters.lock();
+            let (ready, rest) = std::mem::take(&mut waiters.list)
+                .into_iter()
+                .partition(|(seq, _)| last.is_none_or(|last| *seq <= last));
+            waiters.list = rest;
+            ready.into_iter().map(|(_, done)| done).collect()
+        };
+        for done in ready {
+            done(match result {
+                Ok(()) => Ok(()),
+                Err(StoreError::Commit(error)) => Err(StoreError::Commit(error.clone())),
+                Err(_) => Err(StoreError::Closed),
+            });
+        }
+    }
+}
+
 fn writer_loop(
     mut conn: Connection,
-    receiver: mpsc::Receiver<WriteRequest>,
+    receiver: &mpsc::Receiver<WriteRequest>,
     syncer: &mpsc::Sender<Vec<DoneFn>>,
-    crashed: &AtomicBool,
-    committed: &AtomicU64,
-    truncate: &AtomicBool,
+    shared: &Shared,
 ) {
+    let Shared {
+        crashed,
+        committed,
+        truncate,
+        ..
+    } = shared;
     while let Ok(first) = receiver.recv() {
         // Here and not on the sync thread: a `TRUNCATE` checkpoint on another
         // connection made writes in the writer's transactions fail with
@@ -339,6 +407,7 @@ fn writer_loop(
                     done(Err(StoreError::Closed));
                 }
             }
+            shared.wake(None, &Err(StoreError::Closed));
             continue;
         }
         let last = batch.last().map_or(0, |request| request.seq);
@@ -346,6 +415,13 @@ fn writer_loop(
         let result = commit_batch(&mut conn, batch, &mut outcomes);
         // A failed batch counts too: waiting for it would never end.
         committed.store(last, Ordering::Release);
+        shared.wake(
+            Some(last),
+            &result
+                .as_ref()
+                .map(drop)
+                .map_err(|error| StoreError::Commit(error.to_string())),
+        );
         let mut durable = Vec::new();
         for (done, is_durable, outcome) in outcomes {
             let outcome = match (&result, outcome) {
@@ -370,6 +446,8 @@ fn writer_loop(
             }
         }
     }
+    shared.waiters.lock().closed = true;
+    shared.wake(None, &Err(StoreError::Closed));
 }
 
 /// Fsyncs the WAL for durable writes and checkpoints it, off the writer.
@@ -382,6 +460,8 @@ struct Syncer {
     committed: Arc<AtomicU64>,
     /// Asks the writer for a `TRUNCATE` checkpoint ([`WAL_LIMIT_FRAMES`]).
     truncate: Arc<AtomicBool>,
+    /// See [`Store::outside_wal_sync`].
+    gate: Arc<parking_lot::RwLock<()>>,
 }
 
 impl Syncer {
@@ -399,7 +479,11 @@ impl Syncer {
                 waiting.extend(batch);
             }
             if !waiting.is_empty() {
-                let result = self.sync().map_err(|e| e.to_string());
+                let result = {
+                    let gate = Arc::clone(&self.gate);
+                    let _gate = gate.write();
+                    self.sync().map_err(|e| e.to_string())
+                };
                 if let Err(error) = &result {
                     tracing::error!(%error, "store sync failed");
                 }
@@ -501,6 +585,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_wal_sync_waits_for_another_file_s_sync() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(Store::open(&dir.path().join("state.db")).expect("open"));
+        let (entered, inside) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let holder = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                store.outside_wal_sync(|| {
+                    entered.send(()).expect("send");
+                    released.recv().expect("recv");
+                });
+            })
+        };
+        inside.recv().expect("recv");
+        let waiter = Arc::clone(&store);
+        let mut flush = tokio::spawn(async move { waiter.flush().await });
+        let early = tokio::time::timeout(Duration::from_millis(200), &mut flush).await;
+        assert!(early.is_err(), "the WAL sync must wait");
+        // Commits do not wait for that sync.
+        let (seen, committed) = mpsc::channel();
+        store.write(|tx| meta_set(tx, "k", "v"));
+        store.after(store.queued(), move |result| {
+            seen.send(result.is_ok()).expect("send");
+        });
+        assert!(
+            committed
+                .recv_timeout(Duration::from_secs(5))
+                .expect("commit")
+        );
+        release.send(()).expect("send");
+        holder.join().expect("join");
+        flush.await.expect("join").expect("flush");
+    }
+
+    #[tokio::test]
     async fn a_failing_write_does_not_undo_its_batch() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(&dir.path().join("state.db")).expect("open");
@@ -546,6 +666,72 @@ mod tests {
         store.after(store.queued(), move |result| {
             let _ = sender.send(matches!(result, Err(StoreError::Closed)));
         });
+        assert!(receiver.recv().expect("callback ran"));
+    }
+
+    /// Callbacks added from many threads while the writer commits: each
+    /// runs exactly once, after its write is committed.
+    #[test]
+    fn after_runs_every_callback_once_under_concurrent_commits() {
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 500;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(Store::open(&dir.path().join("state.db")).expect("open"));
+        let runs = Arc::new(AtomicU64::new(0));
+        let early = Arc::new(AtomicU64::new(0));
+        let threads: Vec<_> = (0..THREADS)
+            .map(|thread| {
+                let (store, runs, early) =
+                    (Arc::clone(&store), Arc::clone(&runs), Arc::clone(&early));
+                std::thread::spawn(move || {
+                    for round in 0..ROUNDS {
+                        store.write(move |tx| {
+                            meta_set(tx, &format!("k{thread}"), &round.to_string())
+                        });
+                        let seq = Store::queued_here();
+                        let (runs, early, committed) = (
+                            Arc::clone(&runs),
+                            Arc::clone(&early),
+                            Arc::clone(&store.committed),
+                        );
+                        store.after(seq, move |result| {
+                            result.expect("committed");
+                            if committed.load(Ordering::Acquire) < seq {
+                                early.fetch_add(1, Ordering::SeqCst);
+                            }
+                            runs.fetch_add(1, Ordering::SeqCst);
+                        });
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("thread");
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while runs.load(Ordering::SeqCst) < (THREADS * ROUNDS) as u64 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Nothing runs twice: once more after a quiet moment.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(runs.load(Ordering::SeqCst), (THREADS * ROUNDS) as u64);
+        assert_eq!(early.load(Ordering::SeqCst), 0);
+        assert!(store.waiters.lock().list.is_empty());
+    }
+
+    #[tokio::test]
+    async fn waiters_get_closed_when_the_writer_exits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&dir.path().join("state.db")).expect("open");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        // A waiter for a sequence number that is never committed.
+        store.waiters.lock().list.push((
+            u64::MAX,
+            Box::new(move |result| {
+                let _ = sender.send(matches!(result, Err(StoreError::Closed)));
+            }),
+        ));
+        drop(store);
         assert!(receiver.recv().expect("callback ran"));
     }
 

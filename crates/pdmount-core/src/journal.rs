@@ -23,6 +23,8 @@
 //!   died is recognized by its SHA-1 and adopted instead of uploaded again.
 //!
 //! Parked state lives in RAM; parked entries are retried at the next mount.
+//! A local change retries an automatic park but not one made with
+//! `queue park` (D061).
 
 use crate::cache::Priority;
 use crate::config::{MetaRevisionPolicy, UploadConfig};
@@ -54,16 +56,27 @@ const PARK_AFTER: u32 = 5;
 /// between plans: the tree and the drive disagree in a way no step settles.
 const REPLAN_BURST: u32 = 16;
 const TRASH_BATCH: usize = 50;
+/// Base blocks materialized per round before a snapshot (256 MiB).
+const MATERIALIZE_BATCH: usize = 64;
 /// Largest file whose remote content is read to compare it with a local one
 /// when the remote revision claims no SHA-1 (D040).
 const IDENTICAL_PROBE_MAX: u64 = 16 << 20;
 const MAX_WAKE: Duration = Duration::from_secs(1);
+/// How often a `sync` of a path looks at its entries.
+const SYNC_POLL: Duration = Duration::from_millis(50);
+const USER_PARK_REASON: &str = "parked by user";
+/// How far a `sync` follows what an entry waits for.
+const MAX_DEPENDENCY_CHAIN: usize = 4096;
 
 #[derive(Debug, Clone)]
 struct Entry {
     not_before: Instant,
     attempts: u32,
     parked: Option<String>,
+    /// Parked with `queue park`: a local change does not resume it (D061).
+    user_parked: bool,
+    /// `queue drop` is taking the entry apart: no step may start.
+    held: bool,
     in_flight: bool,
     /// Last local change, for the debounce.
     changed_at: Instant,
@@ -87,6 +100,8 @@ impl Entry {
             not_before: now,
             attempts: 0,
             parked: None,
+            user_parked: false,
+            held: false,
             in_flight: false,
             changed_at: now,
             dirty_since: now,
@@ -97,6 +112,46 @@ impl Entry {
             generation: 0,
         }
     }
+
+    /// A local change retries an automatic park.
+    fn changed(&mut self) {
+        if !self.user_parked {
+            self.parked = None;
+        }
+    }
+
+    /// The executor parks the entry; the user's reason stays.
+    fn park(&mut self, reason: String) {
+        if !self.user_parked {
+            self.parked = Some(reason);
+        }
+    }
+}
+
+/// An entry as `queue list` shows it.
+#[derive(Debug, Clone)]
+pub(crate) struct EntryView {
+    pub ino: Ino,
+    pub attempts: u32,
+    pub parked: Option<String>,
+    pub in_flight: bool,
+    pub last_error: Option<String>,
+    pub blocked_on: Option<Ino>,
+    /// How long the inode has been dirty.
+    pub age: Duration,
+    /// Time left of the back-off after a failure.
+    pub backoff: Option<Duration>,
+}
+
+/// One look at the entries a `sync` waits for.
+#[derive(Debug, Default)]
+pub(crate) struct SyncRound {
+    /// Entries not parked.
+    pub pending: usize,
+    /// Of those, the entries that are not held up by a parked one.
+    pub moving: usize,
+    /// The parked entries among them and those holding them up.
+    pub parked: Vec<Ino>,
 }
 
 /// Queue counts for `status`.
@@ -113,17 +168,29 @@ struct State {
     entries: BTreeMap<Ino, Entry>,
     /// Every entry is forced (draining before an unmount).
     draining: bool,
+    /// Shutting down: no step starts any more (D062).
+    stopping: bool,
+}
+
+/// Directories to list again: those the executor has not taken yet, and
+/// how many requests for each are not answered by a listing yet. The store
+/// keeps the latter until they are, so a stop does not forget them (D069).
+#[derive(Default)]
+struct Listings {
+    queued: Vec<Ino>,
+    open: BTreeMap<Ino, u32>,
 }
 
 pub(crate) struct Journal {
     state: lock_order::Mutex<State>,
     wake: tokio::sync::Notify,
     /// Directories to list again (see `Node::clashed`).
-    listings: parking_lot::Mutex<Vec<Ino>>,
+    listings: parking_lot::Mutex<Listings>,
     /// Signalled whenever an entry finishes, fails or leaves.
     progress: tokio::sync::Notify,
     /// One permit per running upload (`upload.concurrency`).
     uploads: Arc<tokio::sync::Semaphore>,
+    upload_slots: usize,
     debounce: Duration,
     max_dirty_age: Duration,
     meta_revision: MetaRevisionPolicy,
@@ -147,6 +214,7 @@ impl Journal {
             uploads: Arc::new(tokio::sync::Semaphore::new(
                 config.concurrency.max(1) as usize
             )),
+            upload_slots: config.concurrency.max(1) as usize,
             debounce: config.debounce.0,
             max_dirty_age: config.max_dirty_age.0,
             meta_revision: config.meta_revision,
@@ -160,10 +228,43 @@ impl Journal {
         entry
     }
 
-    /// Asks for `dirs` to be listed again; `run_journal` does it.
-    pub(crate) fn list_later(&self, dirs: Vec<Ino>) {
-        self.listings.lock().extend(dirs);
+    /// Asks for `dirs` to be listed again; `run_journal` does it. `save`
+    /// gets the directories still to list when they change, under the lock,
+    /// so the saves keep their order.
+    pub(crate) fn list_later(&self, dirs: Vec<Ino>, save: impl FnOnce(Vec<Ino>)) {
+        if dirs.is_empty() {
+            return;
+        }
+        let mut listings = self.listings.lock();
+        let before = listings.open.len();
+        for &dir in &dirs {
+            *listings.open.entry(dir).or_default() += 1;
+        }
+        listings.queued.extend(dirs);
+        if listings.open.len() != before {
+            save(listings.open.keys().copied().collect());
+        }
+        drop(listings);
         self.wake.notify_one();
+    }
+
+    /// The listings asked for since the last call.
+    fn take_listings(&self) -> Vec<Ino> {
+        std::mem::take(&mut self.listings.lock().queued)
+    }
+
+    /// A listing taken by [`Self::take_listings`] succeeded.
+    fn listed(&self, dir: Ino, save: impl FnOnce(Vec<Ino>)) {
+        let mut listings = self.listings.lock();
+        let std::collections::btree_map::Entry::Occupied(mut open) = listings.open.entry(dir)
+        else {
+            return;
+        };
+        *open.get_mut() -= 1;
+        if *open.get() == 0 {
+            open.remove();
+            save(listings.open.keys().copied().collect());
+        }
     }
 
     /// A namespace change: re-plan at once.
@@ -172,7 +273,7 @@ impl Journal {
         {
             let mut state = self.state.lock();
             let entry = Self::entry(&mut state, ino, now);
-            entry.parked = None;
+            entry.changed();
             entry.attempts = 0;
             entry.not_before = now;
             entry.generation += 1;
@@ -186,7 +287,7 @@ impl Journal {
         {
             let mut state = self.state.lock();
             let entry = Self::entry(&mut state, ino, now);
-            entry.parked = None;
+            entry.changed();
             entry.attempts = 0;
             entry.changed_at = now;
             entry.not_before = now;
@@ -236,6 +337,18 @@ impl Journal {
         counts
     }
 
+    /// How long the oldest entry that is not parked has been dirty.
+    pub(crate) fn oldest_age(&self) -> Option<Duration> {
+        let now = Instant::now();
+        let state = self.state.lock();
+        state
+            .entries
+            .values()
+            .filter(|entry| entry.parked.is_none())
+            .map(|entry| now.saturating_duration_since(entry.dirty_since))
+            .max()
+    }
+
     pub(crate) fn parked(&self) -> Vec<(Ino, String)> {
         let state = self.state.lock();
         state
@@ -273,12 +386,28 @@ impl Journal {
         self.wake.notify_one();
     }
 
+    /// No step starts from now on; what is pending resumes at the next
+    /// mount (D062).
+    pub(crate) fn stop_starting(&self) {
+        self.state.lock().stopping = true;
+    }
+
+    /// Whether no upload and no inline step runs.
+    pub(crate) fn idle(&self) -> bool {
+        let state = self.state.lock();
+        self.uploads.available_permits() == self.upload_slots
+            && !state.entries.values().any(|entry| entry.in_flight)
+    }
+
     fn ready(&self, now: Instant) -> (Vec<(Ino, Timing)>, Option<Instant>) {
         let state = self.state.lock();
         let mut ready = Vec::new();
         let mut next: Option<Instant> = None;
+        if state.stopping {
+            return (ready, next);
+        }
         for (&ino, entry) in &state.entries {
-            if entry.in_flight || entry.parked.is_some() {
+            if entry.in_flight || entry.held || entry.parked.is_some() {
                 continue;
             }
             if entry.not_before <= now {
@@ -318,6 +447,7 @@ impl Journal {
         if let Some(entry) = self.state.lock().entries.get_mut(&ino)
             && entry.generation == generation
         {
+            entry.blocked_on = None;
             entry.not_before = until;
         }
     }
@@ -347,18 +477,39 @@ impl Journal {
         }
     }
 
-    fn start(&self, ino: Ino) {
-        if let Some(entry) = self.state.lock().entries.get_mut(&ino) {
-            entry.in_flight = true;
+    /// Marks a step as running, unless the entry was parked or held since
+    /// `ready` looked at it.
+    pub(crate) fn start(&self, ino: Ino) -> bool {
+        let mut state = self.state.lock();
+        if state.stopping {
+            return false;
+        }
+        match state.entries.get_mut(&ino) {
+            Some(entry) if entry.held || entry.parked.is_some() => false,
+            Some(entry) => {
+                entry.in_flight = true;
+                entry.blocked_on = None;
+                true
+            }
+            // Gone since the plan: `queue drop` took it.
+            None => false,
         }
     }
 
     /// Starts an upload if fewer than `upload.concurrency` run; it runs
     /// while the permit is held.
-    fn try_start_upload(&self, ino: Ino) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    pub(crate) fn try_start_upload(&self, ino: Ino) -> Option<tokio::sync::OwnedSemaphorePermit> {
         let permit = Arc::clone(&self.uploads).try_acquire_owned().ok()?;
         let mut state = self.state.lock();
-        state.entries.get_mut(&ino)?.in_flight = true;
+        if state.stopping {
+            return None;
+        }
+        let entry = state.entries.get_mut(&ino)?;
+        if entry.held || entry.parked.is_some() {
+            return None;
+        }
+        entry.in_flight = true;
+        entry.blocked_on = None;
         Some(permit)
     }
 
@@ -419,7 +570,7 @@ impl Journal {
             }
             entry.last_error = Some(error.to_string());
             if error.is_permanent() && (entry.attempts >= PARK_AFTER || error.needs_the_user()) {
-                entry.parked = Some(error.to_string());
+                entry.park(error.to_string());
                 true
             } else {
                 let mut delay = match error {
@@ -443,7 +594,7 @@ impl Journal {
         let mut state = self.state.lock();
         if let Some(entry) = state.entries.get_mut(&ino) {
             entry.in_flight = false;
-            entry.parked = Some(reason);
+            entry.park(reason);
         }
         drop(state);
         self.progress.notify_waiters();
@@ -451,6 +602,157 @@ impl Journal {
 
     pub(crate) fn wake(&self) {
         self.wake.notify_one();
+    }
+
+    pub(crate) fn entries(&self) -> Vec<EntryView> {
+        let now = Instant::now();
+        let state = self.state.lock();
+        state
+            .entries
+            .iter()
+            .map(|(&ino, entry)| EntryView {
+                ino,
+                attempts: entry.attempts,
+                parked: entry.parked.clone(),
+                in_flight: entry.in_flight,
+                last_error: entry.last_error.clone(),
+                blocked_on: entry.blocked_on,
+                age: now.saturating_duration_since(entry.dirty_since),
+                backoff: (entry.attempts > 0 && entry.not_before > now)
+                    .then(|| entry.not_before - now),
+            })
+            .collect()
+    }
+
+    /// `queue retry`: clears the park and the back-off, and forces.
+    pub(crate) fn retry(&self, inos: &[Ino]) {
+        let now = Instant::now();
+        {
+            let mut state = self.state.lock();
+            for ino in inos {
+                if let Some(entry) = state.entries.get_mut(ino) {
+                    entry.parked = None;
+                    entry.user_parked = false;
+                    entry.attempts = 0;
+                    entry.replans = 0;
+                    entry.forced = true;
+                    entry.not_before = now;
+                    entry.generation += 1;
+                }
+            }
+        }
+        self.wake.notify_one();
+    }
+
+    /// `queue park`: holds entries until `retry` or the next mount. A step
+    /// that is running finishes.
+    pub(crate) fn park_by_user(&self, inos: &[Ino]) {
+        {
+            let mut state = self.state.lock();
+            for ino in inos {
+                if let Some(entry) = state.entries.get_mut(ino) {
+                    entry.parked = Some(USER_PARK_REASON.to_owned());
+                    entry.user_parked = true;
+                    entry.generation += 1;
+                }
+            }
+        }
+        self.progress.notify_waiters();
+    }
+
+    /// Keeps steps from starting for these entries, all of them or, when
+    /// one is running (returned), none.
+    pub(crate) fn hold(&self, inos: &[Ino]) -> std::result::Result<(), Ino> {
+        let mut state = self.state.lock();
+        if let Some(&running) = inos
+            .iter()
+            .find(|ino| state.entries.get(ino).is_some_and(|e| e.in_flight))
+        {
+            return Err(running);
+        }
+        for ino in inos {
+            if let Some(entry) = state.entries.get_mut(ino) {
+                entry.held = true;
+                entry.generation += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Ends a [`Self::hold`] of the entries still there.
+    pub(crate) fn release(&self, inos: &[Ino]) {
+        {
+            let mut state = self.state.lock();
+            for ino in inos {
+                if let Some(entry) = state.entries.get_mut(ino) {
+                    entry.held = false;
+                }
+            }
+        }
+        self.wake.notify_one();
+    }
+
+    /// The local intent of the entry was discarded; a held entry leaves.
+    pub(crate) fn forget(&self, ino: Ino) {
+        {
+            let mut state = self.state.lock();
+            state.entries.remove(&ino);
+            Self::unblock(&mut state, ino);
+        }
+        self.wake.notify_one();
+        self.progress.notify_waiters();
+    }
+
+    /// Forces `selected` and what they wait for (once each: a forced entry
+    /// keeps its back-off), and counts what can still finish.
+    pub(crate) fn sync_round(&self, selected: &[Ino]) -> SyncRound {
+        let now = Instant::now();
+        let mut round = SyncRound::default();
+        let mut woke = false;
+        {
+            let mut state = self.state.lock();
+            for &ino in selected {
+                let Some(entry) = state.entries.get(&ino) else {
+                    continue;
+                };
+                if entry.parked.is_none() {
+                    round.pending += 1;
+                }
+                let mut current = ino;
+                let mut steps = 0;
+                let held_up_by = loop {
+                    let Some(entry) = state.entries.get_mut(&current) else {
+                        break None;
+                    };
+                    if entry.parked.is_some() {
+                        break Some(current);
+                    }
+                    if !entry.forced {
+                        entry.forced = true;
+                        entry.not_before = now;
+                        entry.generation += 1;
+                        woke = true;
+                    }
+                    steps += 1;
+                    match entry.blocked_on {
+                        // A cycle is the planner's to break.
+                        Some(next) if steps <= MAX_DEPENDENCY_CHAIN && !entry.in_flight => {
+                            current = next;
+                        }
+                        _ => break None,
+                    }
+                };
+                match held_up_by {
+                    Some(parked) if !round.parked.contains(&parked) => round.parked.push(parked),
+                    Some(_) => {}
+                    None => round.moving += 1,
+                }
+            }
+        }
+        if woke {
+            self.wake.notify_one();
+        }
+        round
     }
 
     /// The connection is back: every entry that is not parked retries now.
@@ -466,7 +768,7 @@ impl Journal {
     }
 }
 
-fn backoff(attempts: u32) -> Duration {
+pub(crate) fn backoff(attempts: u32) -> Duration {
     let base = BACKOFF_MIN.saturating_mul(1 << attempts.min(9).saturating_sub(1));
     let jitter = rand::random::<f64>() * 0.3 + 0.85;
     base.mul_f64(jitter).min(BACKOFF_MAX)
@@ -526,12 +828,15 @@ impl Engine {
     pub(crate) async fn run_journal(self: Arc<Self>) {
         loop {
             self.health.wait_online().await;
-            let relist = std::mem::take(&mut *self.journal.listings.lock());
-            for dir in relist {
+            for dir in self.journal.take_listings() {
                 let this = Arc::clone(&self);
                 self.runtime().spawn(async move {
-                    if let Err(error) = this.list(dir).await {
-                        tracing::debug!(dir, %error, "listing after a freed name failed");
+                    match this.list(dir).await {
+                        Ok(()) => this.journal.listed(dir, |open| this.save_relist(open)),
+                        // Kept in the store: the next start lists it (D069).
+                        Err(error) => {
+                            tracing::debug!(dir, %error, "listing after a freed name failed");
+                        }
                     }
                 });
             }
@@ -547,8 +852,9 @@ impl Engine {
                     Plan::Blocked(on) => self.journal.block(ino, on, timing.generation),
                     Plan::SkipMeta => self.skip_meta(ino, timing.generation),
                     Plan::Work(Work::Trash { link }) => {
-                        self.journal.start(ino);
-                        trash.push((ino, link));
+                        if self.journal.start(ino) {
+                            trash.push((ino, link));
+                        }
                     }
                     Plan::Work(Work::Upload(target)) => {
                         if let Some(permit) = self.journal.try_start_upload(ino) {
@@ -565,8 +871,9 @@ impl Engine {
                         }
                     }
                     Plan::Work(work) => {
-                        self.journal.start(ino);
-                        self.execute(ino, work).await;
+                        if self.journal.start(ino) {
+                            self.execute(ino, work).await;
+                        }
                     }
                 }
             }
@@ -1270,10 +1577,20 @@ impl Engine {
     /// Materializes everything and snapshots the staging file (§7.4 1–3).
     async fn snapshot(&self, ino: Ino) -> std::result::Result<Snapshot, UploadError> {
         let staged = self.ensure_staged(ino).map_err(UploadError::core)?;
-        for _ in 0..8 {
-            let missing = staged.lock().missing_blocks();
+        // Batches until nothing is missing; a batch that makes no progress
+        // (the base changed meanwhile) counts against eight tries.
+        let mut stalls = 0;
+        let mut previous = Vec::new();
+        loop {
+            let missing = staged.lock().missing_blocks(MATERIALIZE_BATCH);
             if missing.is_empty() {
                 break;
+            }
+            if missing == previous {
+                stalls += 1;
+                if stalls == 8 {
+                    break;
+                }
             }
             match self.materialize(ino, &missing, Priority::Readahead).await {
                 Ok(()) => {}
@@ -1285,6 +1602,7 @@ impl Engine {
                 }
                 Err(error) => return Err(UploadError::core(error)),
             }
+            previous = missing;
         }
         let (path, base_rev, gens, mtime, mode) = {
             let staged = staged.lock();
@@ -1575,7 +1893,7 @@ impl Engine {
         // remote node at its name.
         let listed = self.list(dir).await;
         if listed.is_err() {
-            self.journal.list_later(vec![dir]);
+            self.list_later(vec![dir]);
         }
         if let Some(other) = self.tree.read().child(dir, &orig_name).ok().flatten() {
             self.set_conflict_other(id, other);
@@ -2030,6 +2348,7 @@ impl Engine {
         if clean {
             self.remove_staging_after_commit(ino);
         }
+        self.pins_changed();
         true
     }
 
@@ -2083,6 +2402,23 @@ impl Engine {
         self.journal.counts()
     }
 
+    /// Gauges for `stats` (§5.8), by name.
+    pub fn gauges(&self) -> Vec<(&'static str, u64)> {
+        let counts = self.journal.counts();
+        let oldest = self.journal.oldest_age().unwrap_or_default();
+        vec![
+            ("queue_pending", counts.pending as u64),
+            ("queue_parked", counts.parked as u64),
+            ("queue_oldest_secs", oldest.as_secs()),
+            ("staged_open_files", self.staging.open_files() as u64),
+        ]
+    }
+
+    /// How long the oldest entry that is not parked has been dirty (`status`).
+    pub fn queue_oldest(&self) -> Option<Duration> {
+        self.journal.oldest_age()
+    }
+
     /// Parked entries with their paths and reasons.
     pub fn parked(&self) -> Vec<(String, String)> {
         let tree = self.tree.read();
@@ -2116,6 +2452,39 @@ impl Engine {
         };
         self.journal.force_all(false);
         counts
+    }
+
+    /// What keeps `ino` from its next step (`queue show`).
+    pub(crate) fn pending_dependency(&self, ino: Ino) -> Option<Ino> {
+        let now = Instant::now();
+        let timing = Timing {
+            changed_at: now,
+            dirty_since: now,
+            forced: true,
+            generation: 0,
+        };
+        match self.plan(ino, timing, now) {
+            Plan::Blocked(on) => Some(on),
+            _ => None,
+        }
+    }
+
+    /// Forces the entries `selected` gives each round and waits until none
+    /// can finish any more, or `timeout` passes (`sync`). Entries that come
+    /// up meanwhile count too.
+    pub(crate) async fn sync_entries(
+        &self,
+        selected: impl Fn() -> Vec<Ino>,
+        timeout: Duration,
+    ) -> SyncRound {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let round = self.journal.sync_round(&selected());
+            if round.moving == 0 || Instant::now() >= deadline {
+                return round;
+            }
+            tokio::time::sleep(SYNC_POLL).await;
+        }
     }
 
     /// `fsync` in `remote` mode: waits until the content at call time is

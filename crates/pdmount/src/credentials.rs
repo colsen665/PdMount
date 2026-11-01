@@ -418,11 +418,14 @@ impl<'a, S: SecretStore> Credentials<'a, S> {
     /// The SDK cache files and the block cache directory (encrypted with the
     /// cache key).
     fn cache_paths(&self) -> Vec<PathBuf> {
-        let mut paths: Vec<PathBuf> =
-            [self.paths.sdk_secret_cache(), self.paths.sdk_entity_cache()]
-                .iter()
-                .flat_map(|cache| pdmount_core::paths::sqlite_files(cache))
-                .collect();
+        let mut paths: Vec<PathBuf> = [
+            self.paths.sdk_secret_cache(),
+            self.paths.sdk_key_store(),
+            self.paths.sdk_entity_cache(),
+        ]
+        .iter()
+        .flat_map(|cache| pdmount_core::paths::sqlite_files(cache))
+        .collect();
         paths.push(self.paths.blocks_dir());
         paths
     }

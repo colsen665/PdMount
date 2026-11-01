@@ -74,7 +74,7 @@ The following structural issues are not rsync- or git-specific but block the lat
 | SQLCipher DB keyed from the keyring | Yes | Keep the keyring master key. Block cache encrypted per block (XChaCha20-Poly1305) |
 | `credentials.rs` (keyring + 0600 file fallback) | Good | **Adapt** under MIT with attribution; separate keyring service `pdmount` |
 | `pdignore.rs` matcher | Good matcher, harmful default list | **Adapt** the matcher. Default list empty; "ignored" means local-only, never trashing remote |
-| `service.rs` (systemd user unit) | Good | **Adapt**; add `ExecStopPost=fusermount3 -uz` |
+| `service.rs` (systemd user unit) | Good | **Not used** (D059): an XDG autostart entry replaces the unit |
 | `statfs` from cached quota | Good | Keep |
 | Thumbnail guard by process name | False positives | **Replace** with prefetch budgets and priority classes. If needed later, an opt-in rule set limited to known thumbnailer binaries |
 | Whole-file download on open | Blocks; no range reads | **Replace** with a block cache keyed by revision and block index, readahead and prefetch |

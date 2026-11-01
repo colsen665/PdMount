@@ -226,7 +226,7 @@ daemon_rss() { # <pid>
 }
 
 queue_numbers() { # <status text> -> "<pending> <parked>"
-    sed -n 's/^Queue: *\([0-9]*\) pending, \([0-9]*\) parked.*/\1 \2/p' <<<"$1"
+    sed -n 's/^Queue: *\([0-9]*\) pending[^,]*, \([0-9]*\) parked.*/\1 \2/p' <<<"$1"
 }
 
 sample_once() {

@@ -22,6 +22,7 @@ pub struct Config {
     pub kernel: KernelConfig,
     pub sync: SyncConfig,
     pub timeouts: TimeoutConfig,
+    pub stats: StatsConfig,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -167,8 +168,24 @@ impl Serialize for MetaRevisionPolicy {
 #[serde(default, deny_unknown_fields)]
 pub struct FsyncConfig {
     pub mode: FsyncMode,
-    /// Globs that use `remote` fsync regardless of `mode`.
+    /// Globs that use `remote` fsync regardless of `mode`, matched against
+    /// the path from the mount root (`/important/**`).
     pub remote_paths: Vec<String>,
+}
+
+impl FsyncConfig {
+    /// `remote_paths` compiled; `*` stops at a `/`.
+    pub fn remote_matcher(&self) -> Result<globset::GlobSet, globset::Error> {
+        let mut set = globset::GlobSetBuilder::new();
+        for path in &self.remote_paths {
+            set.add(
+                globset::GlobBuilder::new(path)
+                    .literal_separator(true)
+                    .build()?,
+            );
+        }
+        set.build()
+    }
 }
 
 /// DESIGN.md §5.6, decision D012.
@@ -186,7 +203,6 @@ pub struct KernelConfig {
     pub attr_ttl: HumanDuration,
     pub entry_ttl: HumanDuration,
     pub negative_ttl: HumanDuration,
-    pub writeback_cache: bool,
 }
 
 impl Default for KernelConfig {
@@ -195,7 +211,6 @@ impl Default for KernelConfig {
             attr_ttl: HumanDuration(Duration::from_secs(60)),
             entry_ttl: HumanDuration(Duration::from_secs(60)),
             negative_ttl: HumanDuration(Duration::from_secs(10)),
-            writeback_cache: false,
         }
     }
 }
@@ -205,6 +220,8 @@ impl Default for KernelConfig {
 const MIN_POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// Probes of a lost connection are cheap, one quota request each.
 const MIN_PROBE_INTERVAL: Duration = Duration::from_secs(10);
+/// File uploads at once: below the official SDKs' 5 (JS) and 6 (C#), D033.
+const MAX_UPLOAD_CONCURRENCY: u32 = 4;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SyncConfig {
@@ -242,6 +259,14 @@ impl Default for TimeoutConfig {
             shutdown_grace: HumanDuration(Duration::from_secs(30)),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StatsConfig {
+    /// Prometheus textfile written every 15 s; `~/` is expanded. Empty:
+    /// off (DESIGN.md §5.8).
+    pub prometheus_textfile: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -289,8 +314,14 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), String> {
-        if self.upload.concurrency == 0 {
-            return Err("upload.concurrency must be at least 1".into());
+        if !(1..=MAX_UPLOAD_CONCURRENCY).contains(&self.upload.concurrency) {
+            return Err(format!(
+                "upload.concurrency must be 1-{MAX_UPLOAD_CONCURRENCY}: more file uploads at once \
+                 than the official SDKs allow puts the service at risk (D033)"
+            ));
+        }
+        if let Err(error) = self.fsync.remote_matcher() {
+            return Err(format!("fsync.remote_paths: {error}"));
         }
         if self.cache.ram_bytes.0 < crate::pool::MIN_RAM_BYTES {
             return Err("cache.ram_bytes must be at least 16MiB".into());
@@ -306,6 +337,10 @@ impl Config {
         }) {
             return Err("device.name must be 1-64 characters without '/', '(' or ')'".into());
         }
+        let textfile = &self.stats.prometheus_textfile;
+        if !textfile.is_empty() && !textfile.starts_with('/') && !textfile.starts_with("~/") {
+            return Err("stats.prometheus_textfile must be absolute or start with '~/'".into());
+        }
         for rule in &self.access.rule {
             if !rule.path.starts_with('/') {
                 return Err(format!(
@@ -319,15 +354,26 @@ impl Config {
 
     /// Mount point with `~/` expanded against `home`.
     pub fn mountpoint(&self, home: &Path) -> PathBuf {
-        let configured = self
-            .mountpoint
-            .as_deref()
-            .unwrap_or(Self::DEFAULT_MOUNTPOINT);
-        match configured.strip_prefix("~/") {
-            Some(rest) => home.join(rest),
-            None if configured == "~" => home.to_owned(),
-            None => PathBuf::from(configured),
-        }
+        expand_home(
+            self.mountpoint
+                .as_deref()
+                .unwrap_or(Self::DEFAULT_MOUNTPOINT),
+            home,
+        )
+    }
+
+    /// The Prometheus textfile with `~/` expanded; `None` when off.
+    pub fn prometheus_textfile(&self, home: &Path) -> Option<PathBuf> {
+        let configured = &self.stats.prometheus_textfile;
+        (!configured.is_empty()).then(|| expand_home(configured, home))
+    }
+}
+
+fn expand_home(configured: &str, home: &Path) -> PathBuf {
+    match configured.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None if configured == "~" => home.to_owned(),
+        None => PathBuf::from(configured),
     }
 }
 
@@ -385,7 +431,7 @@ mode = "remote"
 remote_paths = ["/important/**"]
 
 [kernel]
-writeback_cache = true
+attr_ttl = "30s"
 
 [sync]
 poll_interval = "1m"
@@ -393,6 +439,9 @@ probe_interval = "15s"
 
 [timeouts]
 metadata = "30s"
+
+[stats]
+prometheus_textfile = "~/metrics/pdmount.prom"
 "#,
         )
         .expect("valid");
@@ -418,10 +467,34 @@ metadata = "30s"
             MetaRevisionPolicy::MaxSize(ByteSize(64 << 20))
         );
         assert_eq!(config.fsync.mode, FsyncMode::Remote);
-        assert!(config.kernel.writeback_cache);
+        assert_eq!(config.kernel.attr_ttl.0, Duration::from_secs(30));
         assert_eq!(config.sync.poll_interval.0, Duration::from_secs(60));
         assert_eq!(config.sync.probe_interval.0, Duration::from_secs(15));
         assert_eq!(config.timeouts.metadata.0, Duration::from_secs(30));
+        assert_eq!(
+            config.prometheus_textfile(Path::new("/home/u")),
+            Some(PathBuf::from("/home/u/metrics/pdmount.prom"))
+        );
+    }
+
+    #[test]
+    fn prometheus_textfile_is_off_by_default_and_must_be_absolute() {
+        let home = Path::new("/home/u");
+        assert_eq!(Config::default().prometheus_textfile(home), None);
+        let absolute =
+            parse("[stats]\nprometheus_textfile = \"/var/lib/node/pd.prom\"").expect("valid");
+        assert_eq!(
+            absolute.prometheus_textfile(home),
+            Some(PathBuf::from("/var/lib/node/pd.prom"))
+        );
+        assert!(matches!(
+            parse("[stats]\nprometheus_textfile = \"pd.prom\""),
+            Err(ConfigError::Invalid { .. })
+        ));
+        assert!(matches!(
+            parse("[stats]\nprometheus = \"/x\""),
+            Err(ConfigError::Parse { .. })
+        ));
     }
 
     #[test]
@@ -442,6 +515,17 @@ metadata = "30s"
             parse("[upload]\nconcurrency = 0"),
             Err(ConfigError::Invalid { .. })
         ));
+        // Below the official SDKs' 5 (JS) and 6 (C#) file transfers (D033, D058).
+        assert!(
+            matches!(parse("[upload]\nconcurrency = 5"), Err(ConfigError::Invalid { message, .. }) if message.contains("D033"))
+        );
+        assert_eq!(
+            parse("[upload]\nconcurrency = 4")
+                .expect("4 is allowed")
+                .upload
+                .concurrency,
+            4
+        );
         assert!(matches!(
             parse("[cache]\nram_bytes = \"8MiB\""),
             Err(ConfigError::Invalid { .. })
@@ -476,6 +560,20 @@ metadata = "30s"
             ..Config::default()
         };
         assert_eq!(absolute.mountpoint(home), Path::new("/mnt/proton"));
+    }
+
+    #[test]
+    fn remote_paths_compile_or_are_a_config_error() {
+        let mut config = Config::default();
+        config.fsync.remote_paths = vec!["/important/**".into(), "**/*.db".into()];
+        let matcher = config.fsync.remote_matcher().expect("globs");
+        assert!(matcher.is_match("/important/a/b"));
+        assert!(matcher.is_match("/x/y.db"));
+        assert!(!matcher.is_match("/other/a"));
+        assert!(config.validate().is_ok());
+        config.fsync.remote_paths = vec!["/a[".into()];
+        let error = config.validate().expect_err("an invalid glob");
+        assert!(error.contains("fsync.remote_paths"), "{error}");
     }
 
     #[test]

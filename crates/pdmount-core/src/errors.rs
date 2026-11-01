@@ -23,6 +23,9 @@ pub enum CoreError {
     AccessDenied,
     #[error("no space left (quota)")]
     NoSpace,
+    /// A remote file too large to stage (`MAX_STAGED_SIZE`).
+    #[error("file too large")]
+    FileTooLarge,
     /// The directory must be listed first (slow path); never reaches FUSE.
     #[error("directory {0} is not listed yet")]
     NeedsListing(u64),
@@ -68,6 +71,7 @@ impl CoreError {
             Self::InvalidArgument => libc::EINVAL,
             Self::AccessDenied => libc::EACCES,
             Self::NoSpace => libc::ENOSPC,
+            Self::FileTooLarge => libc::EFBIG,
             Self::Errno(errno) => *errno,
             Self::InvalidName => libc::EILSEQ,
             Self::NameTooLong => libc::ENAMETOOLONG,

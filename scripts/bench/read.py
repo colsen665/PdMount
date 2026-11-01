@@ -1,21 +1,33 @@
 """Times reads of one file on a mount from the client side.
 
-Usage: read.py <file> <label> [pagecache-drop]
-Runs three tests on the file and prints MiB/s and p50/p99 per read in µs:
+Usage: read.py [--only seq|rand|mmap] [--json <out>] <file> <label> [pagecache-drop]
+Runs three tests on the file (or the one --only names) and prints MiB/s and p50/p99 per
+read in µs:
   seq   sequential pread of 1 MiB (the largest FUSE read)
   rand  2000 preads of 128 KiB at random aligned offsets
   mmap  2000 copies of 128 KiB at random aligned offsets from a read-only mapping
 With a third argument, the kernel page cache of the file is dropped before each test
 (posix_fadvise DONTNEED), so only the daemon's own caches can answer.
+--json writes the results as {test: {bytes, seconds, mb_s, p50_us, p99_us}} (mb_s in 10^6
+bytes per second).
 """
+import argparse
+import json
 import mmap
 import os
 import random
 import sys
 import time
 
-path, label = sys.argv[1], sys.argv[2]
-drop = len(sys.argv) > 3
+parser = argparse.ArgumentParser()
+parser.add_argument("--only", choices=("seq", "rand", "mmap"))
+parser.add_argument("--json")
+parser.add_argument("path")
+parser.add_argument("label")
+parser.add_argument("drop", nargs="?")
+args = parser.parse_args()
+path, label, drop = args.path, args.label, args.drop is not None
+results = {}
 size = os.stat(path).st_size
 chunk, small, count = 1 << 20, 128 << 10, 2000
 rng = random.Random(42)
@@ -30,9 +42,13 @@ def pct(values, p):
 def report(name, lat, nbytes, elapsed):
     print(f"{label:26} {name:5} {nbytes / elapsed / (1 << 20):8.1f} MiB/s  "
           f"p50 {pct(lat, .5):8.0f} µs  p99 {pct(lat, .99):8.0f} µs")
+    results[name] = {"bytes": nbytes, "seconds": elapsed, "mb_s": nbytes / elapsed / 1e6,
+                     "p50_us": pct(lat, .5), "p99_us": pct(lat, .99)}
 
 
 def run(name, fn):
+    if args.only not in (None, name):
+        return
     fd = os.open(path, os.O_RDONLY)
     if drop:
         os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
@@ -73,3 +89,6 @@ def mapped(fd):
 run("seq", seq)
 run("rand", rand)
 run("mmap", mapped)
+if args.json:
+    with open(args.json, "w") as f:
+        json.dump(results, f)

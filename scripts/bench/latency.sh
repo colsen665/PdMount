@@ -22,9 +22,11 @@ export PDMOUNT=${PDMOUNT:-$repo/target/release/pdmount}
 export PROFILE=${PROFILE:-fake-bench}
 # shellcheck source=../../tests/scenarios/lib.sh
 source "$repo/tests/scenarios/lib.sh"
+private_root "$FAKE_DIR"
 if [[ ! -f "$FAKE_DIR/.seeded" ]]; then
     empty=$(mktemp -d)
-    rm -rf "$FAKE_DIR"
+    remove_fake_dir "$FAKE_DIR"
+    private_root "$FAKE_DIR"
     "$PDMOUNT" fake seed --from "$empty" "$FAKE_DIR" >/dev/null
     rmdir "$empty"
     touch "$FAKE_DIR/.seeded"

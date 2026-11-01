@@ -7,6 +7,10 @@
 //! semaphore and a deadline; on expiry the request gets EIO while the work
 //! continues and warms the cache. Every callback runs inside `catch_unwind`:
 //! a panic drops the Reply, which answers EIO, and the mount stays up.
+//!
+//! Every request carries a [`Stopwatch`] (§5.8) that travels with its Reply
+//! and drops right after it: a reply deferred until the store commit, or
+//! sent from the slow path, counts that wait.
 
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags,
@@ -15,11 +19,11 @@ use fuser::{
     ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
 };
 use pdmount_backend::NodeKind;
-use pdmount_core::config::FsyncMode;
+use pdmount_core::cache::ReadFrom;
 use pdmount_core::engine::{Engine, OpenMode, SetAttr};
 use pdmount_core::errors::{CoreError, Result};
 use pdmount_core::health::Connectivity;
-use pdmount_core::metrics::{self, Metrics};
+use pdmount_core::metrics::{self, Metrics, Op, Stopwatch};
 use pdmount_core::vfs::{Attr, Invalidation, Lookup, RenameMode};
 use std::ffi::OsStr;
 use std::future::Future;
@@ -29,6 +33,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::{Semaphore, mpsc};
+use tracing::Instrument;
 
 /// Concurrent slow-path requests (§4.2); matches `max_background`.
 const SLOW_PATH_LIMIT: usize = 64;
@@ -95,28 +100,37 @@ impl PdFs {
         )
     }
 
-    /// Runs a callback body as a hot-path handler, catching panics.
-    fn handle(&self, op: &'static str, body: impl FnOnce()) {
-        if catch_unwind(AssertUnwindSafe(|| metrics::hot(body))).is_err() {
+    /// Runs a callback body as a hot-path handler, catching panics. The
+    /// body gets the request's stopwatch and drops it after the reply.
+    fn handle(&self, op: Op, req: &Request, ino: Option<u64>, body: impl FnOnce(Stopwatch)) {
+        let watch = Stopwatch::new(
+            Arc::clone(self.engine.metrics()),
+            op,
+            req.unique().into(),
+            ino,
+        );
+        if catch_unwind(AssertUnwindSafe(|| metrics::hot(|| body(watch)))).is_err() {
             Metrics::inc(&self.engine.metrics().handler_panics);
-            tracing::error!(op, "FUSE handler panicked; answered EIO");
+            tracing::error!(op = op.as_str(), "FUSE handler panicked; answered EIO");
         }
     }
 
     /// Moves the rest of a request to a tokio task with a deadline.
     fn slow<T, F>(
         &self,
-        op: &'static str,
+        mut watch: Stopwatch,
         deadline: Duration,
         work: F,
-        reply: impl FnOnce(Result<T>) + Send + 'static,
+        reply: impl FnOnce(Result<T>, Stopwatch) + Send + 'static,
     ) where
         T: Send + 'static,
         F: Future<Output = Result<T>> + Send + 'static,
     {
         let permits = Arc::clone(&self.slow);
         let metrics = Arc::clone(self.engine.metrics());
-        self.engine.runtime().spawn(async move {
+        let span = watch.slow_path();
+        let op = watch.op().as_str();
+        let task = async move {
             let result = tokio::time::timeout(deadline, async move {
                 let _permit = permits
                     .acquire_owned()
@@ -143,17 +157,18 @@ impl PdFs {
                     tracing::debug!(op, %error, "request failed");
                 }
             }
-            reply(result);
-        });
+            reply(result, watch);
+        };
+        self.engine.runtime().spawn(task.instrument(span));
     }
 
     /// Runs `attempt` on the hot path; if it needs a listing or inode
     /// numbers, provides them on the slow path and tries again.
     fn retrying<T, A>(
         &self,
-        op: &'static str,
+        watch: Stopwatch,
         attempt: A,
-        reply: impl FnOnce(Result<T>) + Send + 'static,
+        reply: impl FnOnce(Result<T>, Stopwatch) + Send + 'static,
     ) where
         T: Send + 'static,
         A: Fn() -> Result<T> + Send + 'static,
@@ -162,7 +177,7 @@ impl PdFs {
             Err(error) if is_resolvable(&error) => {
                 let engine = Arc::clone(&self.engine);
                 self.slow(
-                    op,
+                    watch,
                     self.metadata_deadline(),
                     async move {
                         let mut error = error;
@@ -178,7 +193,7 @@ impl PdFs {
                     reply,
                 );
             }
-            result => reply(result),
+            result => reply(result, watch),
         }
     }
 
@@ -187,14 +202,18 @@ impl PdFs {
     }
 
     /// Sends a successful reply only once the store has committed the rows
-    /// the request queued (§5.6); errors go out at once.
+    /// the request queued (§5.6); errors go out at once. The stopwatch
+    /// stops after the reply.
     fn committed<T: Send + 'static>(
         &self,
         reply: impl FnOnce(Result<T>) + Send + 'static,
-    ) -> impl FnOnce(Result<T>) + Send + 'static {
+    ) -> impl FnOnce(Result<T>, Stopwatch) + Send + 'static {
         let engine = Arc::clone(&self.engine);
-        move |result| match result {
-            Ok(value) => engine.after_commit(move || reply(Ok(value))),
+        move |result, watch| match result {
+            Ok(value) => engine.after_commit(move || {
+                reply(Ok(value));
+                drop(watch);
+            }),
             Err(error) => reply(Err(error)),
         }
     }
@@ -336,12 +355,13 @@ fn time(value: TimeOrNow) -> SystemTime {
 
 impl Filesystem for PdFs {
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
-        for flag in [
+        let flags = [
             InitFlags::FUSE_DO_READDIRPLUS,
             InitFlags::FUSE_READDIRPLUS_AUTO,
             InitFlags::FUSE_PARALLEL_DIROPS,
             InitFlags::FUSE_ATOMIC_O_TRUNC,
-        ] {
+        ];
+        for flag in flags {
             if let Err(unsupported) = config.add_capabilities(flag) {
                 tracing::info!(
                     ?unsupported,
@@ -361,33 +381,37 @@ impl Filesystem for PdFs {
         Ok(())
     }
 
-    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        self.handle("lookup", || {
+    fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        self.handle(Op::Lookup, req, Some(parent.0), |watch| {
             let engine = Arc::clone(&self.engine);
             let name = name.to_owned();
             let respond = self.lookup_reply();
             self.retrying(
-                "lookup",
+                watch,
                 move || engine.lookup(parent.0, name.as_bytes()),
-                move |result| respond(result, reply),
+                move |result, _watch| respond(result, reply),
             );
         });
     }
 
-    fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
-        self.handle("forget", || self.engine.forget(ino.0, nlookup));
+    fn forget(&self, req: &Request, ino: INodeNo, nlookup: u64) {
+        self.handle(Op::Forget, req, Some(ino.0), |_watch| {
+            self.engine.forget(ino.0, nlookup);
+        });
     }
 
-    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        self.handle("getattr", || match self.engine.getattr(ino.0) {
-            Ok(attr) => reply.attr(&self.attr_ttl, &self.file_attr(&attr)),
-            Err(error) => reply.error(errno(&error)),
+    fn getattr(&self, req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        self.handle(Op::Getattr, req, Some(ino.0), |_watch| {
+            match self.engine.getattr(ino.0) {
+                Ok(attr) => reply.attr(&self.attr_ttl, &self.file_attr(&attr)),
+                Err(error) => reply.error(errno(&error)),
+            }
         });
     }
 
     fn setattr(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         mode: Option<u32>,
         uid: Option<u32>,
@@ -403,7 +427,7 @@ impl Filesystem for PdFs {
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        self.handle("setattr", || {
+        self.handle(Op::Setattr, req, Some(ino.0), |watch| {
             // Files belong to the mounting user; only no-op chowns pass.
             if uid.is_some_and(|u| u != self.uid) || gid.is_some_and(|g| g != self.gid) {
                 return reply.error(Errno::EPERM);
@@ -424,13 +448,13 @@ impl Filesystem for PdFs {
                 Err(CoreError::NeedsMaterialize(_)) => {
                     let engine = Arc::clone(&self.engine);
                     self.slow(
-                        "setattr",
+                        watch,
                         self.block_deadline(),
                         async move { engine.setattr_slow(ino.0, change).await },
                         respond,
                     );
                 }
-                result => respond(result),
+                result => respond(result, watch),
             }
         });
     }
@@ -451,43 +475,43 @@ impl Filesystem for PdFs {
 
     fn mkdir(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
         umask: u32,
         reply: ReplyEntry,
     ) {
-        self.handle("mkdir", || {
+        self.handle(Op::Mkdir, req, Some(parent.0), |watch| {
             let engine = Arc::clone(&self.engine);
             let name = name.to_owned();
             let respond = self.entry_reply();
             self.retrying(
-                "mkdir",
+                watch,
                 move || engine.mkdir(parent.0, name.as_bytes(), mode & !umask),
                 self.committed(move |result| respond(result, reply)),
             );
         });
     }
 
-    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        self.handle("unlink", || {
+    fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        self.handle(Op::Unlink, req, Some(parent.0), |watch| {
             let engine = Arc::clone(&self.engine);
             let name = name.to_owned();
             self.retrying(
-                "unlink",
+                watch,
                 move || engine.unlink(parent.0, name.as_bytes()),
                 self.committed(reply_empty(reply)),
             );
         });
     }
 
-    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        self.handle("rmdir", || {
+    fn rmdir(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        self.handle(Op::Rmdir, req, Some(parent.0), |watch| {
             let engine = Arc::clone(&self.engine);
             let name = name.to_owned();
             self.retrying(
-                "rmdir",
+                watch,
                 move || engine.rmdir(parent.0, name.as_bytes()),
                 self.committed(reply_empty(reply)),
             );
@@ -507,7 +531,7 @@ impl Filesystem for PdFs {
 
     fn rename(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         newparent: INodeNo,
@@ -515,7 +539,7 @@ impl Filesystem for PdFs {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        self.handle("rename", || {
+        self.handle(Op::Rename, req, Some(parent.0), |watch| {
             if flags.intersects(RenameFlags::RENAME_EXCHANGE | RenameFlags::RENAME_WHITEOUT)
                 || !(flags - RenameFlags::RENAME_NOREPLACE).is_empty()
             {
@@ -529,7 +553,7 @@ impl Filesystem for PdFs {
             let engine = Arc::clone(&self.engine);
             let (name, newname) = (name.to_owned(), newname.to_owned());
             self.retrying(
-                "rename",
+                watch,
                 move || {
                     engine.rename(
                         parent.0,
@@ -555,8 +579,8 @@ impl Filesystem for PdFs {
         reply.error(Errno::EPERM);
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        self.handle("open", || {
+    fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        self.handle(Op::Open, req, Some(ino.0), |watch| {
             let respond = self.committed(move |result: Result<(u64, bool)>| match result {
                 Ok((handle, keep_cache)) => {
                     let flags = if keep_cache {
@@ -568,13 +592,13 @@ impl Filesystem for PdFs {
                 }
                 Err(error) => reply.error(errno(&error)),
             });
-            respond(self.engine.open_file(ino.0, open_mode(flags.0)));
+            respond(self.engine.open_file(ino.0, open_mode(flags.0)), watch);
         });
     }
 
     fn create(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
@@ -582,7 +606,7 @@ impl Filesystem for PdFs {
         flags: i32,
         reply: ReplyCreate,
     ) {
-        self.handle("create", || {
+        self.handle(Op::Create, req, Some(parent.0), |watch| {
             let engine = Arc::clone(&self.engine);
             let name = name.to_owned();
             let exclusive = flags & nix::libc::O_EXCL != 0;
@@ -590,7 +614,7 @@ impl Filesystem for PdFs {
             let (uid, gid, attr_ttl, entry_ttl) =
                 (self.uid, self.gid, self.attr_ttl, self.entry_ttl);
             self.retrying(
-                "create",
+                watch,
                 move || engine.create(parent.0, name.as_bytes(), mode & !umask, exclusive, open),
                 self.committed(move |result| match result {
                     Ok((attr, handle)) => {
@@ -612,8 +636,8 @@ impl Filesystem for PdFs {
 
     fn read(
         &self,
-        _req: &Request,
-        _ino: INodeNo,
+        req: &Request,
+        ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         size: u32,
@@ -621,16 +645,24 @@ impl Filesystem for PdFs {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
-        self.handle("read", || {
+        self.handle(Op::ReadRam, req, Some(ino.0), |mut watch| {
             match self.engine.read_local(fh.0, offset, size) {
-                Ok(Some(data)) => reply.data(&data),
+                Ok(Some((data, from))) => {
+                    watch.set_op(match from {
+                        ReadFrom::Ram => Op::ReadRam,
+                        ReadFrom::Disk => Op::ReadDisk,
+                        ReadFrom::Staging => Op::ReadStaging,
+                    });
+                    reply.data(&data);
+                }
                 Ok(None) => {
                     let engine = Arc::clone(&self.engine);
+                    watch.set_op(Op::ReadSlow);
                     self.slow(
-                        "read",
+                        watch,
                         self.block_deadline(),
                         async move { engine.read(fh.0, offset, size).await },
-                        move |result| match result {
+                        move |result, _watch| match result {
                             Ok(data) => reply.data(&data),
                             Err(error) => reply.error(errno(&error)),
                         },
@@ -643,8 +675,8 @@ impl Filesystem for PdFs {
 
     fn write(
         &self,
-        _req: &Request,
-        _ino: INodeNo,
+        req: &Request,
+        ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         data: &[u8],
@@ -653,7 +685,7 @@ impl Filesystem for PdFs {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyWrite,
     ) {
-        self.handle("write", || {
+        self.handle(Op::Write, req, Some(ino.0), |watch| {
             let respond = self.committed(move |result: Result<u32>| match result {
                 Ok(written) => reply.written(written),
                 Err(error) => reply.error(errno(&error)),
@@ -663,65 +695,73 @@ impl Filesystem for PdFs {
                     let engine = Arc::clone(&self.engine);
                     let data = data.to_vec();
                     self.slow(
-                        "write",
+                        watch,
                         self.block_deadline(),
                         async move { engine.write(fh.0, offset, data).await },
                         respond,
                     );
                 }
-                result => respond(result),
+                result => respond(result, watch),
             }
         });
     }
 
     fn flush(
         &self,
-        _req: &Request,
-        _ino: INodeNo,
+        req: &Request,
+        ino: INodeNo,
         fh: FileHandle,
         _lock_owner: fuser::LockOwner,
         reply: ReplyEmpty,
     ) {
-        self.handle("flush", || match self.engine.flush(fh.0) {
-            Ok(()) => self.engine.after_commit(move || reply.ok()),
-            Err(error) => reply.error(errno(&error)),
+        self.handle(Op::Flush, req, Some(ino.0), |watch| {
+            match self.engine.flush(fh.0) {
+                Ok(()) => self.engine.after_commit(move || {
+                    reply.ok();
+                    drop(watch);
+                }),
+                Err(error) => reply.error(errno(&error)),
+            }
         });
     }
 
     fn release(
         &self,
-        _req: &Request,
-        _ino: INodeNo,
+        req: &Request,
+        ino: INodeNo,
         fh: FileHandle,
         _flags: OpenFlags,
         _lock_owner: Option<fuser::LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.handle("release", || {
+        self.handle(Op::Release, req, Some(ino.0), |watch| {
             self.engine.release_file(fh.0);
-            self.engine.after_commit(move || reply.ok());
+            self.engine.after_commit(move || {
+                reply.ok();
+                drop(watch);
+            });
         });
     }
 
     fn fsync(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         _fh: FileHandle,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        self.handle("fsync", || {
+        self.handle(Op::Fsync, req, Some(ino.0), |watch| {
             let engine = Arc::clone(&self.engine);
-            let remote = engine.config().fsync.mode == FsyncMode::Remote;
+            let remote = engine.fsync_is_remote(ino.0);
             let deadline = if remote {
                 self.block_deadline()
             } else {
                 self.metadata_deadline
             };
             self.slow(
-                "fsync",
+                watch,
                 deadline,
                 async move {
                     engine.fsync(ino.0).await?;
@@ -730,19 +770,26 @@ impl Filesystem for PdFs {
                     }
                     Ok(())
                 },
-                reply_empty(reply),
+                move |result, _watch| reply_empty(reply)(result),
             );
         });
     }
 
-    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        self.handle("opendir", || {
+    fn opendir(&self, req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        self.handle(Op::Opendir, req, Some(ino.0), |watch| {
             let engine = Arc::clone(&self.engine);
             self.retrying(
-                "opendir",
+                watch,
                 move || engine.opendir(ino.0),
-                move |result| match result {
-                    Ok(handle) => reply.opened(FileHandle(handle), FopenFlags::FOPEN_CACHE_DIR),
+                move |result, _watch| match result {
+                    Ok((handle, keep_cache)) => {
+                        let flags = if keep_cache {
+                            FopenFlags::FOPEN_CACHE_DIR | FopenFlags::FOPEN_KEEP_CACHE
+                        } else {
+                            FopenFlags::FOPEN_CACHE_DIR
+                        };
+                        reply.opened(FileHandle(handle), flags);
+                    }
                     Err(error) => reply.error(errno(&error)),
                 },
             );
@@ -751,30 +798,32 @@ impl Filesystem for PdFs {
 
     fn readdir(
         &self,
-        _req: &Request,
-        _ino: INodeNo,
+        req: &Request,
+        ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        self.handle("readdir", || match self.engine.dir_snapshot(fh.0) {
-            Ok(entries) => {
-                fill_dir(&entries, offset, &mut reply);
-                reply.ok();
+        self.handle(Op::Readdir, req, Some(ino.0), |_watch| {
+            match self.engine.dir_snapshot(fh.0) {
+                Ok(entries) => {
+                    fill_dir(&entries, offset, &mut reply);
+                    reply.ok();
+                }
+                Err(error) => reply.error(errno(&error)),
             }
-            Err(error) => reply.error(errno(&error)),
         });
     }
 
     fn readdirplus(
         &self,
-        _req: &Request,
-        _ino: INodeNo,
+        req: &Request,
+        ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         mut reply: ReplyDirectoryPlus,
     ) {
-        self.handle("readdirplus", || {
+        self.handle(Op::Readdirplus, req, Some(ino.0), |_watch| {
             let entries = match self.engine.dir_snapshot(fh.0) {
                 Ok(entries) => entries,
                 Err(error) => return reply.error(errno(&error)),
@@ -821,13 +870,13 @@ impl Filesystem for PdFs {
 
     fn releasedir(
         &self,
-        _req: &Request,
-        _ino: INodeNo,
+        req: &Request,
+        ino: INodeNo,
         fh: FileHandle,
         _flags: OpenFlags,
         reply: ReplyEmpty,
     ) {
-        self.handle("releasedir", || {
+        self.handle(Op::Releasedir, req, Some(ino.0), |_watch| {
             self.engine.releasedir(fh.0);
             reply.ok();
         });
@@ -835,25 +884,25 @@ impl Filesystem for PdFs {
 
     fn fsyncdir(
         &self,
-        _req: &Request,
-        _ino: INodeNo,
+        req: &Request,
+        ino: INodeNo,
         _fh: FileHandle,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        self.handle("fsyncdir", || {
+        self.handle(Op::Fsyncdir, req, Some(ino.0), |watch| {
             let engine = Arc::clone(&self.engine);
             self.slow(
-                "fsyncdir",
+                watch,
                 self.metadata_deadline(),
                 async move { engine.fsyncdir().await },
-                reply_empty(reply),
+                move |result, _watch| reply_empty(reply)(result),
             );
         });
     }
 
-    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
-        self.handle("statfs", || {
+    fn statfs(&self, req: &Request, ino: INodeNo, reply: ReplyStatfs) {
+        self.handle(Op::Statfs, req, Some(ino.0), |_watch| {
             let s = self.engine.statfs();
             reply.statfs(
                 s.blocks, s.bfree, s.bavail, s.files, s.ffree, s.bsize, s.namelen, s.bsize,
@@ -861,8 +910,8 @@ impl Filesystem for PdFs {
         });
     }
 
-    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
-        self.handle("getxattr", || {
+    fn getxattr(&self, req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        self.handle(Op::Getxattr, req, Some(ino.0), |_watch| {
             let value = name
                 .to_str()
                 .map_or(Ok(None), |name| self.engine.xattr(ino.0, name));
@@ -874,22 +923,24 @@ impl Filesystem for PdFs {
         });
     }
 
-    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
-        self.handle("listxattr", || match self.engine.xattr_names(ino.0) {
-            Ok(names) => {
-                let list: Vec<u8> = names
-                    .iter()
-                    .flat_map(|name| name.bytes().chain(std::iter::once(0)))
-                    .collect();
-                xattr_reply(reply, &list, size);
+    fn listxattr(&self, req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        self.handle(Op::Listxattr, req, Some(ino.0), |_watch| {
+            match self.engine.xattr_names(ino.0) {
+                Ok(names) => {
+                    let list: Vec<u8> = names
+                        .iter()
+                        .flat_map(|name| name.bytes().chain(std::iter::once(0)))
+                        .collect();
+                    xattr_reply(reply, &list, size);
+                }
+                Err(error) => reply.error(errno(&error)),
             }
-            Err(error) => reply.error(errno(&error)),
         });
     }
 
-    fn access(&self, _req: &Request, ino: INodeNo, mask: fuser::AccessFlags, reply: ReplyEmpty) {
+    fn access(&self, req: &Request, ino: INodeNo, mask: fuser::AccessFlags, reply: ReplyEmpty) {
         // Without `default_permissions` the daemon checks modes (D031).
-        self.handle("access", || {
+        self.handle(Op::Access, req, Some(ino.0), |_watch| {
             reply_empty(reply)(self.engine.access(ino.0, mask.bits() as u32))
         });
     }
@@ -963,6 +1014,9 @@ pub fn mount(
         MountOption::NoDev,
         MountOption::NoSuid,
     ];
+    if engine.is_read_only() {
+        config.mount_options.push(MountOption::RO);
+    }
     config.n_threads = Some(FUSER_THREADS);
     config.clone_fd = true;
     let session = fuser::Session::new(PdFs::new(engine, uid, gid), mountpoint, &config)?;

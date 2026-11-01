@@ -48,16 +48,19 @@ fn available() -> bool {
         && crate::doctor::find_in_path("notify-send").is_some()
 }
 
+/// `notify-send`'s arguments. Other local users can read them in
+/// `/proc/<pid>/cmdline`, so they never carry secrets (D071).
+pub fn argv<'a>(summary: &'a str, body: &'a str) -> [&'a str; 4] {
+    ["--app-name=PdMount", "--", summary, body]
+}
+
 /// Shows a notification: spawns `notify-send` and does not wait for it.
 pub fn desktop(summary: &str, body: &str) {
     if !available() {
         return;
     }
     let spawned = Command::new("notify-send")
-        .arg("--app-name=PdMount")
-        .arg("--")
-        .arg(summary)
-        .arg(body)
+        .args(argv(summary, body))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

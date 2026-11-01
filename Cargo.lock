@@ -1946,6 +1946,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hdrhistogram"
+version = "7.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f49d1053f4708f0af3cf9fc5bffc7e68a914a3c45becb231c80068c9c3f78bea"
+dependencies = [
+ "byteorder",
+ "num-traits",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3200,11 +3210,14 @@ name = "pdmount"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "clap",
  "dbus-secret-service",
+ "futures",
  "hex",
  "keyring",
+ "log",
  "nix 0.30.1",
  "parking_lot",
  "pdmount-backend",
@@ -3218,6 +3231,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
 ]
 
@@ -3257,6 +3271,7 @@ dependencies = [
  "dirs",
  "futures",
  "globset",
+ "hdrhistogram",
  "lru",
  "nix 0.30.1",
  "parking_lot",
@@ -3723,7 +3738,7 @@ dependencies = [
 [[package]]
 name = "proton-drive-sdk"
 version = "0.4.0"
-source = "git+https://github.com/colsen665/proton-sdk-rs2?rev=c837e031507686d782777c6d15ce9dfc57f2baf8#c837e031507686d782777c6d15ce9dfc57f2baf8"
+source = "git+https://github.com/colsen665/proton-sdk-rs2?rev=caafaea683116e71957d8e6b86de1450afc97ac1#caafaea683116e71957d8e6b86de1450afc97ac1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3785,7 +3800,7 @@ dependencies = [
 [[package]]
 name = "proton-sdk-rs2"
 version = "0.4.0"
-source = "git+https://github.com/colsen665/proton-sdk-rs2?rev=c837e031507686d782777c6d15ce9dfc57f2baf8#c837e031507686d782777c6d15ce9dfc57f2baf8"
+source = "git+https://github.com/colsen665/proton-sdk-rs2?rev=caafaea683116e71957d8e6b86de1450afc97ac1#caafaea683116e71957d8e6b86de1450afc97ac1"
 dependencies = [
  "aes-gcm",
  "anyhow",

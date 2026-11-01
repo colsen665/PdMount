@@ -10,6 +10,7 @@ A FUSE filesystem for Linux that mounts Proton Drive "My Files" read-write. It i
 
 | Document | Content |
 |---|---|
+| [docs/user-guide.md](docs/user-guide.md) | Installing and using PdMount: mount, autostart, access rules, conflicts, queue, cache, troubleshooting |
 | [TODO.md](TODO.md) | Current status, next action, open questions |
 | [AGENTS.md](AGENTS.md) | Instructions for agents working in this repository (CLAUDE.md refers to it) |
 | [docs/decisions.md](docs/decisions.md) | Decision log |

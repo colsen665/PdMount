@@ -56,6 +56,9 @@ if ((full)); then
     PROPTEST_CASES=10000 cargo test -p pdmount-core --locked proptests
 fi
 
+step "script self-tests"
+tests/scenarios/selftest-lib.sh
+
 if ((quick == 0)); then
     step "release build"
     cargo build --workspace --release --locked
@@ -69,7 +72,7 @@ if ((quick == 0)); then
         R_FILES=200 R_BIG_MIB=10 MODES="live crash" \
             tests/scenarios/run-all.sh r1 r3 r4 r6 r7 g3 g4 g6 g6_read n1 a1 a6 sha
         R_FILES=200 R_BIG_MIB=10 G3_COMMITS=30 MODES="second" tests/scenarios/run-all.sh r1 r3 g3 a1
-        MODES="live" tests/scenarios/run-all.sh e1 e2 m1 m3 m4 m5 m6 m7
+        MODES="live" tests/scenarios/run-all.sh e1 e2 m1 m3 m4 m5 m6 m7 queue ops
     fi
     kill9_log=$(mktemp "${TMPDIR:-/tmp}/pdmount-kill9.XXXXXX")
     tests/scenarios/kill9.sh >"$kill9_log" 2>&1 || { echo "scenario kill9 failed; log: $kill9_log" >&2; exit 1; }

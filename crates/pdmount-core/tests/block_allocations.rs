@@ -120,6 +120,7 @@ async fn block_reads_after_warm_up_allocate_no_block_buffers() {
                 ram_bytes: 16 << 20,
                 disk_bytes: 64 << 20,
             },
+            pdmount_core::staging::Protections::default(),
         )
         .expect("cache"),
     );
@@ -211,7 +212,8 @@ async fn engine_reads_after_warm_up_allocate_no_block_buffers() {
         let data = engine
             .read_local(handle, offset, READ as u32)
             .expect("read")
-            .expect("local");
+            .expect("local")
+            .0;
         data == content[offset as usize..(offset + READ) as usize]
     };
     // Warm-up: download every block, then one round from disk.

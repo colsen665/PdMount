@@ -169,9 +169,15 @@ impl Engine {
                 *cursor = Some(since.clone());
             }
             if !page.more {
+                *self.last_poll.lock() = Some(std::time::Instant::now());
                 return Ok(());
             }
         }
+    }
+
+    /// How long ago the event stream was last read to its end (`status`).
+    pub fn events_last_poll(&self) -> Option<std::time::Duration> {
+        self.last_poll.lock().map(|at| at.elapsed())
     }
 
     /// Whether a refresh is listing directories again.

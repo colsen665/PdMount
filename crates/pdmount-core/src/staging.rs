@@ -8,23 +8,129 @@
 //! the block cache. A write that only partly covers such a block needs the
 //! block materialized first; one that covers it completely just marks it.
 //!
+//! A file with neither base nor base revision (a new file) has no sidecar
+//! (D067): a data file without one never had a base. A file that has one
+//! gets its sidecar before its data file, and keeps it from the first save
+//! on. Startup lists the data files; a sidecar without one is removed.
+//!
 //! The sidecar is replaced before a write that depends on it is
 //! acknowledged, so a killed daemon finds staging data and bookkeeping in
-//! agreement. Both live in the page cache until `sync`, like the data.
+//! agreement. Both live in the page cache until `sync`, which flushes the
+//! sidecar before the data.
+//!
+//! Staging files are opened on demand: an [`FdCache`] keeps the recently
+//! used descriptors, so the number of staged files is not bounded by the
+//! open-file limit (D063).
 
 use crate::cache::BLOCK_SIZE;
 use crate::vfs::Ino;
 use pdmount_backend::{LinkId, RevisionId};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{self, Write};
+use std::num::NonZeroUsize;
 use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Materialization granularity: Proton's block size.
 pub const GRID: u64 = BLOCK_SIZE;
 const SIDECAR_VERSION: u32 = 1;
+/// Staging descriptors kept open at most (D063).
+pub const OPEN_FILES_MAX: usize = 1024;
+/// Fewer are never kept, whatever the open-file limit.
+const OPEN_FILES_MIN: usize = 16;
+
+/// Descriptors the staging may keep open: [`OPEN_FILES_MAX`], or a quarter
+/// of the soft open-file limit when that is lower, which leaves the rest to
+/// the store, the block cache, FUSE and the network.
+pub fn open_files_capacity() -> usize {
+    use nix::sys::resource::{Resource, getrlimit};
+    let soft = getrlimit(Resource::RLIMIT_NOFILE).map_or(OPEN_FILES_MAX as u64, |(soft, _)| soft);
+    usize::try_from(soft / 4)
+        .unwrap_or(OPEN_FILES_MAX)
+        .clamp(OPEN_FILES_MIN, OPEN_FILES_MAX)
+}
+
+/// Open staging files by inode, least recently used closed first (D063).
+///
+/// A descriptor is shared while an operation uses it: an evicted file stays
+/// open until that operation drops its `Arc`. Descriptors are opened and
+/// closed outside the lock, since a close can make btrfs flush the file.
+pub struct FdCache {
+    files: parking_lot::Mutex<lru::LruCache<Ino, Arc<File>>>,
+}
+
+impl FdCache {
+    pub fn new(capacity: usize) -> Self {
+        let capacity = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN);
+        Self {
+            files: parking_lot::Mutex::new(lru::LruCache::new(capacity)),
+        }
+    }
+
+    /// The descriptor of `ino`, opened read-write from `path` on a miss
+    /// (std opens with `O_CLOEXEC`).
+    pub fn get(&self, ino: Ino, path: &Path) -> io::Result<Arc<File>> {
+        // Opened under the lock: a descriptor opened before a `remove` and
+        // stored after a new `insert` would hide the new file, and writes
+        // through it would go to an unlinked one.
+        let mut files = self.files.lock();
+        if let Some(file) = files.get(&ino) {
+            return Ok(Arc::clone(file));
+        }
+        let file = Arc::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)?,
+        );
+        let evicted = files.push(ino, Arc::clone(&file));
+        drop(files);
+        // Closed after the lock, as in `insert`.
+        drop(evicted);
+        Ok(file)
+    }
+
+    /// Makes `file` the descriptor of `ino`, replacing any other.
+    fn insert(&self, ino: Ino, file: File) -> Arc<File> {
+        let file = Arc::new(file);
+        // The replaced or evicted descriptor is closed after the lock.
+        let evicted = self.files.lock().push(ino, Arc::clone(&file));
+        drop(evicted);
+        file
+    }
+
+    /// Closes the descriptor of `ino`, if open.
+    pub fn remove(&self, ino: Ino) {
+        let file = self.files.lock().pop(&ino);
+        drop(file);
+    }
+
+    /// Descriptors open now.
+    pub fn len(&self) -> usize {
+        self.files.lock().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.files.lock().cap().get()
+    }
+}
+
+impl std::fmt::Debug for FdCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let files = self.files.lock();
+        f.debug_struct("FdCache")
+            .field("open", &files.len())
+            .field("capacity", &files.cap())
+            .finish()
+    }
+}
 
 /// The remote revision whose content a staged file still partly uses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,7 +144,7 @@ pub struct Base {
     pub size: u64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Sidecar {
     version: u32,
     /// Revision the local edits derive from: the precondition of the next
@@ -49,6 +155,24 @@ struct Sidecar {
     materialized: BTreeSet<u64>,
 }
 
+impl Default for Sidecar {
+    /// What a missing sidecar stands for: no base, no base revision.
+    fn default() -> Self {
+        Self {
+            version: SIDECAR_VERSION,
+            base_rev: None,
+            base: None,
+            materialized: BTreeSet::new(),
+        }
+    }
+}
+
+impl Sidecar {
+    fn is_default(&self) -> bool {
+        self.base_rev.is_none() && self.base.is_none() && self.materialized.is_empty()
+    }
+}
+
 /// Where the bytes of a range come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Piece {
@@ -56,21 +180,91 @@ pub enum Piece {
     Base { offset: u64, len: u64 },
 }
 
-/// Staging directory of a profile.
+/// The revisions staged files still read from the block cache, which the
+/// cache must not evict (§6.2). A [`Staged`] holds its entry while it has a
+/// base, however it ends: every way out of the staged map drops the entry.
+#[derive(Debug, Clone, Default)]
+pub struct Protections(Arc<parking_lot::Mutex<HashMap<(LinkId, RevisionId), u32>>>);
+
+impl Protections {
+    fn hold(&self, base: &Base) -> Protection {
+        let key = (base.link.clone(), base.rev.clone());
+        *self.0.lock().entry(key.clone()).or_default() += 1;
+        Protection {
+            protections: self.clone(),
+            key,
+        }
+    }
+
+    /// The protected revisions, for a pass over the cache's entries. Takes
+    /// nothing while held.
+    pub fn lock(&self) -> parking_lot::MutexGuard<'_, HashMap<(LinkId, RevisionId), u32>> {
+        self.0.lock()
+    }
+
+    /// Revisions protected now.
+    pub fn len(&self) -> usize {
+        self.0.lock().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// One staged file's hold on its base revision.
+#[derive(Debug)]
+struct Protection {
+    protections: Protections,
+    key: (LinkId, RevisionId),
+}
+
+impl Drop for Protection {
+    fn drop(&mut self) {
+        let mut held = self.protections.0.lock();
+        if let Some(count) = held.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                held.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// Staging directory of a profile. Clones share the open descriptors.
 #[derive(Debug, Clone)]
 pub struct StagingDir {
     dir: PathBuf,
+    files: Arc<FdCache>,
+    protections: Protections,
 }
 
 impl StagingDir {
+    /// Opens with [`open_files_capacity`] descriptors at most.
     pub fn open(dir: &Path) -> io::Result<Self> {
+        Self::with_capacity(dir, open_files_capacity())
+    }
+
+    pub fn with_capacity(dir: &Path, open_files: usize) -> io::Result<Self> {
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(dir)?;
         Ok(Self {
             dir: dir.to_owned(),
+            files: Arc::new(FdCache::new(open_files)),
+            protections: Protections::default(),
         })
+    }
+
+    /// The base revisions of this directory's staged files.
+    pub fn protections(&self) -> &Protections {
+        &self.protections
+    }
+
+    /// Staging descriptors open now (the `staged_open_files` gauge).
+    pub fn open_files(&self) -> usize {
+        self.files.len()
     }
 
     pub fn data_path(&self, ino: Ino) -> PathBuf {
@@ -85,25 +279,34 @@ impl StagingDir {
         self.dir.join(format!("{ino}.snap"))
     }
 
-    /// Inodes with staging files, for recovery.
+    /// Inodes with staging files, for recovery: those with a data file (a
+    /// new file has no sidecar). Removes sidecars left without a data file
+    /// (a crash between the two in `create` or `remove`).
     pub fn staged_inos(&self) -> io::Result<Vec<Ino>> {
         let mut inos = Vec::new();
+        let mut sidecars = Vec::new();
         for entry in std::fs::read_dir(&self.dir)? {
             let name = entry?.file_name();
-            if let Some(ino) = name
-                .to_str()
-                .and_then(|n| n.strip_suffix(".state"))
-                .and_then(|n| n.parse().ok())
-            {
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if let Ok(ino) = name.parse::<Ino>() {
                 inos.push(ino);
+            } else if let Some(ino) = name.strip_suffix(".state").and_then(|n| n.parse().ok()) {
+                sidecars.push(ino);
             }
         }
         inos.sort_unstable();
+        for ino in sidecars {
+            if inos.binary_search(&ino).is_err() {
+                let _ = std::fs::remove_file(self.sidecar_path(ino));
+            }
+        }
         Ok(inos)
     }
 
     /// Starts staging an inode: `size` bytes, the first `base.size` of them
-    /// from `base`.
+    /// from `base`. The sidecar, if the file needs one, comes first.
     pub fn create(
         &self,
         ino: Ino,
@@ -111,6 +314,31 @@ impl StagingDir {
         base: Option<Base>,
         size: u64,
     ) -> io::Result<Staged> {
+        let base = base.filter(|b| b.size > 0);
+        let mut staged = Staged {
+            ino,
+            dir: self.clone(),
+            path: self.data_path(ino),
+            protection: base.as_ref().map(|base| self.protections.hold(base)),
+            sidecar: Sidecar {
+                base_rev,
+                base,
+                ..Sidecar::default()
+            },
+            size,
+            sidecar_on_disk: false,
+            sidecar_synced: false,
+        };
+        if staged.sidecar.is_default() {
+            // One left from earlier staging whose removal is still queued
+            // would give the new data its base.
+            match std::fs::remove_file(self.sidecar_path(ino)) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+        } else {
+            staged.save()?;
+        }
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -123,38 +351,38 @@ impl StagingDir {
         if size > 0 {
             file.set_len(size)?;
         }
-        let mut staged = Staged {
-            ino,
-            dir: self.clone(),
-            file,
-            sidecar: Sidecar {
-                version: SIDECAR_VERSION,
-                base_rev,
-                base: base.filter(|b| b.size > 0),
-                materialized: BTreeSet::new(),
-            },
-            size,
-        };
-        staged.save()?;
+        self.files.insert(ino, file);
         Ok(staged)
     }
 
-    /// Reopens a staged inode after a restart.
+    /// Reopens a staged inode after a restart. A missing sidecar means no
+    /// base (a new file).
     pub fn reopen(&self, ino: Ino) -> io::Result<Staged> {
-        let json = std::fs::read(self.sidecar_path(ino))?;
-        let sidecar: Sidecar = serde_json::from_slice(&json)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(self.data_path(ino))?;
-        let size = file.metadata()?.len();
+        let (sidecar, sidecar_on_disk) = match std::fs::read(self.sidecar_path(ino)) {
+            Ok(json) => (
+                serde_json::from_slice(&json)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+                true,
+            ),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (Sidecar::default(), false),
+            Err(e) => return Err(e),
+        };
+        // No descriptor yet: the first I/O opens one.
+        let path = self.data_path(ino);
+        let size = std::fs::metadata(&path)?.len();
         let mut staged = Staged {
             ino,
             dir: self.clone(),
-            file,
+            path,
+            protection: sidecar
+                .base
+                .as_ref()
+                .map(|base| self.protections.hold(base)),
             sidecar,
             size,
+            sidecar_on_disk,
+            // Not known: the next `sync` flushes it.
+            sidecar_synced: false,
         };
         // A truncate that cut the file but crashed before its sidecar save
         // ([`Staged::truncate`]): the file is the truth, finish the cut.
@@ -168,8 +396,11 @@ impl StagingDir {
         Ok(staged)
     }
 
-    /// Deletes the staging files of an inode.
+    /// Deletes the staging files of an inode, closing its descriptor first.
+    /// The data file goes first, so a crash leaves at most a sidecar, which
+    /// startup removes. Missing files (no sidecar, no snapshot) are fine.
     pub fn remove(&self, ino: Ino) {
+        self.files.remove(ino);
         for path in [
             self.data_path(ino),
             self.sidecar_path(ino),
@@ -185,10 +416,18 @@ impl StagingDir {
 pub struct Staged {
     ino: Ino,
     dir: StagingDir,
-    file: File,
+    /// The staging file, opened through the directory's [`FdCache`].
+    path: PathBuf,
+    /// Held while the sidecar has a base.
+    protection: Option<Protection>,
     sidecar: Sidecar,
     /// Always equal to the staging file's length.
     size: u64,
+    /// The sidecar file exists (D067: not for a new file until it gets a
+    /// base revision).
+    sidecar_on_disk: bool,
+    /// The sidecar on disk was flushed since its last save.
+    sidecar_synced: bool,
 }
 
 impl Staged {
@@ -198,6 +437,11 @@ impl Staged {
 
     pub fn size(&self) -> u64 {
         self.size
+    }
+
+    /// The staging file's descriptor, for one operation.
+    fn file(&self) -> io::Result<Arc<File>> {
+        self.dir.files.get(self.ino, &self.path)
     }
 
     pub fn base_rev(&self) -> Option<&RevisionId> {
@@ -308,13 +552,16 @@ impl Staged {
         }
     }
 
-    /// Every base block not materialized yet (before a snapshot).
-    pub fn missing_blocks(&self) -> Vec<u64> {
+    /// The first `limit` base blocks not materialized yet (before a
+    /// snapshot). Callers work in batches, so a large base never becomes one
+    /// list.
+    pub fn missing_blocks(&self, limit: usize) -> Vec<u64> {
         let Some(base) = &self.sidecar.base else {
             return Vec::new();
         };
         (0..base.size.div_ceil(GRID))
             .filter(|index| !self.sidecar.materialized.contains(index))
+            .take(limit)
             .collect()
     }
 
@@ -336,7 +583,7 @@ impl Staged {
                 format!("base block {index} has {} of {len} bytes", data.len()),
             ));
         }
-        self.file.write_all_at(&data[..len], start)?;
+        self.file()?.write_all_at(&data[..len], start)?;
         self.sidecar.materialized.insert(index);
         self.drop_base_if_complete();
         self.save()
@@ -356,7 +603,7 @@ impl Staged {
             .collect();
         // Data first: a crash before the sidecar save leaves the block on its
         // base (the write was never acknowledged), never a hole of zeros.
-        self.file.write_all_at(data, offset)?;
+        self.file()?.write_all_at(data, offset)?;
         self.size = self.size.max(offset + len);
         if !covered.is_empty() {
             self.sidecar.materialized.extend(covered);
@@ -368,7 +615,7 @@ impl Staged {
 
     /// Reads staging bytes; the caller merges base pieces.
     pub fn read_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
-        self.file.read_exact_at(buffer, offset)
+        self.file()?.read_exact_at(buffer, offset)
     }
 
     /// Changes the size. A cut inside a missing base block must have been
@@ -376,7 +623,7 @@ impl Staged {
     pub fn truncate(&mut self, size: u64) -> io::Result<()> {
         // The file first: reopening takes the size from it, so a crash before
         // the sidecar save never exposes the base tail as zeros.
-        self.file.set_len(size)?;
+        self.file()?.set_len(size)?;
         self.size = size;
         if let Some(base) = &mut self.sidecar.base
             && size < base.size
@@ -394,6 +641,7 @@ impl Staged {
         {
             self.sidecar.base = None;
             self.sidecar.materialized.clear();
+            self.protection = None;
         }
     }
 
@@ -411,13 +659,25 @@ impl Staged {
         Ok(path)
     }
 
-    /// `fdatasync` of data and sidecar (fsync, §5.6).
-    pub fn sync(&self) -> io::Result<()> {
-        self.file.sync_data()?;
-        File::open(self.dir.sidecar_path(self.ino))?.sync_data()
+    /// `fdatasync` of sidecar and data (fsync, §5.6): the sidecar first, if
+    /// it changed since its last flush, so durable data never comes with a
+    /// lost sidecar that held its base. The descriptor may have been
+    /// reopened since the writes: fsync flushes the inode, through
+    /// whichever descriptor.
+    pub fn sync(&mut self) -> io::Result<()> {
+        if self.sidecar_on_disk && !self.sidecar_synced {
+            File::open(self.dir.sidecar_path(self.ino))?.sync_data()?;
+            self.sidecar_synced = true;
+        }
+        self.file()?.sync_data()
     }
 
+    /// Replaces the sidecar. A file that never had one gets none while it
+    /// is the default; once written it is kept, default or not.
     fn save(&mut self) -> io::Result<()> {
+        if !self.sidecar_on_disk && self.sidecar.is_default() {
+            return Ok(());
+        }
         let path = self.dir.sidecar_path(self.ino);
         let tmp = path.with_extension("state.tmp");
         let json = serde_json::to_vec(&self.sidecar).map_err(io::Error::other)?;
@@ -429,7 +689,9 @@ impl Staged {
             .open(&tmp)?;
         file.write_all(&json)?;
         drop(file);
-        std::fs::rename(&tmp, &path)
+        std::fs::rename(&tmp, &path)?;
+        (self.sidecar_on_disk, self.sidecar_synced) = (true, false);
+        Ok(())
     }
 }
 
@@ -496,7 +758,8 @@ mod tests {
         );
         // A partial write needs its block first.
         assert_eq!(staged.blocks_to_materialize_for_write(10, 5), vec![0]);
-        assert_eq!(staged.missing_blocks(), vec![0, 2]);
+        assert_eq!(staged.missing_blocks(16), vec![0, 2]);
+        assert_eq!(staged.missing_blocks(1), vec![0], "one batch at a time");
     }
 
     #[test]
@@ -527,7 +790,7 @@ mod tests {
         );
         assert_eq!(staged.blocks_to_materialize_for_truncate(GRID + 1), vec![1]);
         staged.truncate(GRID).expect("truncate at a boundary");
-        assert_eq!(staged.missing_blocks(), vec![0]);
+        assert_eq!(staged.missing_blocks(16), vec![0]);
         staged.truncate(GRID + 100).expect("extend");
         assert_eq!(
             staged.plan_read(GRID, 100),
@@ -560,7 +823,7 @@ mod tests {
         assert_eq!(staging.staged_inos().expect("list"), vec![5]);
         let staged = staging.reopen(5).expect("reopen");
         assert_eq!(staged.size(), GRID + 10);
-        assert_eq!(staged.missing_blocks(), vec![0]);
+        assert_eq!(staged.missing_blocks(16), vec![0]);
         assert_eq!(staged.base_rev(), Some(&RevisionId::new("r")));
         let mut buffer = [0u8; 4];
         staged.read_at(GRID, &mut buffer).expect("read");
@@ -592,7 +855,128 @@ mod tests {
         let (_temp, staging) = dir();
         let mut staged = staging.create(4, None, Some(base(4)), 4).expect("create");
         assert!(staged.materialize(0, &base(4), b"ab").is_err());
-        assert_eq!(staged.missing_blocks(), vec![0]);
+        assert_eq!(staged.missing_blocks(16), vec![0]);
+    }
+
+    #[test]
+    fn many_staged_files_share_a_few_descriptors() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staging = StagingDir::with_capacity(&temp.path().join("staging"), 4).expect("open");
+        let content = |ino: Ino, round: u64| format!("file {ino} round {round};").into_bytes();
+        let mut files: Vec<Staged> = (1..=50)
+            .map(|ino| staging.create(ino, None, None, 0).expect("create"))
+            .collect();
+        assert!(staging.open_files() <= 4);
+        for round in 0..3 {
+            for staged in &mut files {
+                let data = content(staged.ino(), round);
+                let offset = round * 64;
+                staged.write(offset, &data).expect("write");
+                assert!(staging.open_files() <= 4);
+            }
+        }
+        // A truncate and a sync go through reopened descriptors too.
+        files[0].truncate(10).expect("truncate");
+        files[1].sync().expect("sync");
+        for staged in files.iter().skip(1).rev() {
+            for round in 0..3 {
+                let expected = content(staged.ino(), round);
+                let mut buffer = vec![0; expected.len()];
+                staged.read_at(round * 64, &mut buffer).expect("read");
+                assert_eq!(buffer, expected);
+            }
+            assert!(staging.open_files() <= 4);
+        }
+        assert_eq!(files[0].size(), 10);
+        assert_eq!(
+            std::fs::read(staging.data_path(1)).expect("read"),
+            &content(1, 0)[..10]
+        );
+        // Removal closes the descriptor (2 was read last).
+        let open = staging.open_files();
+        staging.remove(2);
+        assert_eq!(staging.open_files(), open - 1);
+    }
+
+    #[test]
+    fn open_file_capacity_follows_the_limit() {
+        let capacity = open_files_capacity();
+        assert!((OPEN_FILES_MIN..=OPEN_FILES_MAX).contains(&capacity));
+    }
+
+    #[test]
+    fn a_new_file_has_no_sidecar_until_it_gets_a_base_revision() {
+        let (_temp, staging) = dir();
+        let mut staged = staging.create(7, None, None, 0).expect("create");
+        staged.write(0, b"new").expect("write");
+        assert!(!staging.sidecar_path(7).exists());
+        // `sync` without a sidecar flushes the data only.
+        staged.sync().expect("sync");
+        assert_eq!(staging.staged_inos().expect("list"), vec![7]);
+        let reopened = staging.reopen(7).expect("reopen");
+        assert_eq!(reopened.size(), 3);
+        assert_eq!(reopened.base(), None);
+        assert_eq!(reopened.base_rev(), None);
+        assert_eq!(
+            reopened.plan_read(0, 3),
+            vec![Piece::Staging { offset: 0, len: 3 }]
+        );
+        // After its upload it has a base revision, kept on disk.
+        staged
+            .set_base_rev(Some(RevisionId::new("r")))
+            .expect("base rev");
+        assert!(staging.sidecar_path(7).exists());
+        staged.sync().expect("sync");
+        assert_eq!(
+            staging.reopen(7).expect("reopen").base_rev(),
+            Some(&RevisionId::new("r"))
+        );
+        staging.remove(7);
+        assert!(staging.staged_inos().expect("list").is_empty());
+    }
+
+    #[test]
+    fn a_file_with_a_base_has_its_sidecar_before_its_data() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("staging");
+        let staging = StagingDir::open(&path).expect("open");
+        // The data file cannot be created: the sidecar must exist already.
+        std::fs::create_dir(staging.data_path(8)).expect("block the data path");
+        assert!(
+            staging
+                .create(8, Some(RevisionId::new("r")), Some(base(10)), 10)
+                .is_err()
+        );
+        assert!(staging.sidecar_path(8).exists());
+        std::fs::remove_dir(staging.data_path(8)).expect("unblock");
+        // Without a data file, startup removes it.
+        assert!(staging.staged_inos().expect("list").is_empty());
+        assert!(!staging.sidecar_path(8).exists());
+        let staged = staging
+            .create(8, Some(RevisionId::new("r")), Some(base(10)), 10)
+            .expect("create");
+        assert!(staging.sidecar_path(8).exists() && staging.data_path(8).exists());
+        drop(staged);
+        assert_eq!(staging.reopen(8).expect("reopen").base(), Some(&base(10)));
+    }
+
+    #[test]
+    fn restaging_without_a_base_drops_an_old_sidecar() {
+        let (_temp, staging) = dir();
+        drop(
+            staging
+                .create(9, Some(RevisionId::new("r")), Some(base(10)), 10)
+                .expect("create"),
+        );
+        // Created again before the old staging was removed.
+        let mut staged = staging.create(9, None, None, 0).expect("create again");
+        staged.write(0, b"ab").expect("write");
+        let reopened = staging.reopen(9).expect("reopen");
+        assert_eq!(reopened.base(), None);
+        assert_eq!(
+            reopened.plan_read(0, 2),
+            vec![Piece::Staging { offset: 0, len: 2 }]
+        );
     }
 
     #[test]
@@ -611,7 +995,7 @@ mod tests {
             .expect("cut");
         let mut staged = staging.reopen(6).expect("reopen");
         assert_eq!(staged.size(), GRID);
-        assert_eq!(staged.missing_blocks(), vec![0]);
+        assert_eq!(staged.missing_blocks(16), vec![0]);
         // Growing again reads zeros, not the old base tail.
         staged.truncate(2 * GRID).expect("extend");
         assert_eq!(

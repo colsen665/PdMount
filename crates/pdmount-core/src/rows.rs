@@ -32,8 +32,8 @@ pub fn int_to_kind(value: i64) -> NodeKind {
 pub fn write_rows(conn: &Connection, rows: &[(Ino, Option<NodeRow>)]) -> rusqlite::Result<()> {
     let mut old_links: Vec<String> = Vec::new();
     {
-        let mut select = conn.prepare("SELECT link_id FROM inodes WHERE ino = ?1")?;
-        let mut clear = conn.prepare(
+        let mut select = conn.prepare_cached("SELECT link_id FROM inodes WHERE ino = ?1")?;
+        let mut clear = conn.prepare_cached(
             "UPDATE inodes SET parent_ino = NULL, name = NULL, link_id = NULL WHERE ino = ?1",
         )?;
         for (ino, _) in rows {
@@ -50,14 +50,14 @@ pub fn write_rows(conn: &Connection, rows: &[(Ino, Option<NodeRow>)]) -> rusqlit
             clear.execute([sql_ino(*ino)])?;
         }
     }
-    let mut delete = conn.prepare("DELETE FROM inodes WHERE ino = ?1")?;
-    let mut upsert = conn.prepare(
+    let mut delete = conn.prepare_cached("DELETE FROM inodes WHERE ino = ?1")?;
+    let mut upsert = conn.prepare_cached(
         "INSERT OR REPLACE INTO inodes(ino, kind, parent_ino, name, link_id, mode, mtime_ns, ctime_ns, size,
              listed, local_only, deleted, content_gen, meta_gen, uploaded_content_gen, uploaded_meta_gen,
              deferred_error, atime_ns, remote_newer)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
     )?;
-    let mut upsert_remote = conn.prepare(
+    let mut upsert_remote = conn.prepare_cached(
         "INSERT OR REPLACE INTO remote(link_id, parent_link, name, name_hash, kind, active_rev, size, mtime_ns,
              mode, sha1, trashed, seen_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, strftime('%s','now'))",
@@ -105,7 +105,7 @@ pub fn write_rows(conn: &Connection, rows: &[(Ino, Option<NodeRow>)]) -> rusqlit
         }
     }
     // Remote rows nobody refers to any more.
-    let mut orphaned = conn.prepare(
+    let mut orphaned = conn.prepare_cached(
         "DELETE FROM remote WHERE link_id = ?1
            AND NOT EXISTS (SELECT 1 FROM inodes WHERE inodes.link_id = ?1)",
     )?;

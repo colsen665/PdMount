@@ -46,11 +46,16 @@ pub enum MountState {
         pid: u64,
         queue_pending: u64,
         queue_parked: u64,
+        queue_oldest_secs: Option<u64>,
+        events_last_poll_secs: Option<u64>,
+        events_refreshing: bool,
+        read_only: bool,
         /// Conflicts waiting for the user.
         conflicts: u64,
         inodes: u64,
         cache_bytes: u64,
         cache_blocks: u64,
+        pinned: Option<control::PinnedReply>,
         connectivity: Connectivity,
         /// Unix seconds when `connectivity` began.
         connectivity_since: u64,
@@ -84,6 +89,15 @@ fn percent(used: u64, max: u64) -> f64 {
         0.0
     } else {
         used as f64 * 100.0 / max as f64
+    }
+}
+
+/// `45s`, `3m`, `2h`.
+fn short_age(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m", secs / 60),
+        _ => format!("{}h", secs / 3600),
     }
 }
 
@@ -134,14 +148,20 @@ impl fmt::Display for StatusReport {
                 pid,
                 queue_pending,
                 queue_parked,
+                queue_oldest_secs,
+                events_last_poll_secs,
+                events_refreshing,
+                read_only,
                 conflicts,
                 inodes,
                 cache_bytes,
                 cache_blocks,
+                pinned,
                 connectivity,
                 connectivity_since,
             } => {
-                writeln!(f, "Mount:      mounted (daemon pid {pid})")?;
+                let ro = if *read_only { ", read-only" } else { "" };
+                writeln!(f, "Mount:      mounted (daemon pid {pid}{ro})")?;
                 match connectivity {
                     Connectivity::Online => writeln!(f, "Connection: online")?,
                     Connectivity::Offline => writeln!(
@@ -155,10 +175,25 @@ impl fmt::Display for StatusReport {
                         local_time(*connectivity_since)
                     )?,
                 }
+                let oldest = match queue_oldest_secs {
+                    Some(secs) if *queue_pending > 0 => format!(" (oldest {})", short_age(*secs)),
+                    _ => String::new(),
+                };
                 writeln!(
                     f,
-                    "Queue:      {queue_pending} pending, {queue_parked} parked"
+                    "Queue:      {queue_pending} pending{oldest}, {queue_parked} parked"
                 )?;
+                let refreshing = if *events_refreshing {
+                    ", refreshing"
+                } else {
+                    ""
+                };
+                match events_last_poll_secs {
+                    Some(secs) => {
+                        writeln!(f, "Events:     last poll {secs} s ago{refreshing}")?;
+                    }
+                    None => writeln!(f, "Events:     no poll finished yet{refreshing}")?,
+                }
                 if *conflicts > 0 {
                     writeln!(f, "Conflicts:  {conflicts} open (pdmount conflicts list)")?;
                 }
@@ -167,7 +202,17 @@ impl fmt::Display for StatusReport {
                     f,
                     "Cache:      {} in {cache_blocks} blocks",
                     ByteSize(*cache_bytes).human()
-                )
+                )?;
+                if let Some(pinned) = pinned {
+                    write!(
+                        f,
+                        "\nPinned:     {} paths, {} of {} fetched",
+                        pinned.paths,
+                        ByteSize(pinned.fetched_bytes).human(),
+                        ByteSize(pinned.total_bytes).human()
+                    )?;
+                }
+                Ok(())
             }
         }
     }
@@ -217,10 +262,15 @@ pub async fn status(
                 pid: reply.pid.into(),
                 queue_pending: reply.queue_pending,
                 queue_parked: reply.queue_parked,
+                queue_oldest_secs: reply.queue_oldest_secs,
+                events_last_poll_secs: reply.events_last_poll_secs,
+                events_refreshing: reply.events_refreshing,
+                read_only: reply.read_only,
                 conflicts: reply.conflicts,
                 inodes: reply.inodes,
                 cache_bytes: reply.cache_bytes,
                 cache_blocks: reply.cache_blocks,
+                pinned: reply.pinned,
                 connectivity,
                 connectivity_since: reply.connectivity_since,
             },
@@ -244,11 +294,27 @@ pub async fn status(
             sign_in: None,
         },
         Resumed::Active(logged_in) => {
-            let backend = session::proton_backend(&logged_in, &device).await?;
-            SessionState::Active {
-                username: backend.account().await?.username,
-                storage: logged_in.storage.to_string(),
-                quota: Some(backend.storage_info().await?),
+            let active = async {
+                let backend = session::proton_backend(
+                    &logged_in,
+                    &device,
+                    session::TransferLimits::of(config),
+                )
+                .await?;
+                anyhow::Ok(SessionState::Active {
+                    username: backend.account().await?.username,
+                    storage: logged_in.storage.to_string(),
+                    quota: Some(backend.storage_info().await?),
+                })
+            }
+            .await;
+            match active {
+                // The token is fine but the keys cannot be unlocked (D085).
+                Err(error) if session::needs_login(&error) => SessionState::NeedsLogin {
+                    reason: format!("{error:#}"),
+                    sign_in: None,
+                },
+                other => other?,
             }
         }
     };
@@ -288,6 +354,38 @@ mod tests {
     }
 
     #[test]
+    fn mounted_report_shows_the_oldest_change_and_the_event_stream() {
+        let text = report_with(
+            SessionState::NotLoggedIn,
+            MountState::Mounted {
+                pid: 7,
+                queue_pending: 2,
+                queue_parked: 1,
+                queue_oldest_secs: Some(180),
+                events_last_poll_secs: Some(12),
+                events_refreshing: true,
+                read_only: true,
+                conflicts: 0,
+                inodes: 1,
+                cache_bytes: 0,
+                cache_blocks: 0,
+                pinned: None,
+                connectivity: Connectivity::Online,
+                connectivity_since: 0,
+            },
+        );
+        assert!(
+            text.contains("Queue:      2 pending (oldest 3m), 1 parked"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Events:     last poll 12 s ago, refreshing"),
+            "{text}"
+        );
+        assert!(text.contains("(daemon pid 7, read-only)"), "{text}");
+    }
+
+    #[test]
     fn active_report_shows_account_and_quota() {
         let text = report(SessionState::Active {
             username: "user@proton.me".into(),
@@ -319,10 +417,15 @@ mod tests {
                 pid: 42,
                 queue_pending: 2,
                 queue_parked: 0,
+                queue_oldest_secs: None,
+                events_last_poll_secs: None,
+                events_refreshing: false,
+                read_only: false,
                 conflicts: 0,
                 inodes: 7,
                 cache_bytes: 1 << 20,
                 cache_blocks: 3,
+                pinned: None,
                 connectivity: Connectivity::Online,
                 connectivity_since: 0,
             },
@@ -336,10 +439,15 @@ mod tests {
                 pid: 42,
                 queue_pending: 0,
                 queue_parked: 0,
+                queue_oldest_secs: None,
+                events_last_poll_secs: None,
+                events_refreshing: false,
+                read_only: false,
                 conflicts: 3,
                 inodes: 7,
                 cache_bytes: 0,
                 cache_blocks: 0,
+                pinned: None,
                 connectivity: Connectivity::Online,
                 connectivity_since: 0,
             },
@@ -361,10 +469,15 @@ mod tests {
                     pid: 1,
                     queue_pending: 4,
                     queue_parked: 0,
+                    queue_oldest_secs: None,
+                    events_last_poll_secs: None,
+                    events_refreshing: false,
+                    read_only: false,
                     conflicts: 0,
                     inodes: 1,
                     cache_bytes: 0,
                     cache_blocks: 0,
+                    pinned: None,
                     connectivity,
                     connectivity_since: 1_700_000_000,
                 },

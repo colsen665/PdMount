@@ -1364,6 +1364,14 @@ proptest! {
 fn regression_cases() {
     use Op::*;
     let s = |p: &str| p.to_owned();
+    // A zero-length write past the end set the size without writing, so
+    // after a restart no block list could hold that size.
+    run_case(vec![
+        Remote(self::Remote::Create(s("/d"), vec![])),
+        Write(s("/d"), 1, vec![]),
+        Drain,
+        Restart,
+    ]);
     run_case(vec![
         Rename(s("/d/a"), s("/a"), true),
         Crash,
@@ -1503,6 +1511,22 @@ fn concurrent_regression_cases() {
         Step::Sync(A),
         a(Unlink(s("/d"))),
     ]);
+    // A listing queued when a clashed file left its name must survive a
+    // restart before it runs, or the app's /a stays hidden on B (D069;
+    // failed 16 of 20 replays before).
+    for _ in 0..10 {
+        run_concurrent_case(
+            &[
+                b(Rename(s("/d/d"), s("/d/d"), false)),
+                Step::App(R::Create(s("/a"), vec![7; 1378])),
+                b(Create(s("/a"))),
+                Step::Sync(B),
+                b(Unlink(s("/a"))),
+                Step::Restart(B),
+            ],
+            DEBOUNCE,
+        );
+    }
     // A node renamed into a folder that is trashed meanwhile stays where it
     // is on the drive: its rename loses, not the node.
     for _ in 0..20 {

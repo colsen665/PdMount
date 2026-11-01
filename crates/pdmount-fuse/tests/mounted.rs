@@ -120,19 +120,39 @@ fn mount(
     state: &Path,
     mountpoint: &Path,
 ) -> Mount {
+    mount_with(runtime, backend, state, mountpoint, Config::default())
+}
+
+fn mount_with(
+    runtime: &tokio::runtime::Runtime,
+    backend: &FakeBackend,
+    state: &Path,
+    mountpoint: &Path,
+    config: Config,
+) -> Mount {
+    mount_options(runtime, backend, state, mountpoint, config, false)
+}
+
+fn mount_options(
+    runtime: &tokio::runtime::Runtime,
+    backend: &FakeBackend,
+    state: &Path,
+    mountpoint: &Path,
+    config: Config,
+    read_only: bool,
+) -> Mount {
+    let mut options = EngineOptions::in_dir(
+        state,
+        config,
+        DeviceIdentity {
+            id: Uuid::from_u128(1),
+            name: "mounted-test".into(),
+        },
+        system_clock(),
+    );
+    options.read_only = read_only;
     let (engine, invalidations) = runtime
-        .block_on(Engine::open(
-            Arc::new(backend.clone()),
-            EngineOptions::in_dir(
-                state,
-                Config::default(),
-                DeviceIdentity {
-                    id: Uuid::from_u128(1),
-                    name: "mounted-test".into(),
-                },
-                system_clock(),
-            ),
-        ))
+        .block_on(Engine::open(Arc::new(backend.clone()), options))
         .expect("engine");
     engine.start_background();
     let mounted =
@@ -436,5 +456,264 @@ fn mount_reports_state_in_xattrs() {
     if let Ok(set) = set {
         assert!(!set.status.success());
     }
+    unmount(&runtime, m);
+}
+
+/// §5.8: requests are timed per operation, deferred replies included, and
+/// a reset clears the histograms.
+#[test]
+fn mount_times_requests() {
+    let Some((runtime, temp, mnt)) = setup() else {
+        return;
+    };
+    let backend = FakeBackend::new();
+    let m = mount(&runtime, &backend, &temp.path().join("state"), &mnt);
+    let metrics = Arc::clone(m.engine.metrics());
+    let count = |op: &str| {
+        metrics
+            .snapshot_latency()
+            .into_iter()
+            .find(|(name, _)| *name == op)
+            .map_or(0, |(_, summary)| summary.count)
+    };
+
+    std::fs::create_dir(mnt.join("made")).expect("mkdir");
+    std::fs::metadata(mnt.join("made")).expect("stat");
+    std::fs::write(mnt.join("made/file"), b"content").expect("write");
+    assert_eq!(
+        std::fs::read(mnt.join("made/file")).expect("read"),
+        b"content"
+    );
+    assert!(count("mkdir") > 0);
+    assert!(count("lookup") + count("getattr") > 0);
+    assert!(count("create") > 0 && count("write") > 0);
+    assert!(count("read_staging") + count("read_ram") > 0);
+
+    metrics.reset_latency();
+    assert!(metrics.snapshot_latency().is_empty());
+    std::fs::create_dir(mnt.join("again")).expect("mkdir");
+    assert_eq!(count("mkdir"), 1);
+    unmount(&runtime, m);
+}
+
+/// §5.4: an unchanged directory is listed from the kernel's cache, and a
+/// change made through the mount shows at the next listing.
+#[test]
+fn mount_lists_unchanged_directories_from_the_kernel_cache() {
+    let Some((runtime, temp, mnt)) = setup() else {
+        return;
+    };
+    let backend = FakeBackend::new();
+    let m = mount(&runtime, &backend, &temp.path().join("state"), &mnt);
+    let metrics = Arc::clone(m.engine.metrics());
+    let listings = || {
+        metrics
+            .snapshot_latency()
+            .into_iter()
+            .filter(|(name, _)| matches!(*name, "readdir" | "readdirplus"))
+            .map(|(_, summary)| summary.count)
+            .sum::<u64>()
+    };
+    let names = |dir: &Path| {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read_dir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .into_string()
+                    .expect("utf-8")
+            })
+            .collect();
+        names.sort();
+        names
+    };
+    let dir = mnt.join("d");
+    std::fs::create_dir(&dir).expect("mkdir");
+    std::fs::write(dir.join("a"), b"a").expect("write");
+    assert_eq!(names(&dir), ["a"]);
+    let before = listings();
+    assert_eq!(names(&dir), ["a"]);
+    assert_eq!(listings(), before, "the second listing came from the cache");
+
+    std::fs::write(dir.join("b"), b"b").expect("write");
+    assert_eq!(names(&dir), ["a", "b"]);
+    std::fs::remove_file(dir.join("a")).expect("unlink");
+    assert_eq!(names(&dir), ["b"]);
+    unmount(&runtime, m);
+}
+
+/// Set in the child of `mount_keeps_more_pending_files_than_descriptors`.
+const FD_LIMIT_CHILD: &str = "PDMOUNT_TEST_FD_LIMIT_CHILD";
+
+/// D063: staged files are opened on demand, so more files can wait for
+/// their upload than the open-file limit allows descriptors. Runs itself
+/// again under `prlimit --nofile=512`, where one descriptor per staged file
+/// ran out (EMFILE) before.
+#[test]
+fn mount_keeps_more_pending_files_than_descriptors() {
+    const FILES: usize = 2000;
+    if std::env::var_os(FD_LIMIT_CHILD).is_none() {
+        if !fuse_available() {
+            eprintln!("skipped: FUSE is not available");
+            return;
+        }
+        if Command::new("prlimit").arg("--version").output().is_err() {
+            eprintln!("skipped: prlimit is missing");
+            return;
+        }
+        let output = run(Command::new("prlimit")
+            .arg("--nofile=512")
+            .arg("--")
+            .arg(std::env::current_exe().expect("test binary"))
+            .args([
+                "mount_keeps_more_pending_files_than_descriptors",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(FD_LIMIT_CHILD, "1"));
+        assert!(
+            output.contains("1 passed"),
+            "the child ran no test: {output}"
+        );
+        return;
+    }
+    let Some((runtime, temp, mnt)) = setup() else {
+        panic!("FUSE went away between the parent and the child");
+    };
+    // Uploads wait, so every file stays staged until the drain.
+    let mut config = Config::default();
+    let hour = pdmount_core::units::HumanDuration(std::time::Duration::from_secs(3600));
+    config.upload.debounce = hour;
+    config.upload.max_dirty_age = hour;
+    let backend = FakeBackend::new();
+    let m = mount_with(&runtime, &backend, &temp.path().join("state"), &mnt, config);
+    let dir = mnt.join("many");
+    std::fs::create_dir(&dir).expect("mkdir");
+    let content = |i: usize| format!("file {i}\n").repeat(i % 7 + 1);
+    for i in 0..FILES {
+        std::fs::write(dir.join(format!("f{i}")), content(i)).expect("write");
+    }
+    let gauge = |name: &str| {
+        m.engine
+            .gauges()
+            .into_iter()
+            .find(|(gauge, _)| *gauge == name)
+            .map(|(_, value)| value)
+            .expect("gauge")
+    };
+    assert!(gauge("queue_pending") >= FILES as u64);
+    let capacity = pdmount_core::staging::open_files_capacity() as u64;
+    assert!(capacity < 512 / 2, "capacity {capacity}");
+    assert!(gauge("staged_open_files") <= capacity);
+    for i in 0..FILES {
+        assert_eq!(
+            std::fs::read_to_string(dir.join(format!("f{i}"))).expect("read"),
+            content(i)
+        );
+    }
+    assert!(gauge("staged_open_files") <= capacity);
+    unmount(&runtime, m);
+}
+
+/// `mount -o ro`: a write answers EROFS, reads work, and a change pending
+/// from before uploads.
+#[test]
+fn a_read_only_mount_answers_erofs_and_uploads_what_is_pending() {
+    let Some((runtime, temp, mnt)) = setup() else {
+        return;
+    };
+    let backend = FakeBackend::new();
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(&state).expect("mkdir");
+    let mut held = Config::default();
+    held.upload.debounce = pdmount_core::units::HumanDuration(std::time::Duration::from_secs(3600));
+    let m = mount_with(&runtime, &backend, &state, &mnt, held);
+    std::fs::write(mnt.join("pending.txt"), b"pending").expect("write");
+    assert_ne!(m.engine.queue_counts().pending, 0);
+    unmount(&runtime, m);
+
+    let m = mount_options(&runtime, &backend, &state, &mnt, Config::default(), true);
+    let denied = std::fs::write(mnt.join("new.txt"), b"x").expect_err("a write");
+    assert_eq!(denied.raw_os_error(), Some(nix::libc::EROFS));
+    let denied = std::fs::OpenOptions::new()
+        .write(true)
+        .open(mnt.join("pending.txt"))
+        .expect_err("an open for writing");
+    assert_eq!(denied.raw_os_error(), Some(nix::libc::EROFS));
+    assert_eq!(
+        std::fs::read(mnt.join("pending.txt")).expect("read"),
+        b"pending"
+    );
+    let counts = runtime.block_on(m.engine.drain(std::time::Duration::from_secs(60)));
+    assert_eq!((counts.pending, counts.parked), (0, 0));
+    let root = runtime.block_on(backend.root()).expect("root").link_id;
+    let names: Vec<String> = runtime
+        .block_on(backend.list_children(&root))
+        .expect("list")
+        .into_iter()
+        .map(|node| node.name)
+        .collect();
+    assert!(names.contains(&"pending.txt".to_owned()), "{names:?}");
+    unmount(&runtime, m);
+}
+
+/// `fsync.remote_paths`: fsync of a matching file returns after the upload,
+/// of another one at once, with the upload still to come.
+#[test]
+fn fsync_of_a_remote_path_waits_for_the_upload() {
+    let Some((runtime, temp, mnt)) = setup() else {
+        return;
+    };
+    let backend = FakeBackend::new();
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(&state).expect("mkdir");
+    let mut config = Config::default();
+    config.upload.debounce =
+        pdmount_core::units::HumanDuration(std::time::Duration::from_secs(3600));
+    config.fsync.remote_paths = vec!["/important/**".to_owned()];
+    let m = mount_with(&runtime, &backend, &state, &mnt, config);
+    let names = || -> Vec<String> {
+        let root = runtime.block_on(backend.root()).expect("root").link_id;
+        let important = runtime
+            .block_on(backend.list_children(&root))
+            .expect("list");
+        let mut names: Vec<String> = Vec::new();
+        for node in important {
+            if node.name == "important" {
+                names.extend(
+                    runtime
+                        .block_on(backend.list_children(&node.link_id))
+                        .expect("list")
+                        .into_iter()
+                        .map(|inner| inner.name),
+                );
+            }
+            names.push(node.name);
+        }
+        names
+    };
+    let other = mnt.join("other.txt");
+    let file = std::fs::File::create(&other).expect("create");
+    use std::io::Write as _;
+    (&file).write_all(b"other").expect("write");
+    file.sync_all().expect("fsync");
+    drop(file);
+    assert!(
+        !names().contains(&"other.txt".to_owned()),
+        "a local fsync does not upload"
+    );
+
+    std::fs::create_dir(mnt.join("important")).expect("mkdir");
+    let path = mnt.join("important/a.txt");
+    let file = std::fs::File::create(&path).expect("create");
+    (&file).write_all(b"important").expect("write");
+    file.sync_all().expect("fsync");
+    assert!(
+        names().contains(&"a.txt".to_owned()),
+        "uploaded when fsync returned"
+    );
+    drop(file);
     unmount(&runtime, m);
 }

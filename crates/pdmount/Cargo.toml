@@ -17,7 +17,9 @@ fake-backend = []
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+async-trait.workspace = true
 dbus-secret-service.workspace = true
+futures.workspace = true
 hex.workspace = true
 keyring.workspace = true
 nix.workspace = true
@@ -35,7 +37,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+log.workspace = true
 tempfile.workspace = true
+tracing-log.workspace = true
 
 [lints]
 workspace = true

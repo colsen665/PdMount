@@ -211,6 +211,27 @@ impl ProtonBackend {
     }
 }
 
+/// A file's size from what its uploader claims. The claimed block sizes win
+/// over the claimed size: blocks are what reads and staging use, and a
+/// claimed size no block list backs must not size a staging file (S-5).
+fn file_size(claimed_size: Option<i64>, block_sizes: Option<&[i32]>) -> Option<u64> {
+    let claimed = claimed_size.and_then(|size| u64::try_from(size).ok());
+    let Some(sizes) = block_sizes.filter(|sizes| !sizes.is_empty()) else {
+        return claimed;
+    };
+    let sum = sizes.iter().fold(0u64, |sum, &size| {
+        sum.saturating_add(u64::try_from(size).unwrap_or(0))
+    });
+    if claimed.is_some_and(|claimed| claimed != sum) {
+        tracing::debug!(
+            claimed = claimed_size,
+            blocks = sum,
+            "claimed size differs from the block sizes; using the block sizes"
+        );
+    }
+    Some(sum)
+}
+
 fn link_of(uid: &NodeUid) -> LinkId {
     LinkId::new(uid.link_id.raw())
 }
@@ -259,19 +280,11 @@ fn convert_node(node: Node) -> RemoteNode {
                 name: base.name,
                 kind: NodeKind::File,
                 active_revision: Some(RevisionId::new(revision.uid.revision_id.raw())),
-                // Without a claimed size, the claimed block sizes add up to
-                // it; without a claimed mtime, the revision's commit time.
-                size: revision
-                    .claimed_size
-                    .and_then(|size| u64::try_from(size).ok())
-                    .or_else(|| {
-                        revision.claimed_block_sizes.as_ref().map(|sizes| {
-                            sizes
-                                .iter()
-                                .map(|&size| u64::try_from(size).unwrap_or(0))
-                                .sum()
-                        })
-                    }),
+                size: file_size(
+                    revision.claimed_size,
+                    revision.claimed_block_sizes.as_deref(),
+                ),
+                // Without a claimed mtime, the revision's commit time.
                 mtime: Some(system_time(
                     revision
                         .claimed_modification_time
@@ -316,6 +329,12 @@ fn decrypted<D: std::fmt::Debug>(object: PotentialObject<Node, D>) -> Option<Rem
 /// The first cause of type `T` in an SDK error's chain.
 fn cause<T: std::error::Error + 'static>(error: &anyhow::Error) -> Option<&T> {
     error.chain().find_map(|cause| cause.downcast_ref::<T>())
+}
+
+/// The plaintext did not fit the buffer it was written to: a full
+/// `Cursor<&mut [u8]>` refuses the rest with `WriteZero`.
+fn overflowed(error: &anyhow::Error) -> bool {
+    cause::<std::io::Error>(error).is_some_and(|e| e.kind() == std::io::ErrorKind::WriteZero)
 }
 
 /// Classifies an SDK error (DESIGN.md Appendix A).
@@ -374,8 +393,20 @@ fn map_error(error: anyhow::Error) -> BackendError {
             return BackendError::Transient(format!("{error:#}"));
         }
     }
+    if error
+        .chain()
+        .any(|cause| cause.to_string().contains(USER_KEYS_LOCKED))
+    {
+        tracing::warn!("the account keys cannot be unlocked; a new login is needed");
+        return BackendError::Unauthorized;
+    }
     BackendError::Other(format!("{error:#}"))
 }
+
+/// `ProtonAccountClient::get_user_keys` when no passphrase opens an active
+/// key. The SDK has no error type for it; only a new login can help, as with
+/// a rejected session (D085). A test runs the SDK's own path.
+const USER_KEYS_LOCKED: &str = "none could be unlocked";
 
 /// Whether an SDK error (a session check, say) is a failure to connect, as
 /// opposed to an answer from the server.
@@ -471,13 +502,15 @@ async fn open_source(
             Ok((bytes.len() as u64, Box::new(std::io::Cursor::new(bytes))))
         }
         UploadSource::File(path) => {
-            let file = tokio::fs::File::open(&path)
-                .await
-                .map_err(|e| BackendError::Other(format!("cannot read {}: {e}", path.display())))?;
+            let file = tokio::fs::File::open(&path).await.map_err(|e| {
+                BackendError::local_io(format_args!("cannot read {}", path.display()), e)
+            })?;
             let size = file
                 .metadata()
                 .await
-                .map_err(|e| BackendError::Other(format!("cannot stat {}: {e}", path.display())))?
+                .map_err(|e| {
+                    BackendError::local_io(format_args!("cannot stat {}", path.display()), e)
+                })?
                 .len();
             Ok((size, Box::new(file)))
         }
@@ -507,25 +540,53 @@ impl ProtonBackend {
             .map_err(map_error)
     }
 
-    /// One verified, decrypted block. `download_block` of the SDK without
-    /// its size check, which is an untyped error: a block that decrypts to
-    /// another size than claimed is an integrity failure.
-    async fn download_block(
+    /// The claimed plaintext size of a block, if its block map has it.
+    async fn claimed_block_size(
         &self,
         file: &LinkId,
         revision: &RevisionId,
         index: u32,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Option<u32>> {
         let map = self.block_map(file, revision).await?;
         let index = i32::try_from(index).map_err(|_| BackendError::NotFound)?;
-        if map.entry(index).is_none() {
-            return Err(BackendError::NotFound);
+        Ok(map.entry(index).ok_or(BackendError::NotFound)?.plain_size)
+    }
+
+    /// One verified, decrypted block, straight into `buf`; returns its
+    /// length. `download_block` of the SDK without its size check, which is
+    /// an untyped error: a block that decrypts to another size than claimed,
+    /// or to more than `buf` holds, is an integrity failure.
+    async fn download_block_into(
+        &self,
+        file: &LinkId,
+        revision: &RevisionId,
+        index: u32,
+        buf: &mut [u8],
+    ) -> Result<usize> {
+        let map = self.block_map(file, revision).await?;
+        let index = i32::try_from(index).map_err(|_| BackendError::NotFound)?;
+        let entry = map.entry(index).ok_or(BackendError::NotFound)?;
+        let capacity = buf.len();
+        let too_long = |len: String| {
+            BackendError::Integrity(format!(
+                "block {index} of revision {} has {len} bytes, more than the {capacity} expected",
+                map.revision_uid
+            ))
+        };
+        if let Some(claimed) = entry.plain_size
+            && claimed as usize > capacity
+        {
+            return Err(too_long(claimed.to_string()));
         }
+        // `authed` runs the call again after a token refresh, so its
+        // closure is `Fn`: it borrows the buffer through a lock.
+        let buf = tokio::sync::Mutex::new(buf);
         self.authed(|client| {
-            let map = Arc::clone(&map);
+            let (map, buf) = (Arc::clone(&map), &buf);
             async move {
                 let entry = map.entry(index).expect("checked above");
-                let mut data = Vec::new();
+                let mut buf = buf.lock().await;
+                let mut out = std::io::Cursor::new(&mut **buf);
                 client
                     .block_downloader()
                     .download_verified(
@@ -536,20 +597,26 @@ impl ProtonBackend {
                         entry.token.clone(),
                         &entry.hash_digest,
                         map.content_key.clone(),
-                        &mut data,
+                        &mut out,
                     )
                     .await
-                    .map_err(map_error)?;
+                    .map_err(|error| {
+                        if overflowed(&error) {
+                            too_long("more".into())
+                        } else {
+                            map_error(error)
+                        }
+                    })?;
+                let len = out.position();
                 if let Some(claimed) = entry.plain_size
-                    && data.len() as u64 != u64::from(claimed)
+                    && len != u64::from(claimed)
                 {
                     return Err(BackendError::Integrity(format!(
-                        "block {index} of revision {} decrypted to {} bytes, claimed {claimed}",
+                        "block {index} of revision {} decrypted to {len} bytes, claimed {claimed}",
                         map.revision_uid,
-                        data.len()
                     )));
                 }
-                Ok(data)
+                Ok(len as usize)
             }
         })
         .await
@@ -654,14 +721,23 @@ impl Backend for ProtonBackend {
         index: u32,
         buf: &mut [u8],
     ) -> Result<usize> {
-        let data = self.download_block(file, revision, index).await?;
-        crate::copy_block(&data, buf, index, revision)
+        self.download_block_into(file, revision, index, buf).await
     }
 
+    /// Into a buffer sized once, from the claimed size when there is one.
     async fn fetch_block(&self, file: &LinkId, revision: &RevisionId, index: u32) -> Result<Bytes> {
-        self.download_block(file, revision, index)
-            .await
-            .map(Bytes::from)
+        let size = self
+            .claimed_block_size(file, revision, index)
+            .await?
+            .map_or(crate::MAX_BLOCK_BYTES, |size| {
+                (size as usize).min(crate::MAX_BLOCK_BYTES)
+            });
+        let mut buf = vec![0; size];
+        let len = self
+            .download_block_into(file, revision, index, &mut buf)
+            .await?;
+        buf.truncate(len);
+        Ok(Bytes::from(buf))
     }
 
     async fn upload_new(
@@ -879,6 +955,104 @@ impl Backend for ProtonBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The SDK's own path: an active key that no stored passphrase opens.
+    mod locked_keys {
+        use proton_drive_sdk::proton_sdk_rs2::account::ProtonAccountClient;
+        use proton_drive_sdk::proton_sdk_rs2::addresses::AddressesApiClient;
+        use proton_drive_sdk::proton_sdk_rs2::api::cache::DefaultAccountClientCache;
+        use proton_drive_sdk::proton_sdk_rs2::api::client::{
+            AccountApiClients, DefaultAccountApiClients,
+        };
+        use proton_drive_sdk::proton_sdk_rs2::cache::InMemoryCacheRepository;
+        use proton_drive_sdk::proton_sdk_rs2::keys::KeysApiClient;
+        use proton_drive_sdk::proton_sdk_rs2::secret::SessionSecretCache;
+        use proton_drive_sdk::proton_sdk_rs2::users::{UserResponse, UsersApiClient};
+        use std::sync::Arc;
+
+        struct OneLockedKey;
+
+        #[async_trait::async_trait]
+        impl UsersApiClient for OneLockedKey {
+            async fn get_user(&self) -> anyhow::Result<UserResponse> {
+                Ok(serde_json::from_value(serde_json::json!({
+                    "Code": 1000,
+                    "User": {"Keys": [{"ID": "k", "PrivateKey": "not armored", "Active": 1}]},
+                }))?)
+            }
+        }
+
+        struct Clients(DefaultAccountApiClients);
+
+        impl AccountApiClients for Clients {
+            fn keys(&self) -> Arc<dyn KeysApiClient> {
+                self.0.keys()
+            }
+            fn users(&self) -> Arc<dyn UsersApiClient> {
+                Arc::new(OneLockedKey)
+            }
+            fn addresses(&self) -> Arc<dyn AddressesApiClient> {
+                self.0.addresses()
+            }
+        }
+
+        struct NoPassphrase;
+
+        #[async_trait::async_trait]
+        impl SessionSecretCache for NoPassphrase {
+            async fn set_account_key_passphrase(
+                &self,
+                _key_id: &String,
+                _passphrase: &[u8],
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn try_get_account_key_passphrase(
+                &self,
+                _key_id: &String,
+            ) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+        }
+
+        pub async fn error() -> anyhow::Error {
+            let client = ProtonAccountClient {
+                api: Arc::new(Clients(DefaultAccountApiClients::new(
+                    reqwest::Client::new(),
+                ))),
+                cache: Arc::new(DefaultAccountClientCache::new(
+                    Arc::new(InMemoryCacheRepository::new()),
+                    Arc::new(InMemoryCacheRepository::new()),
+                    Arc::new(NoPassphrase),
+                )),
+            };
+            client.get_user_keys().await.expect_err("locked")
+        }
+    }
+
+    #[tokio::test]
+    async fn keys_that_cannot_be_unlocked_ask_for_a_login() {
+        assert_eq!(
+            map_error(locked_keys::error().await),
+            BackendError::Unauthorized
+        );
+        assert_eq!(
+            map_error(locked_keys::error().await.context("get my files")),
+            BackendError::Unauthorized,
+            "with context around it"
+        );
+    }
+
+    /// A block longer than the buffer is told apart from other failures.
+    #[tokio::test]
+    async fn a_full_block_buffer_is_an_overflow() {
+        use tokio::io::AsyncWriteExt;
+        let mut buf = [0u8; 2];
+        let mut out = std::io::Cursor::new(&mut buf[..]);
+        let error = out.write_all(b"abc").await.expect_err("full");
+        assert!(overflowed(&anyhow::Error::from(error)));
+        assert!(!overflowed(&anyhow::anyhow!("other")));
+    }
 
     #[test]
     fn mode_metadata_is_octal_permission_bits() {
@@ -1165,9 +1339,35 @@ mod tests {
     }
 
     #[test]
+    fn the_block_sizes_decide_a_file_size() {
+        // A claimed size no block list backs (S-5).
+        let block = 4 << 20;
+        assert_eq!(
+            file_size(Some(1 << 62), Some(&[block, 1])),
+            Some((4 << 20) + 1)
+        );
+        assert_eq!(file_size(Some(7), None), Some(7));
+        assert_eq!(file_size(Some(7), Some(&[])), Some(7));
+        assert_eq!(file_size(None, Some(&[3, 4])), Some(7));
+        assert_eq!(file_size(Some(-1), None), None);
+        assert_eq!(
+            file_size(None, Some(&[i32::MAX; 4])),
+            Some(4 * u64::from(i32::MAX as u32))
+        );
+    }
+
+    #[test]
     fn integrity_and_unknown_errors_are_classified() {
         let integrity: anyhow::Error = DataIntegrityException::new("hash mismatch").into();
         assert!(matches!(map_error(integrity), BackendError::Integrity(_)));
+        // A block map whose listing fails the manifest check (P17): every
+        // read of that revision is EIO.
+        let manifest: anyhow::Error =
+            CompletedDownloadManifestVerificationException::new("not signed").into();
+        assert!(matches!(
+            map_error(manifest.context("get_block_map")),
+            BackendError::Integrity(_)
+        ));
         assert!(matches!(
             map_error(anyhow::anyhow!("something else")),
             BackendError::Other(_)

@@ -2,6 +2,8 @@
 
 mod access;
 mod auth;
+mod autostart;
+mod cache;
 mod conflicts;
 mod control;
 mod credentials;
@@ -9,14 +11,19 @@ mod daemon;
 mod doctor;
 mod mounts;
 mod notify;
+mod pins;
 #[cfg(test)]
 mod probe;
+mod queue;
+mod secret_cache;
 mod session;
+mod stats;
 mod status;
 mod trash;
 
 use clap::{Args, Parser, Subcommand};
 use pdmount_core::config::BrowserMode;
+use pdmount_core::engine::queue::QueueTarget;
 use pdmount_core::{Config, Profile, ProfilePaths};
 use std::process::ExitCode;
 
@@ -28,11 +35,11 @@ struct Cli {
     #[arg(long, global = true, default_value = Profile::DEFAULT)]
     profile: Profile,
 
-    /// Store secrets in 0600 files when the keyring is unavailable (D029).
+    /// Store secrets in 0600 files when the keyring is unavailable.
     #[arg(long, global = true, conflicts_with = "force_file_secrets")]
     allow_file_secrets: bool,
 
-    /// Store secrets in 0600 files only; never use the keyring (D029).
+    /// Store secrets in 0600 files only; never use the keyring.
     #[arg(long, global = true)]
     force_file_secrets: bool,
 
@@ -50,17 +57,17 @@ enum Command {
     Login(BrowserArgs),
     /// End the session and remove stored secrets.
     Logout,
-    /// Show session, account, storage, device and mount.
+    /// Show session, storage, device, mount, connection, queue and conflicts.
     Status,
     /// Mount My Files and run in the background.
     Mount(MountArgs),
-    /// Unmount.
+    /// Upload what is pending, then unmount.
     Unmount(UnmountArgs),
-    /// Show the daemon's counters.
-    Stats,
+    /// Show the daemon's counters, gauges and latencies.
+    Stats(StatsArgs),
     /// Delete the local state and block cache; the login is kept.
     Reset(ResetArgs),
-    /// Check FUSE, keyring, login, disk space and clock.
+    /// Check FUSE, config, keyring, login, disk space, clock and autostart.
     Doctor,
     /// Read-only and read-write rules per path (while mounted).
     #[command(subcommand)]
@@ -68,6 +75,33 @@ enum Command {
     /// Conflicts between this device and others (while mounted).
     #[command(subcommand)]
     Conflicts(ConflictsCommand),
+    /// Keep a file or folder offline (while mounted).
+    Pin(PinArgs),
+    /// Stop keeping a path offline (while mounted).
+    Unpin {
+        /// Absolute inside the mountpoint, or relative to the mount root.
+        path: std::path::PathBuf,
+    },
+    /// Mount this profile at desktop login; without an argument, show the state.
+    Autostart {
+        #[command(subcommand)]
+        command: Option<AutostartCommand>,
+    },
+    /// Upload what is pending now and wait for it (while mounted).
+    Sync {
+        /// Give up after this many seconds.
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+        /// Only what is at or below this path. Absolute inside the
+        /// mountpoint, or relative to the mount root.
+        path: Option<std::path::PathBuf>,
+    },
+    /// Inspect and control the upload queue (while mounted).
+    #[command(subcommand)]
+    Queue(QueueCommand),
+    /// The block cache (while mounted).
+    #[command(subcommand)]
+    Cache(CacheCommand),
     /// The account's trash (Proton only, while not mounted).
     #[command(subcommand)]
     Trash(TrashCommand),
@@ -143,6 +177,37 @@ enum FakeCommand {
     /// Make calls of running daemons on this fake fail, or stop doing so.
     #[command(subcommand)]
     Fault(FaultCommand),
+    /// Simulate a network for the daemons on this fake: a round trip per
+    /// call, one shared pipe per direction. Options left out are 0 or
+    /// unlimited; without options, print the profile.
+    Profile(ProfileArgs),
+}
+
+#[cfg(feature = "fake-backend")]
+#[derive(Debug, clap::Args)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+struct ProfileArgs {
+    #[command(subcommand)]
+    command: Option<ProfileCommand>,
+    /// Round-trip time in milliseconds.
+    #[arg(long)]
+    rtt: Option<u64>,
+    /// Upload bandwidth in bytes per second.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    up: Option<u64>,
+    /// Download bandwidth in bytes per second.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    down: Option<u64>,
+    /// The fake drive's directory.
+    #[arg(required = true)]
+    dir: Option<std::path::PathBuf>,
+}
+
+#[cfg(feature = "fake-backend")]
+#[derive(Debug, Subcommand)]
+enum ProfileCommand {
+    /// Remove the profile: calls cost nothing again.
+    Clear { dir: std::path::PathBuf },
 }
 
 #[cfg(feature = "fake-backend")]
@@ -211,17 +276,27 @@ async fn fake_resolve(
 enum AccessCommand {
     /// Set `ro` or `rw` on a path and everything below it.
     Set {
+        /// `ro` or `rw`.
         #[arg(value_parser = access::parse_mode)]
         mode: pdmount_core::config::AccessMode,
         /// Absolute inside the mountpoint, or relative to the mount root.
         path: std::path::PathBuf,
     },
     /// Remove the rule on a path (also an orphaned one).
-    Unset { path: std::path::PathBuf },
+    Unset {
+        /// Absolute inside the mountpoint, or relative to the mount root.
+        path: std::path::PathBuf,
+    },
     /// Show all rules, or those at or below a path.
-    List { path: Option<std::path::PathBuf> },
+    List {
+        /// Absolute inside the mountpoint, or relative to the mount root.
+        path: Option<std::path::PathBuf>,
+    },
     /// Show the mode of a path and the rule that decides it.
-    Effective { path: std::path::PathBuf },
+    Effective {
+        /// Absolute inside the mountpoint, or relative to the mount root.
+        path: std::path::PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -241,6 +316,7 @@ enum ConflictsCommand {
     },
     /// Settle a conflict: keep both copies, or keep one of them.
     Resolve {
+        /// `keep-both`, `keep-local` or `keep-remote`.
         #[arg(value_parser = parse_resolution)]
         choice: pdmount_core::conflicts::Resolution,
         /// A conflict id, or the path of either copy.
@@ -252,6 +328,96 @@ fn parse_resolution(value: &str) -> Result<pdmount_core::conflicts::Resolution, 
     pdmount_core::conflicts::Resolution::parse(value)
         .filter(|_| value.contains('-'))
         .ok_or_else(|| format!("expected keep-both, keep-local or keep-remote, got {value:?}"))
+}
+
+#[derive(Debug, Args)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+struct PinArgs {
+    #[command(subcommand)]
+    command: Option<PinCommand>,
+    /// Absolute inside the mountpoint, or relative to the mount root
+    /// (write `./list` for a file named list).
+    #[arg(required = true)]
+    path: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+enum PinCommand {
+    /// Show the pinned paths: files, bytes fetched and state.
+    List,
+}
+
+#[derive(Debug, Subcommand)]
+enum AutostartCommand {
+    /// Write the XDG autostart entry for this profile.
+    Enable,
+    /// Remove the entry.
+    Disable,
+}
+
+/// Exactly one of `--id`, `--all` or a path.
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+struct QueueTargetArgs {
+    /// The id `queue list` shows (the inode number).
+    #[arg(long)]
+    id: Option<u64>,
+    /// Every entry.
+    #[arg(long)]
+    all: bool,
+    /// Its entry or, for a folder, every entry under it. Absolute inside the
+    /// mountpoint, or relative to the mount root.
+    path: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+enum QueueCommand {
+    /// Show what is pending: id, kind, state, attempts, age and path.
+    List {
+        /// Only what is at or below this path.
+        path: Option<std::path::PathBuf>,
+    },
+    /// Show entries with their last error, base revision and dependencies.
+    Show {
+        /// The id `queue list` shows (the inode number).
+        #[arg(long, conflicts_with = "path")]
+        id: Option<u64>,
+        /// Its entry or, for a folder, every entry under it. Absolute inside the
+        /// mountpoint, or relative to the mount root.
+        #[arg(required_unless_present = "id")]
+        path: Option<std::path::PathBuf>,
+    },
+    /// Upload now: clears parks and back-offs.
+    Retry(QueueTargetArgs),
+    /// Hold entries until `queue retry` or the next mount.
+    Park(QueueTargetArgs),
+    /// Discard local changes: back to the remote version, or removed if
+    /// never uploaded. Without --yes it only prints what it would discard.
+    Drop {
+        #[command(flatten)]
+        target: QueueTargetArgs,
+        /// Really discard the changes; this cannot be undone.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CacheCommand {
+    /// Show the disk cache against its cap, pinned bytes and the RAM pool.
+    Stats,
+    /// Evict the least recently used blocks; pinned blocks and the bases of
+    /// changed files stay.
+    Gc {
+        /// Bytes to go down to, for example 2GiB (default: 80 % of `cache.max_bytes`).
+        #[arg(long)]
+        target: Option<pdmount_core::units::ByteSize>,
+    },
+    /// Evict every block that may go, or only those of files at or below a path.
+    Wipe {
+        /// Absolute inside the mountpoint, or relative to the mount root.
+        path: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -286,13 +452,18 @@ struct MountArgs {
     /// Fail instead of signing in when the profile has no session.
     #[arg(long)]
     no_login: bool,
+    #[command(flatten)]
+    browser: BrowserArgs,
+    /// Mount option: `ro` answers EROFS to every write; pending work still uploads.
+    #[arg(short = 'o', value_name = "OPTION", value_parser = ["ro"])]
+    option: Option<String>,
     /// Mountpoint; default: `mountpoint` from the config (~/ProtonDrive).
     mountpoint: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Args)]
 struct UnmountArgs {
-    /// Wait for pending uploads first (the default).
+    /// Wait up to 10 minutes for pending uploads first (the default).
     #[arg(long, conflicts_with = "force")]
     wait: bool,
     /// Detach the mount even if it is busy or the daemon hangs, and stop the daemon.
@@ -300,6 +471,16 @@ struct UnmountArgs {
     force: bool,
     /// Mountpoint; default: `mountpoint` from the config.
     mountpoint: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct StatsArgs {
+    /// Print the reply as JSON.
+    #[arg(long)]
+    json: bool,
+    /// Clear the latency histograms after reading them.
+    #[arg(long)]
+    reset: bool,
 }
 
 #[derive(Debug, Args)]
@@ -321,24 +502,52 @@ impl BrowserArgs {
 }
 
 fn init_logging(verbose: u8) {
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    let rust_log = std::env::var("RUST_LOG").ok();
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                // The daemon's stderr is its log file: no color codes there.
+                .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+                .with_filter(log_filter(verbose, rust_log.as_deref())),
+        )
+        .init();
+}
+
+/// The SDK whose log records may carry secrets (DESIGN.md §12.4).
+const SDK_SECRET_TARGET: &str = "proton_sdk_rs2";
+
+/// The log filter: `RUST_LOG` when it parses, else the level from `-v`.
+/// Records of `proton_sdk_rs2` above WARN never pass, whatever the
+/// directives say: its debug logs printed key material before P16, and a
+/// more specific directive (`proton_sdk_rs2::account=debug`, a span
+/// directive) would win over a crate-wide `proton_sdk_rs2=warn` alone.
+fn log_filter<S>(
+    verbose: u8,
+    rust_log: Option<&str>,
+) -> impl tracing_subscriber::layer::Filter<S> + use<S>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    use tracing_subscriber::filter::{EnvFilter, FilterExt, filter_fn};
     let level = match verbose {
         0 => "warn",
         1 => "info",
         _ => "debug",
     };
-    // The SDK logs key material at debug level in this module; never show it.
+    let sdk = format!("{SDK_SECRET_TARGET}=warn");
     // pgp warns on every re-encoded key whose length differs from the
     // original; it is harmless noise, so only RUST_LOG shows it.
-    let default = format!("{level},proton_sdk_rs2::secret=warn,pgp::packet::packet_sum=error");
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .map(|filter| filter.add_directive("proton_sdk_rs2::secret=warn".parse().expect("valid")))
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        // The daemon's stderr is its log file: no color codes there.
-        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
-        .init();
+    let env = rust_log
+        .and_then(|directives| EnvFilter::try_new(directives).ok())
+        .unwrap_or_else(|| EnvFilter::new(format!("{level},pgp::packet::packet_sum=error")))
+        .add_directive(sdk.parse().expect("valid"));
+    env.and(filter_fn(|meta| {
+        *meta.level() <= tracing::Level::WARN || !meta.target().starts_with(SDK_SECRET_TARGET)
+    }))
 }
 
 #[cfg(feature = "fake-backend")]
@@ -428,6 +637,7 @@ async fn fake_command(command: FakeCommand) -> anyhow::Result<ExitCode> {
                 .await?;
         }
         FakeCommand::Fault(command) => fake_fault(command)?,
+        FakeCommand::Profile(args) => fake_profile(args)?,
         FakeCommand::Changes { after, dir } => {
             for (seq, change) in FakeBackend::open(&dir)?.changes_since(after) {
                 match change {
@@ -468,6 +678,32 @@ fn fake_fault(command: FaultCommand) -> anyhow::Result<()> {
         FaultCommand::Unauthorized(args) => rule(FaultKind::Unauthorized, args)?,
         FaultCommand::Clear { client, dir } => clear_faults(&dir, client.as_deref())?,
     }
+    Ok(())
+}
+
+#[cfg(feature = "fake-backend")]
+fn fake_profile(args: ProfileArgs) -> anyhow::Result<()> {
+    use pdmount_backend::fake::{NetProfile, clear_profile, read_profile, write_profile};
+    if let Some(ProfileCommand::Clear { dir }) = args.command {
+        return Ok(clear_profile(&dir)?);
+    }
+    let dir = args.dir.expect("clap requires the directory");
+    if args.rtt.is_some() || args.up.is_some() || args.down.is_some() {
+        let profile = NetProfile {
+            rtt: std::time::Duration::from_millis(args.rtt.unwrap_or(0)),
+            up_bytes_per_sec: args.up,
+            down_bytes_per_sec: args.down,
+        };
+        return Ok(write_profile(&dir, profile)?);
+    }
+    let profile = read_profile(&dir);
+    let rate = |rate: Option<u64>| rate.map_or("unlimited".to_owned(), |r| format!("{r} B/s"));
+    println!(
+        "rtt {} ms, up {}, down {}",
+        profile.rtt.as_millis(),
+        rate(profile.up_bytes_per_sec),
+        rate(profile.down_bytes_per_sec)
+    );
     Ok(())
 }
 
@@ -527,12 +763,29 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Mount(args) => {
             let config = Config::load(&paths.config_file())?;
             let mountpoint = daemon::mountpoint(&config, &home_dir()?, args.mountpoint);
+            let read_only = args.option.is_some();
             if args.foreground {
-                daemon::run_foreground(&paths, &config, &mountpoint, &args.backend).await
+                let textfile = config.prometheus_textfile(&home_dir()?);
+                daemon::run_foreground(
+                    &paths,
+                    &config,
+                    &mountpoint,
+                    &args.backend,
+                    textfile,
+                    read_only,
+                )
+                .await
             } else {
-                let login = (!args.no_login).then_some(config.auth.browser);
-                daemon::mount_background(&paths, &mountpoint, &args.backend, cli.verbose, login)
-                    .await
+                let login = (!args.no_login).then_some(args.browser.mode(&config));
+                daemon::mount_background(
+                    &paths,
+                    &mountpoint,
+                    &args.backend,
+                    cli.verbose,
+                    login,
+                    read_only,
+                )
+                .await
             }
         }
         Command::Unmount(args) => {
@@ -541,7 +794,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 daemon::existing_mountpoint(&paths, &config, &home_dir()?, args.mountpoint);
             daemon::unmount(&paths, &mountpoint, args.force).await
         }
-        Command::Stats => daemon::stats(&paths).await,
+        Command::Stats(args) => stats::run(&paths, args.json, args.reset).await,
         Command::Reset(_) => {
             let config = Config::load(&paths.config_file())?;
             let mountpoint = daemon::existing_mountpoint(&paths, &config, &home_dir()?, None);
@@ -590,6 +843,76 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 }
             }
         }
+        Command::Pin(args) => {
+            let Some(path) = args.path else {
+                return pins::list(&paths).await;
+            };
+            let config = Config::load(&paths.config_file())?;
+            let mountpoint = daemon::existing_mountpoint(&paths, &config, &home_dir()?, None);
+            pins::set(&paths, access::mount_relative(&path, &mountpoint)?).await
+        }
+        Command::Unpin { path } => {
+            let config = Config::load(&paths.config_file())?;
+            let mountpoint = daemon::existing_mountpoint(&paths, &config, &home_dir()?, None);
+            pins::unset(&paths, access::mount_relative(&path, &mountpoint)?).await
+        }
+        Command::Autostart { command } => match command {
+            Some(AutostartCommand::Enable) => autostart::enable(&paths),
+            Some(AutostartCommand::Disable) => autostart::disable(&paths),
+            None => Ok(autostart::show(&paths)),
+        },
+        Command::Sync { timeout, path } => {
+            let config = Config::load(&paths.config_file())?;
+            let mountpoint = daemon::existing_mountpoint(&paths, &config, &home_dir()?, None);
+            let path = path
+                .map(|p| access::mount_relative(&p, &mountpoint))
+                .transpose()?;
+            queue::sync(&paths, path, timeout).await
+        }
+        Command::Queue(command) => {
+            let config = Config::load(&paths.config_file())?;
+            let mountpoint = daemon::existing_mountpoint(&paths, &config, &home_dir()?, None);
+            let by_path = |path: std::path::PathBuf| {
+                access::mount_relative(&path, &mountpoint).map(QueueTarget::Path)
+            };
+            let target = |args: QueueTargetArgs| match (args.id, args.all, args.path) {
+                (Some(id), _, _) => Ok(QueueTarget::Id(id)),
+                (None, true, _) => Ok(QueueTarget::All),
+                (None, false, Some(path)) => by_path(path),
+                (None, false, None) => unreachable!("clap requires one"),
+            };
+            match command {
+                QueueCommand::List { path } => {
+                    let target = path.map_or(Ok(QueueTarget::All), by_path)?;
+                    queue::list(&paths, target).await
+                }
+                QueueCommand::Show { id, path } => {
+                    let target = match (id, path) {
+                        (Some(id), _) => QueueTarget::Id(id),
+                        (None, Some(path)) => by_path(path)?,
+                        (None, None) => unreachable!("clap requires one"),
+                    };
+                    queue::show(&paths, target).await
+                }
+                QueueCommand::Retry(args) => queue::retry(&paths, target(args)?).await,
+                QueueCommand::Park(args) => queue::park(&paths, target(args)?).await,
+                QueueCommand::Drop { target: args, yes } => {
+                    queue::drop(&paths, target(args)?, yes).await
+                }
+            }
+        }
+        Command::Cache(command) => match command {
+            CacheCommand::Stats => cache::stats(&paths).await,
+            CacheCommand::Gc { target } => cache::gc(&paths, target).await,
+            CacheCommand::Wipe { path } => {
+                let config = Config::load(&paths.config_file())?;
+                let mountpoint = daemon::existing_mountpoint(&paths, &config, &home_dir()?, None);
+                let path = path
+                    .map(|p| access::mount_relative(&p, &mountpoint))
+                    .transpose()?;
+                cache::wipe(&paths, path).await
+            }
+        },
         Command::Doctor => {
             let checks = doctor::run(&paths).await;
             for check in &checks {
@@ -639,9 +962,81 @@ fn main() -> ExitCode {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    /// A log writer that keeps everything in memory.
+    #[derive(Clone, Default)]
+    pub(crate) struct Captured(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Captured {
+        pub(crate) fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock()).into_owned()
+        }
+    }
+
+    #[test]
+    fn sdk_debug_records_never_reach_the_log() {
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::layer::SubscriberExt;
+        // The SDK logs through `log`; the bridge is what the daemon uses.
+        let _ = tracing_log::LogTracer::builder()
+            .with_max_level(log::LevelFilter::Trace)
+            .init();
+        let directives = [
+            None,
+            Some("trace"),
+            Some("proton_sdk_rs2=trace"),
+            Some("proton_sdk_rs2::account=trace,proton_sdk_rs2::api::cache=debug"),
+            Some("[sdk]=trace"),
+        ];
+        for rust_log in directives {
+            let captured = Captured::default();
+            let writer = captured.clone();
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(move || writer.clone())
+                    .with_ansi(false)
+                    .with_filter(log_filter(2, rust_log)),
+            );
+            tracing::subscriber::with_default(subscriber, || {
+                let _span = tracing::info_span!("sdk").entered();
+                log::debug!(target: "proton_sdk_rs2::account", "Passphrase: hunter2");
+                log::trace!(target: "proton_sdk_rs2::api::cache", "raw: address-key");
+                tracing::debug!(target: "proton_sdk_rs2::secret", "serialized-passphrase");
+                log::warn!(target: "proton_sdk_rs2::auth", "refresh token rejected");
+                tracing::debug!("pdmount debug record");
+            });
+            let text = captured.text();
+            for secret in ["hunter2", "address-key", "serialized-passphrase"] {
+                assert!(
+                    !text.contains(secret),
+                    "{rust_log:?} let {secret} through: {text}"
+                );
+            }
+            assert!(
+                text.contains("refresh token rejected"),
+                "{rust_log:?}: {text}"
+            );
+            if rust_log.is_none_or(|d| d == "trace") {
+                assert!(
+                    text.contains("pdmount debug record"),
+                    "{rust_log:?}: {text}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn cli_definition_is_consistent() {
@@ -673,6 +1068,27 @@ mod tests {
                 .command,
             Command::Trash(TrashCommand::Empty { yes: true })
         ));
+    }
+
+    #[test]
+    fn mount_browser_flags_override_the_config() {
+        let parse = |args: &[&str]| match Cli::try_parse_from(args).expect("parse").command {
+            Command::Mount(args) => args.browser,
+            other => panic!("unexpected {other:?}"),
+        };
+        let config = Config::default();
+        assert_eq!(
+            parse(&["pdmount", "mount"]).mode(&config),
+            BrowserMode::Auto
+        );
+        assert_eq!(
+            parse(&["pdmount", "mount", "--browser"]).mode(&config),
+            BrowserMode::Always
+        );
+        assert_eq!(
+            parse(&["pdmount", "mount", "--no-browser"]).mode(&config),
+            BrowserMode::Never
+        );
     }
 
     #[test]

@@ -59,7 +59,7 @@ Path prefixes: `sdk/` = `proton-drive-sdk-0.4.0/src/`, `rs2/` = `proton-sdk-rs2-
 | M0/M1 (read-only mount) | P1, P2, P4, P8 (P3 recommended) |
 | M2 (writes) | P5, P6, P10, P13 |
 | M3 (multi-device, robustness) | P9, P11, P12, P14, P15 |
-| M4 (performance) | P7 |
+| M4 (performance) | P7, P18 |
 
 ## Patches
 
@@ -77,7 +77,8 @@ Path prefixes: `sdk/` = `proton-drive-sdk-0.4.0/src/`, `rs2/` = `proton-sdk-rs2-
 - **Problem:** the downloaded block's SHA-256 is computed and discarded. `CompletedDownloadManifestVerificationException`
   is defined but never raised.
 - **Fix:** compare each block's digest with `BlockDto.hash_digest`, and verify the manifest signature over the concatenated hashes as
-  `RevisionReader.cs:341-357` does. Raise typed integrity errors.
+  `RevisionReader.cs:341-357` does. Raise typed integrity errors. The manifest check covers the full-download path only;
+  block-map reads get it from P17.
 
 ### P3 — Public reusable block map
 - **Where:** `sdk/node/file/download.rs:173-212` (`download_range` rebuilds the download state on every call).
@@ -183,6 +184,67 @@ Path prefixes: `sdk/` = `proton-drive-sdk-0.4.0/src/`, `rs2/` = `proton-sdk-rs2-
 - **Test:** a DTO with `TrashTime`, with `Trashed`, with `null` and without the field. Checked against the live API in
   M3.1: a trashed file and folder report a trash time at once.
 
+### P16 — No secrets or response bodies in logs
+- **Where:** `rs2/account.rs:226`, `rs2/api/cache.rs:249`, `rs2/users.rs:83`, `rs2/secret.rs:63,67`, `rs2/session.rs`
+  (`ensure_authenticated`); `sdk/api/share.rs` (`get_my_files_share`, `get_share`), `sdk/api/file.rs`
+  (`get_thumbnail_blocks`), `sdk/api/links.rs` (`get_link_details`, `move_link`, `move_multiple`, `copy_link`),
+  `sdk/api/trash.rs` (`get_trash`, `trash_multiple`). Security review finding S-1 (High), M4.0.2.1.
+- **Problem:** debug logs print the user key passphrase, the cached address private keys (at every session resume), the
+  serialized cached passphrase, the whole `/users` body and the session probe body. The drive SDK logs the raw share
+  responses (encrypted share keys and passphrases), the thumbnail block list (download URLs and tokens), link move request
+  bodies (encrypted node passphrases), and the move, copy, link-details and trash responses. The trash, share and
+  thumbnail-block decode errors carry the whole body too.
+- **Fix:** the logs are removed (the move requests still log their URL); the decode errors keep the serde error only.
+- **Left as is:** the generic decode helpers (`sdk/api/mod.rs:249,284,298,307`), `storage.rs:139`, `docs.rs:238` and the
+  shared-by-me/with-me and album decoders still put the body into the error of a malformed reply (error text, not a log
+  call); PdMount logs such errors at WARN. TODO Known gaps ("Security (M4.0.1)").
+- **Behaviour change:** none.
+- **Test:** none in the fork (log output only); PdMount's `sdk_debug_records_never_reach_the_log` covers the filter that
+  backs it up.
+
+### P17 — Manifest verification on block-map reads
+- **Where:** `sdk/node/file/block_map.rs` (`get_block_map`, new `verify_block_listing`), `sdk/node/download.rs`
+  (`manifest_verification_keys`, shared with `RevisionReader::verify_manifest`), `rs2/api/response.rs`
+  (`AddressPublicKeyListResponse`), `rs2/account.rs` (`get_address_public_keys`). Security review findings S-4 (Medium)
+  and S-11 (Low), M4.0.2.2.
+- **Problem:** `download_block` checks each block against its listed hash, but nothing checks the listed hashes: the
+  manifest signature is verified only by full downloads (P2). A storage or server that lists other blocks (another revision
+  of the same file, say) passes every check. A block listed with an empty hash skips the per-block check
+  (`sdk/block/download.rs` `verify_block_hash`).
+- **Fix:** `get_block_map` builds the manifest from the listed thumbnail hashes (by type) and block hashes (by index), as
+  the full download and the JS SDK (`fileDownloader.ts`, which also uses the listed hashes) do, and verifies
+  `ManifestSignature` with the node key when `SignatureEmail` is empty, else the address keys of that email. Failure:
+  `CompletedDownloadManifestVerificationException`; an empty block hash: `DataIntegrityException`. PdMount maps both to
+  `Integrity` (EIO) and does not cache the map.
+- **Second fix, found by the real-account check:** `get_address_public_keys` never worked. `AddressPublicKeyListResponse`
+  expected `Address` as a string and a top-level `AddressPublicKeys`; the server answers `Address: {Keys: [{PublicKey,
+  Primary, Flags, Source}], SignedKeyList}` (`get_core-{_version}-keys-all` in `cs/client/js/src/internal/apiService/coreTypes.ts`),
+  so every call failed to decode ("invalid type: map, expected a string at line 1 column 23"). With the first commit
+  alone, 989 of the dataset's files read as EIO. Now `Address`, `CatchAll` and `Unverified` decode as key lists, and
+  verification uses the `Address` keys not flagged compromised (`Flags` bit 1); `Unverified` keys are documented as not
+  for verification. Before, node authorship checks (`node/authorship.rs`) never got their keys either, and each failed
+  lookup was an uncached `keys/all` call; a successful lookup is cached for its TTL.
+- **Test:** `verify_block_listing` with constructed listings: a signed listing passes; a tampered hash, a dropped thumbnail
+  or block, another key's signature, a missing signature and an empty hash fail. `all_keys_answer_decodes_the_address_keys`
+  decodes the schema's answer. Real account: see the M4.0.2.2 entry in `docs/handoff-log.md`.
+- **Behaviour change:** a block map whose listing has a missing or invalid manifest signature, or a block without a hash,
+  now fails, so every read of that revision is EIO; before, such reads worked.
+
+### P18 — Configurable block transfer parallelism
+- **Where:** `sdk/client.rs` (`ProtonDriveClient::new` → `from_components_with_api_url`, which fixes
+  `DEFAULT_DEGREE_OF_BLOCK_TRANSFER_PARALLELISM = 6` for the block uploader and downloader), `sdk/node/transfer.rs`
+  (`TransferQueue`). M4.7, D058.
+- **Problem:** with P7's file limit of 4, uploads could have 6 blocks in flight, equal to the C# SDK's limit rather than
+  below it as D033 asks; only the lower-level `from_components` constructor takes another value.
+- **Fix:** `ProtonDriveClient::with_block_transfer_parallelism(n)`, next to `with_max_concurrent_file_transfers`, replaces
+  the block semaphore of the upload and download queues (`TransferQueue::with_max_degree_of_parallelism`, which keeps
+  the file semaphore, so the two builders work in either order). Thumbnail downloads and the block-processing
+  semaphores derived from the constructor's value are unchanged.
+- **Test:** `changing_the_block_parallelism_keeps_the_file_capacity` (queue), and
+  `block_transfer_parallelism_applies_to_uploads_and_downloads` (client: 4 files and 5 blocks per direction, the sixth
+  block and fifth file wait). PdMount cannot build a client without a session, so this fork test covers its builder.
+- **Behaviour change:** none unless called.
+
 ## Upstream tracking
 
 | Patch | Fork branch | Commit | Based on | Upstream | State |
@@ -202,6 +264,9 @@ Path prefixes: `sdk/` = `proton-drive-sdk-0.4.0/src/`, `rs2/` = `proton-sdk-rs2-
 | P13 | `feat/fresh-node-batch` | `7b4dcf9` | `base/0.4.0` | deferred (D023) | merged into `pdmount` |
 | P14 | `feat/caller-name-hash` | `2137adc` | `pdmount` at `4548aa7` (needs P10, P13) | deferred (D023) | merged into `pdmount` |
 | P15 | `fix/link-trash-time` | `30c061a` | `base/0.4.0` | deferred (D023) | merged into `pdmount` |
+| P16 | `fix/no-secret-logs` | `ed2a9a6`, `1de736a` (rustfmt) | `pdmount` at `d1c8994` | deferred (D023) | merged into `pdmount` |
+| P17 | `feat/block-map-manifest` | `d6e26ba`, `b0da02f` (keys decoding) | `pdmount` at `0c3d32c` (after P16) | deferred (D023) | merged into `pdmount` |
+| P18 | `feat/block-parallelism` | `cc50981` | `pdmount` at `28cacff` (needs P7) | deferred (D023) | merged into `pdmount` |
 
 Integration: `pdmount` = `base/0.4.0` + all branches above, merged with `--no-ff`. It also contains `9176b0f`, a test-only fix
 setting the new `FolderNode` field (from P5) in a test helper added by P10. Checks on 2026-10-19: 236 SDK tests pass (baseline
@@ -209,6 +274,9 @@ setting the new `FolderNode` field (from P5) in a test helper added by P10. Chec
 fork's workspace tests (278) pass on it. Through PdMount, the patches ran against the live API in the M2.8 real-account matrix
 (60 of 60 runs passed, 2026-10-22). P14 (`e3c576a`) and P15 (`d1c8994`, pinned by PdMount) were merged on 2026-10-22;
 the fork's workspace tests (281) pass, and both ran against the live API in the M3.1 probe.
+P16 was merged on 2026-10-27 (`e931883`; its rustfmt follow-up `0c3d32c`); the fork's workspace tests (281) pass. P17 was
+merged on 2026-10-27 (`8181251`, then `28cacff` with the keys-decoding fix); the fork's workspace tests (288) pass.
+P18 was merged on 2026-10-28 (`2ae4aa3`, pinned by PdMount); the fork's workspace tests (290) pass.
 
 ## Behaviour changes
 
@@ -222,6 +290,7 @@ P8, P9, P11, P12; P13 only adds an API and changes no existing behaviour) and on
 | P9 | A failed token refresh returns `Err(TokenRefreshError)` instead of `Ok(old tokens)`. `refresh_token_expired` fires on Proton code 10013. `tokens_refreshed` no longer fires after a failure. |
 | P11 | New-file drafts send `ClientUID`. With `override_existing_draft_by_other_client = true`, another client's draft that never got a committed revision is deleted and the create retried. Failures are `NodeWithSameNameExistsError` / `RevisionDraftConflictError`. |
 | P12 | Drive API requests are retried: 429 for all methods; 5xx and timeouts for idempotent methods only; connection failures. Circuit breakers fail fast for 60 s after 50 consecutive 429s or 10 consecutive 5xx. |
+| P17 | `get_block_map` fails for a revision whose manifest signature is missing or does not verify over the listed hashes, or that lists a block without a hash (2026-10-27, accepted with the M4.0.1 fix plan). `get_address_public_keys` now returns the address's non-compromised keys instead of failing, so authorship and manifest checks of address-signed nodes run for the first time. |
 | P15 | Trashed nodes report their trash time (`trash_time`) in `get_node`, `get_nodes_uncached`, folder listings and the trash listing; before, it was always `None`. |
 
 ## Known gaps after M0.2

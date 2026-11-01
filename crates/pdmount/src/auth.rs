@@ -5,9 +5,9 @@
 use crate::notify;
 use crate::session::{self, LoggedIn, TokenSaver};
 use pdmount_backend::proton::ProtonBackend;
-use pdmount_core::ProfilePaths;
 use pdmount_core::device::DeviceIdentity;
 use pdmount_core::health::{Connectivity, Health};
+use pdmount_core::{Profile, ProfilePaths};
 use proton_drive_sdk::proton_sdk_rs2::auth::TokenCredential;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,6 +32,7 @@ pub struct SignIn {
 pub struct Auth {
     paths: ProfilePaths,
     device: DeviceIdentity,
+    limits: session::TransferLimits,
     backend: Arc<ProtonBackend>,
     health: Arc<Health>,
     /// The account of the mount: a login as anyone else is refused.
@@ -51,6 +52,7 @@ impl Auth {
     pub async fn new(
         paths: ProfilePaths,
         device: DeviceIdentity,
+        limits: session::TransferLimits,
         backend: Arc<ProtonBackend>,
         health: Arc<Health>,
         logged_in: LoggedIn,
@@ -59,6 +61,7 @@ impl Auth {
         Arc::new(Self {
             paths,
             device,
+            limits,
             backend,
             health,
             username: logged_in.session.username.clone(),
@@ -243,19 +246,13 @@ impl Auth {
         let mut announced = false;
         let slot = Arc::clone(self);
         let begin = session::begin_web_login(&self.paths, move |url, code| {
-            *slot.sign_in.lock() = Some(SignIn {
-                url: url.to_owned(),
-                code: code.to_owned(),
-            });
-            if !announced {
-                announced = true;
-                tracing::warn!(
-                    url,
-                    code,
-                    "sign-in needed: open the link (or run `pdmount login`)"
-                );
-                notify::desktop("PdMount: sign in needed", url);
-            }
+            link_received(
+                &slot.sign_in,
+                &slot.paths.profile,
+                url,
+                code,
+                &mut announced,
+            );
         });
         let session = tokio::time::timeout(SIGN_IN_TIME + Duration::from_secs(30), begin)
             .await
@@ -284,7 +281,7 @@ impl Auth {
         let logged_in = session::store_login(&self.paths, session)
             .await
             .map_err(|error| format!("cannot store the new session: {error:#}"))?;
-        let client = session::drive_client(&logged_in.session, &self.device)
+        let client = session::drive_client(&logged_in.session, &self.device, self.limits)
             .map_err(|error| format!("cannot use the new session: {error:#}"))?;
         let credential = logged_in.session.token_credential.clone();
         self.backend.replace_session(client, credential.clone());
@@ -295,5 +292,81 @@ impl Auth {
         tracing::info!("signed in again");
         self.health.kick();
         Ok(())
+    }
+}
+
+/// A sign-in link from the SDK: kept for `status` and `login`, which read it
+/// over the 0600 control socket. The log and the desktop notification name
+/// the code only, never the link (D071): its fragment holds half of the
+/// fork secret.
+fn link_received(
+    slot: &parking_lot::Mutex<Option<SignIn>>,
+    profile: &Profile,
+    url: &str,
+    code: &str,
+    announced: &mut bool,
+) {
+    *slot.lock() = Some(SignIn {
+        url: url.to_owned(),
+        code: code.to_owned(),
+    });
+    if !std::mem::replace(announced, true) {
+        tracing::warn!(
+            code,
+            "sign-in needed: run `pdmount login` or `pdmount status` for the link"
+        );
+        let (summary, body) = sign_in_notice(profile);
+        notify::desktop(summary, &body);
+    }
+}
+
+/// The desktop notification for a needed sign-in.
+fn sign_in_notice(profile: &Profile) -> (&'static str, String) {
+    (
+        "PdMount: sign in needed",
+        format!("Sign-in needed for profile {profile}: run `pdmount login`"),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    const URL: &str = "https://account.proton.me/sign-in#fork-key";
+
+    #[test]
+    fn the_sign_in_link_stays_out_of_the_log_and_the_notification() {
+        let captured = crate::tests::Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(move || writer.clone())
+                .with_ansi(false),
+        );
+        let slot = parking_lot::Mutex::new(None);
+        let profile = Profile::default();
+        let mut announced = false;
+        tracing::subscriber::with_default(subscriber, || {
+            link_received(&slot, &profile, URL, "ABCD-1234", &mut announced);
+            link_received(&slot, &profile, URL, "ABCD-1234", &mut announced);
+        });
+        let text = captured.text();
+        assert!(text.contains("ABCD-1234"), "{text}");
+        assert!(!text.contains("account.proton.me"), "{text}");
+        assert_eq!(text.matches("sign-in needed").count(), 1, "{text}");
+        assert_eq!(
+            slot.lock().as_ref().map(|sign_in| sign_in.url.as_str()),
+            Some(URL),
+            "status and login still get the link"
+        );
+
+        let (summary, body) = sign_in_notice(&profile);
+        let argv = notify::argv(summary, &body);
+        assert!(argv.iter().any(|arg| arg.contains("pdmount login")));
+        assert!(
+            !argv.iter().any(|arg| arg.contains("proton.me")),
+            "{argv:?}"
+        );
     }
 }
