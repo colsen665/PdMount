@@ -1,8 +1,8 @@
 ## Area 3 (backend crate, test switches in shipped builds, SDK fork P16–P18, scripts): findings
 
-Reviewed: worktree `4903f03` (`m4-start..HEAD` for `crates/pdmount-backend`, `Cargo.toml`, `scripts`, `tests`); SDK fork
-`pdmount` `d1c8994..2ae4aa3` (P16–P18). Paths relative to the worktree unless prefixed `sdk/` (= fork
-`crates/proton-drive-sdk/src/`) or `rs2/` (= fork `crates/proton-sdk-rs2/src/`), both at `2ae4aa3`. Threat model
+Reviewed: worktree `686ded8` (`m4-start..HEAD` for `crates/pdmount-backend`, `Cargo.toml`, `scripts`, `tests`); SDK fork
+`pdmount` `c837e03..caafaea` (P16–P18). Paths relative to the worktree unless prefixed `sdk/` (= fork
+`crates/proton-drive-sdk/src/`) or `rs2/` (= fork `crates/proton-sdk-rs2/src/`), both at `caafaea`. Threat model
 `docs/security/threat-model.md`. Open Lows of the 2026-10-27 review are not repeated; none of them is made worse by the M4 changes
 (see "Checked and fine").
 
@@ -96,7 +96,7 @@ Backend crate (`git diff m4-start..HEAD -- crates/pdmount-backend Cargo.toml`):
   only EMFILE/ENFILE to `Transient`; its message holds a staging path, not remote text.
 - New logs in the diff: `claimed`/`blocks` numbers at debug, a fixed warning at the D085 match; `?degraded` as before (no key
   material). `log`/`tracing-log` are workspace entries only; `pdmount-backend` does not depend on them.
-- `Cargo.toml`: fork pinned to `2ae4aa3` by revision for both crates, `--locked` in CI.
+- `Cargo.toml`: fork pinned to `caafaea` by revision for both crates, `--locked` in CI.
 
 Test code and shipped builds:
 - The only feature is `pdmount/fake-backend` (`crates/pdmount/Cargo.toml:14`); no other crate names it, so the workspace release
@@ -111,10 +111,10 @@ Test code and shipped builds:
   `DESIGN.md:1349`; same uid only, shortens a timeout), `DBUS_SESSION_BUS_ADDRESS`/`DISPLAY`/`WAYLAND_DISPLAY` (presence checks).
   None selects a backend or changes what is verified.
 
-SDK fork `d1c8994..2ae4aa3`:
+SDK fork `c837e03..caafaea`:
 - P16: the listed debug logs are gone (`rs2/account.rs` passphrase, `rs2/api/cache.rs` raw keys, `rs2/users.rs` body,
   `rs2/secret.rs` serialized values, `rs2/session.rs` probe body; `sdk/api/{file,links,share,trash}.rs` bodies and request JSON).
-  Grep of the fork at `2ae4aa3` for log calls mentioning passphrase/token/key/body/`{:?}`: only key ids, address ids, cache key
+  Grep of the fork at `caafaea` for log calls mentioning passphrase/token/key/body/`{:?}`: only key ids, address ids, cache key
   names, session id, counts and URLs with volume/link ids remain (`rs2/account.rs:117,229,299`, `rs2/secret.rs:57`,
   `rs2/session.rs:394,472`, `sdk/api/links.rs:192,213`). `println!` only in a `#[cfg(test)]` keyring test and doc comments. The
   decode helpers that still put a reply body into the error text (`sdk/api/mod.rs:298,307`, `sdk/api/storage.rs:139`) are

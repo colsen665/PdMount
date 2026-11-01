@@ -27,7 +27,7 @@ No Critical/High in this area per the reviewer. Remote names never reach local p
 - **Attack**: folder F and file X in listed dir D; remote moves F away; listing of D fetched (shows X, not F); before apply, the executor completes a local move of X into F and stamps X (`changed_since`); apply skips X in `follows`, `remove_subtree(F)` unindexes X; incoming pass finds X without an inode, `unknown` did not count it → `expect` panics. D's children already taken; D looks empty until relisted.
 - **Impact**: files vanish from view; slow-path task dies (EIO); no persisted loss found.
 - **Fix**: compute removals first and count incoming links that will be unindexed, or keep stamped nodes; proptest with a stamped node under a vanished folder.
-- **Confidence**: low-medium (traced by reading). NOTE: related to the G6 fix in 29355a6 (`a_node_moved_out_of_a_vanished_folder_survives_the_listing`).
+- **Confidence**: low-medium (traced by reading). NOTE: related to the G6 fix in 4a4eb28 (`a_node_moved_out_of_a_vanished_folder_survives_the_listing`).
 
 ### A2-5: Control characters in remote names reach logs and the CLI unescaped
 - **Rating**: Info

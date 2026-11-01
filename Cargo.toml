@@ -6,6 +6,7 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2024"
 publish = false
+license = "MIT"
 
 [workspace.dependencies]
 pdmount-backend = { path = "crates/pdmount-backend" }
@@ -61,7 +62,7 @@ dbg_macro = "warn"
 todo = "warn"
 unwrap_used = "warn"
 
-# The community SDK is used through a patched fork (decisions D002, D022).
+# The community SDK is used through a patched fork (decisions D002, D089).
 # Patches and their status: docs/sdk-patches.md.
 [patch.crates-io]
 proton-drive-sdk = { git = "https://github.com/colsen665/proton-sdk-rs2", rev = "caafaea683116e71957d8e6b86de1450afc97ac1" }

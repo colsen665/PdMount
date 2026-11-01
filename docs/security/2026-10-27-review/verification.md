@@ -1,6 +1,6 @@
 # Verification of the M4.0.1 area reports (Fable verifier, 2026-10-27)
 
-Reviewed tree: worktree `e55ed49` (`m4-start`), SDK fork `pdmount` at `d1c8994`. Threat model:
+Reviewed tree: worktree `8c5eda9` (`m4-start`), SDK fork `pdmount` at `c837e03`. Threat model:
 `docs/security/threat-model.md` (D070). Area reports: `area1.md` … `area5.md` in this directory (finding IDs A1-n … A5-n).
 Fixes and their specifications: `docs/plans/m4.md` "M4.0.1 outcomes". Open Lows and Infos: TODO.md Known gaps,
 "Security (M4.0.1)".
@@ -15,7 +15,7 @@ Fixes and their specifications: `docs/plans/m4.md` "M4.0.1 outcomes". Open Lows 
 | S-6 | A3-2, A4-1 | Claimed per-block `plain_size` used as allocation size (calloc, virtual) | CONFIRMED | Low (from Medium) | M4.0.2.3 |
 | S-7 | A5-5 | `rm -rf "$DATASET"` (and `FAKE_DIR`, bench scripts) | CONFIRMED | Medium | M4.0.2.4 |
 | S-8 | A5-6 | `/dev/shm/pdmount-*` root without an ownership check; git's ownership check blocks the planted-repo exec | PLAUSIBLE | Low (from Medium) | M4.0.2.4 |
-| S-9 | A2-4 | `apply_listing_at` `expect("counted above")` with a stamped node under a vanished folder; 29355a6 covers followers only | CONFIRMED (traced) | Low | Known gaps |
+| S-9 | A2-4 | `apply_listing_at` `expect("counted above")` with a stamped node under a vanished folder; 4a4eb28 covers followers only | CONFIRMED (traced) | Low | Known gaps |
 | S-10 | A5-2, A4-3 | `Retry-After` unbounded; 429 retries unbounded per request | CONFIRMED | Low | Known gaps |
 | S-11 | A5-3, A4-5 | Empty listed block hash skips the per-block check | CONFIRMED | Low | M4.0.2.2 |
 | S-12 | A2-1, A4-4 | Remote mode keeps setuid/setgid/sticky bits (mount is `nosuid`) | CONFIRMED | Low | Known gaps |

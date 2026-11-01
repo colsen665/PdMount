@@ -1,6 +1,6 @@
 ## Area 1 (CLI binary crate `crates/pdmount/src/`): findings
 
-Reviewed read-only at commit e55ed49: main.rs, daemon.rs, control.rs, session.rs, credentials.rs, auth.rs, notify.rs, doctor.rs, status.rs, mounts.rs, access.rs, conflicts.rs, trash.rs, probe.rs, plus `crates/pdmount-core/src/{paths,device,config}.rs` and the SDK fork checkout at `~/.cargo/git/checkouts/proton-sdk-rs2-<hash>/d1c8994/` (rev d1c8994) for what it logs.
+Reviewed read-only at commit 8c5eda9: main.rs, daemon.rs, control.rs, session.rs, credentials.rs, auth.rs, notify.rs, doctor.rs, status.rs, mounts.rs, access.rs, conflicts.rs, trash.rs, probe.rs, plus `crates/pdmount-core/src/{paths,device,config}.rs` and the SDK fork checkout at `~/.cargo/git/checkouts/proton-sdk-rs2-<hash>/c837e03/` (rev c837e03) for what it logs.
 
 ### A1-1: The secret log filter misses two SDK modules that log the key passphrase and unlocked private keys at debug
 - **Rating**: High

@@ -85,9 +85,10 @@ scratchpad directory that depends on the exact versions and run `cargo fetch`. T
 
 ## Git
 
-- Remote: `origin` = a local bare repo, branch `master`, until the user says otherwise.
-- **No GitHub use** (repos, forks, PRs, issues, Actions) until the user says otherwise (D023).
-- SDK fork: `<fork>` (local bare repo, D022). See docs/sdk-patches.md, "Fork repository".
+- Remote: `origin` = `git@github.com:colsen665/PdMount.git`, branch `master`; authentication is set in the repo-local git config, from "Local paths" (D089).
+- **GitHub (D089):** this repo and the fork only. No hosted CI or Actions, and no upstream PRs or issues until the user says the patches are stable.
+- **The repository is public.** Never write the account name, the user's local username or home path, a path on this machine, SSH key names or paths, hardware details, tokens or personal data into it or its commit messages (D090); write `<test account>` and `<user>`. Ask the user about any reference to a file outside the repository. `docs/security/` stays in the repository unless it reveals details of the local system. Push only with the user's agreement. A false positive of the publishing scan goes in `.betterleaks.toml` or `.betterleaksignore`, by pattern, never by private value.
+- SDK fork: `https://github.com/colsen665/proton-sdk-rs2`. See docs/sdk-patches.md, "Fork repository".
 - Commit or push only when the user asks. Exception during M3 (D039) and M4 (D056): commit after each task of
   `docs/plans/m3.md` / `docs/plans/m4.md` once CI passes (next bullet), one commit per task, message `M3.n: <title>` /
   `M4.n: <title>`; never push. In M4 a session may do several tasks (the plan's "Sessions" table), each its own commit.
@@ -97,6 +98,20 @@ scratchpad directory that depends on the exact versions and run `cargo fetch`. T
 - Author: the repository's local git config (`user.name=Claus`, `user.email=colsen665@proton.me`), set for the sandbox user.
 - Commit message trailer: the `Co-Authored-By` line of the model that made the change, e.g.
   `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
+
+## Local paths
+
+Locations on this machine are never written into the repository (D090). They live in `.pdmount-local.env` at the checkout's
+root, gitignored, as shell `KEY=value` lines. **If the file or a key is missing, for example on a new checkout, ask the user and
+write it there; never copy a value into a tracked file or a commit message.**
+
+| Key | Meaning |
+|---|---|
+| `PDMOUNT_SSH_KEY` | SSH key for pushing this repository; set `core.sshCommand` from it in the repo-local git config |
+| `PDMOUNT_FORK_SSH_KEY` | SSH key for pushing the SDK fork |
+| `PDMOUNT_FORK_CHECKOUT` | The working copy of the SDK fork (`<working copy>` in the docs) |
+| `PDMOUNT_CS_SDK` | The official SDK checkout (`<official SDK checkout>` in the docs) |
+| `FSX`, `PJDFSTEST` | Used by `tests/fsx.sh` and `tests/pjdfstest.sh` (`<tools dir>` in the docs) |
 
 ## Environment (verified 2026-10-19)
 

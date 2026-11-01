@@ -3,6 +3,7 @@ name = "pdmount-core"
 description = "PdMount core: configuration, profile paths and the filesystem engine"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [dependencies]

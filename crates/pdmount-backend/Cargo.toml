@@ -3,6 +3,7 @@ name = "pdmount-backend"
 description = "Storage backend interface for PdMount, with the Proton Drive adapter and an in-memory fake"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [dependencies]

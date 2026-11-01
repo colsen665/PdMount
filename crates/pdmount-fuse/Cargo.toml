@@ -3,6 +3,7 @@ name = "pdmount-fuse"
 description = "PdMount FUSE adapter: maps fuser callbacks onto the pdmount-core engine"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [dependencies]

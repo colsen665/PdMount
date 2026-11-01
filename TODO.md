@@ -1,6 +1,6 @@
 # TODO
 
-Last updated: 2026-11-01 (**M4 done**: M4.16 exit check passed at `9a4cd1b`, not pushed; M4.8 done; D064 decided by the user: writeback cache stays off; M5–M7 planned, D073–D083, merged with M4.8; `kernel.writeback_cache` removed, D083). M3 done (M3.21: every §16 criterion passes; results in its entry in `docs/handoff-log.md`). Pre-M4
+Last updated: 2026-11-01 (**On GitHub, D089, D090**: public MIT repo and real SDK fork, one commit per milestone. **M4 done**: M4.16 exit check passed at `afb99df`, not pushed; M4.8 done; D064 decided by the user: writeback cache stays off; M5–M7 planned, D073–D083, merged with M4.8; `kernel.writeback_cache` removed, D083). M3 done (M3.21: every §16 criterion passes; results in its entry in `docs/handoff-log.md`). Pre-M4
 review done; fix groups G1–G5, G7 and G8 applied, G6 in part (the rest is optional, user's call). **M4 started:**
 plan in `docs/plans/m4.md` (D056), M4.0 done, tag `m4-start`. M4.0.1 security review done (1 High, 5 Medium).
 Fixes M4.0.2.1–M4.0.2.4 done (the High and every Medium). M4.1 done (latency histograms, `stats --json/--reset`,
@@ -12,7 +12,10 @@ KILLPRIV_V2 D068, directory pages kept D072). M4.9 done (cache protections, orde
 
 ## Next action
 
-- **M4 is done and on `master`.** Decisions D057, D062, D068, D070, D071, D072, D085, D087 accepted, D088 (no passphrase move); the full CI passed on `1f96727`. Sandbox profiles `default` and `second` were cleared (D088); `default` is logged in again, `second` needs a login from the user before the Q1/Q6 probe. Then M5 (`docs/plans/m5.md`). No decision is `proposed`. Before relying on the latency numbers on a spinning disk, run `m4.sh` with `BENCH_ROOT` there (Known gaps).
+- **Publication is done (D089, D090):** the maintainer was told, then the SDK fork and PdMount were pushed.
+- **Start M5** (`docs/plans/m5.md`). Before each push, run the full CI (D084).
+- **SDK update, not done (user to schedule):** upstream is at 0.5.1 and its maintainer suggests updating. The patches stay on `base/0.4.0` until a separate task rebases and tests them; upstream PRs still wait for the user (D089).
+- **M4 is done and on `master`.** Decisions D057, D062, D068, D070, D071, D072, D085, D087 accepted, D088 (no passphrase move); the full CI passed on `bc03e80`. Sandbox profiles `default` and `second` were cleared (D088); `default` is logged in again, `second` needs a login from the user before the Q1/Q6 probe. Then M5 (`docs/plans/m5.md`). No decision is `proposed`. Before relying on the latency numbers on a spinning disk, run `m4.sh` with `BENCH_ROOT` there (Known gaps).
 - **Optional (user's call, 2026-10-27):** the rest of G6, pure refactors (report S-E4–S-E6, S-E9, rest of
   S-E10/S-E11, S-B2, S-B9, S-I1, S-L4 `Ids`, S-L6 `Ctx`/home dir): the staging-lock helpers, `bind_remote`,
   `keep_pending` returning renamed names, the write/truncate pairs, the journal outcome prologue and wrappers,
@@ -34,7 +37,7 @@ when every exit criterion in §16 passes. The task checklists of M0–M3 are in 
 - [x] M4 Performance and operations (2026-11-01)
 - [ ] M5 User services, flush at session end, further roots (D074, D075, D078; plan `docs/plans/m5.md`)
 - [ ] M6 Conflict notifications (D077; plan `docs/plans/m6.md`)
-- [ ] M7 Upstream patches and crypto migration (upstream submission deferred, D023)
+- [ ] M7 Upstream patches and crypto migration (upstream PRs once stable, when the user says so, D089)
 
 ## M4 tasks
 
@@ -104,11 +107,11 @@ Specifications: `docs/plans/m6.md`.
 | Q1 | ~~Does the server enforce `CurrentRevisionID` and `OriginalHash`? At draft creation or at commit?~~ **Resolved (M3.1, real API):** `CurrentRevisionID` only at draft creation; revision drafts are exclusive per file across clients (D043). `OriginalHash` is enforced on rename and move (P14). Details: `docs/plans/m3.md`, "M3.1 outcomes"; DESIGN.md §10.4. | — | M3 |
 | Q2 | ~~Is there an API to update a folder's XAttr (mtime) after creation?~~ **Resolved: no.** Folder XAttr can only be set at creation. Rename has no XAttr; XAttr updates exist only for photo revisions (iOS-only) and albums (`driveTypes.ts` 4950–4980, 1782–1794, 3726–3736). D013 stands. | — | M2 |
 | Q3 | ~~Does git's object finalization fall back from `link()` to `rename()` on EPERM?~~ **Answered by test:** G2, G3, G4, G6 and G7 pass on the fake mount, where `link()` returns EPERM (git 2.55). | — | M2 |
-| Q4 | ~~Where is the SDK fork hosted?~~ **Resolved:** local bare repo `<fork>` (D022) | — | M0 |
+| Q4 | ~~Where is the SDK fork hosted?~~ **Resolved:** GitHub fork `colsen665/proton-sdk-rs2` (D089) | — | M0 |
 | Q5 | Crypto migration timing, and how the community SDK will follow | Watch `cs/README.md`/changelogs and the upstream repo | M7 |
 | Q6 | ~~Which server error codes signal a stale revision or name hash?~~ **Resolved (M3.1):** draft conflicts code 2500 (HTTP 409 for revisions, 422 for names, with `Details`); stale `OriginalHash` code 2000 "…out of date, rename/move failed."; move into a descendant code 2000 "Cannot move a folder into a sub-folder"; a removed draft at commit code 2511. Mapping: M3.12 in the plan's "M3.1 outcomes". | — | M3 |
 | Q7 | Rate-limit thresholds for many small uploads (git, untar). **M1 data point:** prefetch at concurrency 4 got HTTP 429 within seconds; a cold rsync of 1000 small files (about 2 API calls each, unpaced) took 290–373 s without errors **M4.15 (4 uploads at once, P7): no 429 at this load.** 5000 small files drained at a steady 3.0 uploads/s, 3.1 calls/s; the rate follows from 4 uploads × about 1.2 s per call, so it is not a measured server limit. No default changes | — | M2/M4 |
-| Q8 | **Deferred (D023); don't raise it until GitHub use resumes.** How are the fork patches submitted upstream (GitHub fork, or `git format-patch` to the maintainer)? | User decision | M7 |
+| Q8 | ~~How are the fork patches submitted upstream?~~ **Route resolved:** PRs from the GitHub fork, once stable, when the user says so (D089) | User decision on timing | M7 |
 | Q9 | ~~Should a daemon crash keep acknowledged changes that were not fsync'd (G5 `crash`)?~~ **Resolved (D032):** option (b), replies wait for the store commit (no fsync); measured within the §5.7 SLOs. | — | M2 |
 
 ## Handoff notes
@@ -116,9 +119,9 @@ Specifications: `docs/plans/m6.md`.
 <!-- Rewrite at the end of every session: current state and standing notes only, kept short. The session's full
      entry goes at the top of docs/handoff-log.md. -->
 
-- **M4 exit result (2026-11-01, `9a4cd1b`, on `worktree-M4`, not pushed):**
+- **M4 exit result (2026-11-01, `afb99df`, on `worktree-M4`, not pushed):**
   - Passed on this code: `scripts/ci.sh`; `run-all.sh` on the fake in `live remount crash fresh`; pjdfstest; 10 000-case proptests. git 1.50, untar 11.36, read 1048 MB/s, gc 0.90 × cap. slo 13 of 13: `setattr` p99 0.75 ms (limit 2), `fsync` 32.7 ms (limit 40). Report: `target/bench/m4-2026-11-01/report.md`.
-  - **The slo row often cannot get a verdict:** it needs 5 quiet rounds of 15. On 2026-11-01 7 of 8 attempts with the temporary build, the full run, and the first of two reruns at `9a4cd1b` stopped at 3 or 4 quiet rounds. That gives no verdict on the limits; a rerun at a quiet moment can pass. Where the noise comes from is not known: it comes in bursts, sometimes after about 8 quiet probes in a run, so the benchmark's own deletes are a suspect, and btrfs has `discard=async`; discards were seen in only 3 % of 2 s samples, so this is unproven.
+  - **The slo row often cannot get a verdict:** it needs 5 quiet rounds of 15. On 2026-11-01 7 of 8 attempts with the temporary build, the full run, and the first of two reruns at `afb99df` stopped at 3 or 4 quiet rounds. That gives no verdict on the limits; a rerun at a quiet moment can pass. Where the noise comes from is not known: it comes in bursts, sometimes after about 8 quiet probes in a run, so the benchmark's own deletes are a suspect, and btrfs has `discard=async`; discards were seen in only 3 % of 2 s samples, so this is unproven.
   - D087 closed the setattr miss: a WAL fsync and a staging fsync take turns. It costs `fsync` tail margin (Known gaps). The 10 000-case proptests also found an old bug, a zero-length write past the end set the size (M4.16.7); the kernel does not send such writes.
   - Security review: no High or Critical. No race test exists for C-3 and C-4 (fixed by reading the code). Remaining findings: Known gaps.
 - **Current state (2026-11-01):** M4.9–M4.12 are on `master`, pushed (D060 and D061 accepted by the user; D062 proposed). M4.13–M4.16 are committed on `worktree-M4`, full run passed, **not pushed**. Per-session details: `docs/handoff-log.md`.
@@ -127,7 +130,7 @@ Specifications: `docs/plans/m6.md`.
   and M6.2.
 - **The `gc` row runs again (M4.9):** it passes (0.90 × cap, 408 MiB after gc). It was last run from a cache already below the cap,
   so the case "cap lowered with a full cache" is covered there only by a full `all` run and the unit test.
-- **SLOs after M4.10:** the slo row fails on most runs, on the base as well. Six alternating rounds, `64cba69` against
+- **SLOs after M4.10:** the slo row fails on most runs, on the base as well. Six alternating rounds, `342ae90` against
   M4.10: checks 13, 13, 12, 11, 11, 10 against 13, 12, 12, 11, 11, 9 of 13; setattr p99 1.26–3.64 against 0.90–3.04 ms (limit 2);
   rename 0.84–2.59 against 0.84–3.26 ms (limit 2); fsync 26.4–29.1 plus one 78 against 26.9–31.5 plus one 82 ms (limit 30; both
   spikes in round 6, so the machine). fsync's median is 2.4 ms higher (28.7 against 31.1), which six rounds cannot separate from
@@ -143,7 +146,7 @@ Specifications: `docs/plans/m6.md`.
   rows run in subshells, so a stopped row is reported and the others still run. After M4.8: git 1.48 (D072; 3.10–3.47
   before), untar 11.09×, read 1078 MB/s, slo 10–13 of 13. The untar row is noisy on this
   SSD (one base run 16.5×); compare binaries by alternating runs. Swap a binary under a running test with
-  `cp --remove-destination` ("Text file busy" otherwise). M4.5 baseline (3 runs, at `92337ce`):
+  `cp --remove-destination` ("Text file busy" otherwise). M4.5 baseline (3 runs, at `7197651`):
   git 1.89 / 2.68 / 0.42 (noise on both sides, M4.6.3); untar 14.0–15.1× (limit now 15×); read 1043–1094 MB/s;
   slo 14 of 15, fsync p99 34–48 ms (limit now 30 ms), setattr p99 1.70–1.96 ms (limit 2 ms, close); gc SKIP
   (2026-10-28: 2.0 × cap). A full `all` run writes about 4–6 GB to the SSD, 1.5 GB of it in the gc row: skip
@@ -179,7 +182,7 @@ Specifications: `docs/plans/m6.md`.
   handle); the default matrix, CI and benchmarks ran on the final code.
 - **Deviations from docs/plans/m4.md (M4.6):** M4.6.2 keeps the sequential fsync: the parallel flush it specified
   broke the 2 ms namespace SLO (p99 4.7–7.0 ms, D067). M4.6.2 also carries D069, a fix the 10 000-case proptests
-  required (the fault fails on `2380b62` too). M4.6.3's git row gained `sync -f` after the local clone; without it
+  required (the fault fails on `25f8118` too). M4.6.3's git row gained `sync -f` after the local clone; without it
   the spread was 0.41–3.82. "Skipping unchanged rows" and "UPDATE in place" (after M4.6.1) were not specified as a
   task: untar stayed below 12× in alternating runs (10.9–11.6×), though the daemon writes about 310 MiB per untar
   of a 44.5 MB tar, mostly WAL pages of many small commits (a Known gap). M4.6.4: the SDK still decrypts into its
@@ -264,7 +267,7 @@ Specifications: `docs/plans/m6.md`.
   the app exits, and an unmount then takes the 10 s grace period.
 - **`cs/` sources:** `<official SDK checkout>/` is a clone at tag `js/v0.21.0` (`e6a661f5`, cs 0.24), chosen because every existing
   `cs/` line citation matches there.
-- **GitHub postponed (D023):** no PRs, forks, issues or hosted CI. A read-only `git fetch upstream` is allowed.
+- **GitHub (D089, D090):** `origin` is `colsen665/PdMount`, public. No hosted CI; upstream PRs wait for the user. Local checkouts and bare repos from before the milestone rewrite hold the old history: never merge or push from them. Local locations: AGENTS.md, "Local paths".
 - **Deviations from DESIGN.md (already updated there):**
   - The SDK secret cache is in the data directory, the entity cache in the cache directory.
   - The browser is opened with `xdg-open`.
@@ -329,7 +332,7 @@ By milestone.
   `docs/security/2026-10-27-review/` (`verification.md` maps S-n to the area findings)):**
   - Low S-9: a listing applied while a local move into a folder that vanished remotely has just completed can hit
     `expect("counted above")` (`vfs.rs` `apply_listing_at`); the folder looks empty in RAM until relisted, nothing
-    persisted. The 29355a6 fix covers followers, not stamped nodes. Needs a proptest case.
+    persisted. The 4a4eb28 fix covers followers, not stamped nodes. Needs a proptest case.
   - Low S-10: `Retry-After` has no upper bound (fork `error.rs:191`, `http/retry.rs:115-122`; core `events.rs:96-105`
     sleeps it; the journal clamps at 300 s).
   - Low S-12: remote modes keep setuid/setgid/sticky bits (`proton.rs` `parse_mode`, `vfs.rs:73,99`); the mount is

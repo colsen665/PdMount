@@ -15,6 +15,9 @@
 BACKEND=fake
 source "$(dirname "$0")/scenarios/lib.sh"
 
+# Local tool locations (AGENTS.md, "Local paths").
+[[ -f "$repo/.pdmount-local.env" ]] && source "$repo/.pdmount-local.env"
+
 PJDFSTEST=${PJDFSTEST:?set PJDFSTEST to a pjdfstest checkout; see the header of this script}
 list=$repo/tests/pjdfstest.list
 [[ -x "$PJDFSTEST/pjdfstest" ]] ||

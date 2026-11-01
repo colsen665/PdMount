@@ -3,6 +3,7 @@ name = "pdmount"
 description = "Mount Proton Drive \"My Files\" as a FUSE filesystem"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [[bin]]

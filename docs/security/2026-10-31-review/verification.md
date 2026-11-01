@@ -1,9 +1,9 @@
 # Verification of the M4.16 area reports (Fable verifier, 2026-10-31)
 
-Reviewed tree: worktree `4903f03` (`m4-start..4903f03`), SDK fork `pdmount` at `2ae4aa3` (checkout
-`~/.cargo/git/checkouts/proton-sdk-rs2-<hash>/2ae4aa3`). Threat model: `docs/security/threat-model.md` (D070).
+Reviewed tree: worktree `686ded8` (`m4-start..686ded8`), SDK fork `pdmount` at `caafaea` (checkout
+`~/.cargo/git/checkouts/proton-sdk-rs2-<hash>/caafaea`). Threat model: `docs/security/threat-model.md` (D070).
 Area reports: `area1.md` … `area3.md` in this directory (finding IDs B1-n … B3-n; B1-4's six hardening items are verified one by
-one). Read-only: every code path below was traced in the source; nothing was run. Line numbers are of the worktree at `4903f03`.
+one). Read-only: every code path below was traced in the source; nothing was run. Line numbers are of the worktree at `686ded8`.
 
 No finding is High or Critical, so no M4.17.n fix is required by this review. Nothing High or Critical was noticed while tracing.
 

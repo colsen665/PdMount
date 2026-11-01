@@ -16,6 +16,9 @@
 BACKEND=fake
 source "$(dirname "$0")/scenarios/lib.sh"
 
+# Local tool locations (AGENTS.md, "Local paths").
+[[ -f "$repo/.pdmount-local.env" ]] && source "$repo/.pdmount-local.env"
+
 FSX=${FSX:?set FSX to the fsx binary; see the header of this script}
 FSX_DURATION=${FSX_DURATION:-21600}
 FSX_SEED=${FSX_SEED:-$(date +%s)}

@@ -1,0 +1,35 @@
+# Exemptions for the publishing scan: generic paths only, never private values (D090).
+[[allowlists]]
+description = "Made-up home directory in unit tests"
+regexes = ['''/home/u\b''']
+
+[[allowlists]]
+description = "PdMount's files and default mountpoints on the target system"
+regexes = [
+  '''(?:~|\$HOME)/\.config/pdmount\b''',
+  '''(?:~|\$HOME)/\.local/share/pdmount\b''',
+  '''(?:~|\$HOME)/\.local/state\}?/pdmount\b''',
+  '''(?:~|\$HOME)/\.cache/pdmount\b''',
+  '''(?:~|\$HOME)/ProtonDrive\b''',
+  '''~/Drive\b''',
+  '''~/(?:metrics|node-exporter)/pdmount\.prom\b''',
+]
+
+[[allowlists]]
+description = "Standard locations on the target system"
+regexes = [
+  '''~/\.config/(?:autostart|systemd/user|rc/init\.d)\b''',
+  '''~/\.cache/thumbnails\b''',
+  '''~/\.local(?:/share)?(?:[^/\w.-]|$)''',
+]
+
+[[allowlists]]
+description = "Default state directories of the test scripts"
+regexes = ['''(?:~|\$HOME)/\.cache/pdmount-(?:scenarios|bench)\b''']
+
+[[allowlists]]
+description = "Cargo's public source copies, and pdcli's default config, as cited in the docs"
+regexes = [
+  '''~/\.cargo/(?:registry/src|git/checkouts)\b''',
+  '''~/\.config/pdcli\b''',
+]

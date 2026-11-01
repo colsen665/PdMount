@@ -6,20 +6,26 @@ entry. At the end of a session, add its entry at the top of "Session entries" (A
 
 ## Session entries
 
-- **Decision review (2026-11-01, Opus; on `master`):** M4 pushed to `master` (`417a036`) on the user's request. The user accepted D057, D062, D068, D070, D071, D072, D085 and D087. The user amended D085 (D088): `move_passphrases` and its tests and the `rusqlite` dependency of `crates/pdmount` are gone. Before clearing, `default` had its passphrase in `sdk-keys.db` and `second` had one in `sdk-secrets.db`; both had empty journals and staging tables, and `second` held 6 conflict records and one orphan staging file (test data). `logout` on both got HTTP 401 from `/auth/v4`, so neither session was ended on the server (cause not looked into); both directories under `~/.local/share/pdmount` and `~/.cache/pdmount` were deleted, logs kept. The user wiped their own mount's state too and logged `default` in again: its passphrase is in `sdk-keys.db`, none in `sdk-secrets.db`. `scripts/ci.sh` (full) passed on `1f96727`.
+- **Publication (2026-11-01, Opus; D089, D090):** the maintainer was told and replied; the user took that as the go-ahead and raised the logging problem again in a follow-up mail. The SDK fork was recreated and pushed: `pdmount`, 18 patch branches, `pin/*`, `base/0.4.0`; `main` is upstream's plus the user's README note. `base/0.4.0` was retagged because its tagger was an old identity. GitHub's fork network keeps a deleted fork's objects, so those stay fetchable by hash. Upstream is at 0.5.1; the patches stay on `base/0.4.0` (TODO.md, Next action).
 
-- **M4 exit (2026-11-01, Opus; M4 ticked, not pushed):** the user chose to find the cause of the setattr miss rather than raise the limit. Temporary timing logs, not committed: commits of 2 ms or more ran inside a WAL `fdatasync` (272 of 275); a stand-alone SQLite test shows the stall only when that overlaps a `fdatasync` of another file; replies over 30 ms were the `TRUNCATE` checkpoint. D087: the two kinds of fsync take turns (`9a4cd1b`). A false lead: 4120-byte appends do not stall, and an early SQLite test was void because identical `UPDATE`s write no WAL frames.
+- **Publication rework (2026-11-01, Opus; D089, D090, nothing pushed):** the user chose a public fork after a scan, the maintainer told first, and P16 unchanged. A Betterleaks v1.9.0 scan of this history and of the fork found test values only here, and hits in upstream's commits only there; the 44 commits on top of `base/0.4.0` are clean, so the fork's hashes stand. Exemptions are in `.betterleaks.toml` and `.betterleaksignore`. Full `scripts/ci.sh` on the new top commit.
+
+- **GitHub (2026-11-01, Opus; D089, D090):** real fork of the SDK and MIT repo. The fork's history was rewritten with `git filter-branch`: 40 commits, patch branch trees unchanged, upstream hashes unchanged. PdMount's history was rewritten before publication; it has one commit per milestone, each a cleaned tree, and local locations moved to `.pdmount-local.env`. gitleaks was not used, as the sandbox refused running downloaded tools; the secret scan was a masked pattern scan. Rule for each push: full `scripts/ci.sh` first (D084).
+
+- **Decision review (2026-11-01, Opus; on `master`):** M4 pushed to `master` (`1c0dbd4`) on the user's request. The user accepted D057, D062, D068, D070, D071, D072, D085 and D087. The user amended D085 (D088): `move_passphrases` and its tests and the `rusqlite` dependency of `crates/pdmount` are gone. Before clearing, `default` had its passphrase in `sdk-keys.db` and `second` had one in `sdk-secrets.db`; both had empty journals and staging tables, and `second` held 6 conflict records and one orphan staging file (test data). `logout` on both got HTTP 401 from `/auth/v4`, so neither session was ended on the server (cause not looked into); both directories under `~/.local/share/pdmount` and `~/.cache/pdmount` were deleted, logs kept. The user wiped their own mount's state too and logged `default` in again: its passphrase is in `sdk-keys.db`, none in `sdk-secrets.db`. `scripts/ci.sh` (full) passed on `bc03e80`.
+
+- **M4 exit (2026-11-01, Opus; M4 ticked, not pushed):** the user chose to find the cause of the setattr miss rather than raise the limit. Temporary timing logs, not committed: commits of 2 ms or more ran inside a WAL `fdatasync` (272 of 275); a stand-alone SQLite test shows the stall only when that overlaps a `fdatasync` of another file; replies over 30 ms were the `TRUNCATE` checkpoint. D087: the two kinds of fsync take turns (`afb99df`). A false lead: 4120-byte appends do not stall, and an early SQLite test was void because identical `UPDATE`s write no WAL frames.
   - Full run on this code: `scripts/ci.sh`, matrix, pjdfstest, 10 000-case proptests, git 1.50, untar 11.36, read 1048 MB/s, gc 0.90 × cap passed; slo stopped at 4 quiet rounds of 15. The attempt before it did not count: CI stopped at `cargo fmt` on my new test, and its proptests found the zero-length write bug (M4.16.7, reproduced by a regression case first); its slo row passed 13 of 13.
-  - slo at `9a4cd1b`: attempt 1 stopped at 3 quiet rounds; attempt 2 passed 13 of 13 (4 rounds not counted), `setattr` p99 0.75 ms, `fsync` 32.7 ms. Attempts were capped at 3, retried on the quiet-round count only.
+  - slo at `afb99df`: attempt 1 stopped at 3 quiet rounds; attempt 2 passed 13 of 13 (4 rounds not counted), `setattr` p99 0.75 ms, `fsync` 32.7 ms. Attempts were capped at 3, retried on the quiet-round count only.
   - The toolchain line in `AGENTS.md` was stale (1.99 nightly): builds use 1.98.1 stable. The user installed rustup for the sandbox user with the `gentoo` default, for Miri in another session; the compiler stayed the same.
 
-- **M4.16 fixes and final run (2026-10-31, Opus; M4 not ticked):** the user chose "Median, quiet disk" (D086: fsync limit 40 ms, median of 5 rounds, other limits stay) and "Five plus cheap Lows". Commits: `2374308` C-1, R-11, R-13; `263d651` C-2, R-10 (live corruption of the new staging file, reproduced by a test first: it grew from 1 to 4,194,315 bytes); `d2e1129` C-3; `6c1a3af` C-4; `92066fe` C-5, R-7; `1a8b8e3` D086. C-3 and C-4 have no race test.
-  - Final run at `1a8b8e3`, 13:53–16:00: `scripts/ci.sh`, matrix on the fake (`live remount crash fresh`), pjdfstest, 10 000-case proptests passed. git 1.50, untar 11.24, read 1049 MB/s, gc 0.90 × cap pass. **slo fails on setattr:** median p99 3.00 ms, limit 2; rounds 3.28, 3.00, 3.75, 1.51, 2.32. fsync median 30.7 ms passes. 5 of 5 rounds quiet.
+- **M4.16 fixes and final run (2026-10-31, Opus; M4 not ticked):** the user chose "Median, quiet disk" (D086: fsync limit 40 ms, median of 5 rounds, other limits stay) and "Five plus cheap Lows". Commits: `ec77a7c` C-1, R-11, R-13; `815a25a` C-2, R-10 (live corruption of the new staging file, reproduced by a test first: it grew from 1 to 4,194,315 bytes); `4c1916d` C-3; `3d22f06` C-4; `bebd5ee` C-5, R-7; `df3d38b` D086. C-3 and C-4 have no race test.
+  - Final run at `df3d38b`, 13:53–16:00: `scripts/ci.sh`, matrix on the fake (`live remount crash fresh`), pjdfstest, 10 000-case proptests passed. git 1.50, untar 11.24, read 1049 MB/s, gc 0.90 × cap pass. **slo fails on setattr:** median p99 3.00 ms, limit 2; rounds 3.28, 3.00, 3.75, 1.51, 2.32. fsync median 30.7 ms passes. 5 of 5 rounds quiet.
   - Diagnosis (scratch copies of `ops.py`, not committed; the numbers are in `TODO.md`): the tail belongs to the first committing operation after an fsync with other clients' fsyncs running, not to setattr. What it waits on is not established. A simple append-during-`fdatasync` test on btrfs does not reproduce it.
 
 - **Passphrase eviction fix (2026-10-31, Opus):** the M4.15 blocker, D085. `secret_cache.rs` keeps `account:passphrase:*` in `sdk-keys.db` (no cap) and moves existing ones when the caches open; `map_error` turns locked keys into `Unauthorized`; `status` reports it and `mount` comes up waiting for the sign-in (`known_root_for_login`). No fork change. Checked with `status` on profile `default`, read-only: "needs login, run `pdmount login`" instead of the error; the passphrase there was already gone, so the user signed in again (`<test account>`). After it the passphrase is in `sdk-keys.db` and none in `sdk-secrets.db`. The next mount drained the 12 parked trash steps in about 30 s; `pdmount-test/untar/` is gone; unmounted afterwards. A daemon sitting in `needs_login` while the login happens was not run on the real account: the login was done with no mount up. Full `scripts/ci.sh` passed.
 
-- **M4.15 (2026-10-31, Opus; the user agreed in the session):** real account, `74cabab`, P7 on (4 files, 5 blocks). Everything under `pdmount-test/`. No 429 in any run. Step 3 (optional matrix) not run.
+- **M4.15 (2026-10-31, Opus; the user agreed in the session):** real account, `59a5b13`, P7 on (4 files, 5 blocks). Everything under `pdmount-test/`. No 429 in any run. Step 3 (optional matrix) not run.
   - G2 and G3 (`G3_COMMITS=200`) `live`: PASS, 82 s and 77 s to acknowledge, then about 10.5 min to drain. 1113 uploads, 3298 backend calls, `rate_limited` 0, nothing parked. `backend_upload_new` p50 1.96 s, p99 4.02 s.
   - Untar of the M4.3 tar (5000 files, 100 folders) into `pdmount-test/untar/`: acknowledged in 1.14 s, drained in 1675 s (27.9 min). 5000 uploads, 5250 backend calls, `rate_limited` 0, 0 429 lines in the log, `deadline_expired` 0, `hot_path_network_calls` 0. Steady about 3.0 uploads/s from start to end. p99: `upload_new` 3.11 s (p50 1.17 s, max 4.13 s), `create_folder` 348 ms, `get_nodes` 2.82 s, `poll_events` 398 ms, `storage_info` 634 ms.
   - Q7 answered: no 429 at this load. The rate is what 4 concurrent uploads at about 1.2 s each give, so this is no server limit; no default change proposed. The server content of the untar was not read back: the check is that all 5000 uploads were committed. 
@@ -72,8 +78,8 @@ entry. At the end of a session, add its entry at the top of "Session entries" (A
     `control.rs`. Both reverted; the first two matrices are `target/m4.8/invalid-suite-*`.
   - **Open:** setattr p99 on the current tree against base (TODO "SLOs after M4.8"), unexplained. The conflict hazard of dirty
     pages is from reading the kernel, not from a test.
-- **M4.6.1–M4.6.4 (2026-10-29, Opus):** performance fixes from "M4.5 outcomes", one commit each (`eda253e`,
-  `b83b0e9`, `82bcf5a`, and M4.6.4). Results in `target/m4.6/` (not committed); full numbers in the commit bodies.
+- **M4.6.1–M4.6.4 (2026-10-29, Opus):** performance fixes from "M4.5 outcomes", one commit each (`182b07a`,
+  `a0f30d6`, `0713d59`, and M4.6.4). Results in `target/m4.6/` (not committed); full numbers in the commit bodies.
   - **M4.6.1** (E2, E12): `prepare_cached` in `write_rows` and the cache index writes; `Store::after` waits in a
     waiter list the writer drains after each commit (no no-op write). CI and 10 000-case proptests pass. On the SSD
     the gain is within noise (untar A/B medians 1.22–1.65 s for every variant); on tmpfs untar 0.84 → 0.54 s,
@@ -85,7 +91,7 @@ entry. At the end of a session, add its entry at the top of "Session entries" (A
     (WAL fsync overlapping the staging fsync on btrfs stalls the writer). Kept sequential: fsync p50 15–19 ms, p99
     28.7–31.5 ms, namespace p99 0.62–0.83 ms (slo alone, 3 alternating rounds). The first A/B used the same binary
     for all runs ("Text file busy" on `cp` while the previous daemon exited); rerun with `cp --remove-destination`.
-  - **D069 (in M4.6.2):** the 10 000-case `two_devices_and_an_app_converge` failed on a case that fails on `2380b62`
+  - **D069 (in M4.6.2):** the 10 000-case `two_devices_and_an_app_converge` failed on a case that fails on `25f8118`
     too (16/20 replays): a clashed, never uploaded file unlinked, then a restart before the queued listing ran, left
     the app's node hidden for good. The relist queue is now kept in `meta` (`relist`) until each listing succeeds and
     requeued at start. Shrunk to 6 steps by a step-skipping replay (`REPLAY_SKIP`, removed again); now in
@@ -103,7 +109,7 @@ entry. At the end of a session, add its entry at the top of "Session entries" (A
 
 - **M4.5 (2026-10-29, Opus):** baseline measurement, profiling, triage. Outcomes, baseline table, experiments and the
   M4.6.1–M4.6.4 specs: `docs/plans/m4.md`, "M4.5 outcomes".
-  - Baseline at `92337ce`, `scripts/bench/m4.sh` three times (`target/m4.5/bench-{1,2,3}/`):
+  - Baseline at `7197651`, `scripts/bench/m4.sh` three times (`target/m4.5/bench-{1,2,3}/`):
     - git 1.89 / 2.68 / 0.42 (noisy on both sides);
     - untar 14.04 / 14.01 / 15.10;
     - read 1043 / 1081 / 1094 MB/s;
@@ -145,8 +151,8 @@ entry. At the end of a session, add its entry at the top of "Session entries" (A
     `running_out_of_descriptors_is_retryable`, mounted `mount_keeps_more_pending_files_than_descriptors` (re-runs itself
     under `prlimit --nofile=512`, 2000 files written and read back with uploads held by a 1 h debounce, then drained;
     about 32 s). Checked that it fails (EMFILE at the first few hundred writes) with an unbounded capacity.
-  - M4.7: fork branch `feat/block-parallelism` `cc50981` from `pdmount` (`with_block_transfer_parallelism`,
-    `TransferQueue::with_max_degree_of_parallelism`, 2 tests), merged as `2ae4aa3`, fork workspace tests 290 pass;
+  - M4.7: fork branch `feat/block-parallelism` `faf4691` from `pdmount` (`with_block_transfer_parallelism`,
+    `TransferQueue::with_max_degree_of_parallelism`, 2 tests), merged as `caafaea`, fork workspace tests 290 pass;
     pinned. PdMount: `session::TransferLimits` passed to `drive_client`, `proton_backend`, `proton_backend_offline`,
     `Auth` (re-login), `status`, `trash`, probe; `upload.concurrency` 1–4 (error names D033).
   - Correction to the plan: `download_verified` does use the client's download queue (one block permit), so its limit
@@ -216,7 +222,7 @@ entry. At the end of a session, add its entry at the top of "Session entries" (A
   M0–M3 checklists and the Done list moved here unchanged; `TODO.md` keeps the current state, the standing notes and a
   new "Known gaps" section (about 5k tokens). AGENTS.md (document map, end-of-session rule) and D021 (amendment)
   updated. Before that, the user had `worktree-M4` merged into `master` in the main checkout (fast-forward to
-  `799b1dd`, `.claude/` ignored) and pushed to `origin`.
+  `4139b1a`, `.claude/` ignored) and pushed to `origin`.
 
 - **M4.0.2.4 (2026-10-28, Opus):** test-script safety (S-7, S-8).
   - `lib.sh`: `private_root` (mkdir 0700, refuse a symlink or another user's directory, chmod 0700) for
@@ -228,7 +234,7 @@ entry. At the end of a session, add its entry at the top of "Session entries" (A
     names the refusals.
   - `scripts/ci.sh` PASS (`target/m4.0.2/ci-4.out`).
   - Session summary (M4.0.2.1–M4.0.2.4): 10 000-case proptests after M4.0.2.3: PASS (486 s, `target/m4.0.2/proptests.out`). Fork `pdmount` is at
-    `28cacff` (P16, P17). Where to work: this worktree, `.claude/worktrees/M4` (branch `worktree-M4`); nothing pushed.
+    `631b4aa` (P16, P17). Where to work: this worktree, `.claude/worktrees/M4` (branch `worktree-M4`); nothing pushed.
 
 - **M4.0.2.3 (2026-10-27, Opus):** bounds on remote claimed sizes (S-5, S-6).
   - `proton.rs` `file_size`: the saturating sum of the claimed block sizes wins over a differing claimed size (DEBUG
@@ -244,7 +250,7 @@ entry. At the end of a session, add its entry at the top of "Session entries" (A
   - `scripts/ci.sh` PASS (`target/m4.0.2/ci-3.out`).
 
 - **M4.0.2.2 (2026-10-27, Opus):** manifest verification on block-map reads (S-4, S-11).
-  - Fork P17 (`feat/block-map-manifest`, `d6e26ba` + `b0da02f`; `pdmount` `28cacff`, pinned): `get_block_map` verifies the
+  - Fork P17 (`feat/block-map-manifest`, `6f6276d` + `5dd08b3`; `pdmount` `631b4aa`, pinned): `get_block_map` verifies the
     manifest signature over the listed thumbnail and block hashes (`verify_block_listing`; key selection shared with
     the full download as `manifest_verification_keys`) and refuses an empty block hash. PdMount's `map_error` already
     mapped both errors to `Integrity`; a test now covers the manifest one. `block_map()` caches only `Ok` maps.
@@ -253,15 +259,15 @@ entry. At the end of a session, add its entry at the top of "Session entries" (A
     2026-10-27): `MODES=fresh tests/scenarios/run-all.sh sha`, read-only, plus reads of PdMount-uploaded files under
     `pdmount-test/`. First run: FAIL, 989 files EIO in 52 min (no 429): `get_address_public_keys` had never
     worked (its response type does not match the server's `keys/all` answer), so every address-signed file failed
-    before any signature was checked. Fixed in the fork (`b0da02f`, docs/sdk-patches.md P17). The failed lookups
-    were not cached, so each failing read repeated a listing and a `keys/all` call; Known gaps. Second run (`28cacff`):
+    before any signature was checked. Fixed in the fork (`5dd08b3`, docs/sdk-patches.md P17). The failed lookups
+    were not cached, so each failing read repeated a listing and a `keys/all` call; Known gaps. Second run (`631b4aa`):
     PASS, all 1004 files match, 735 s (cold `sha256sum` 12 min), no WARN/ERROR, no 429, 0 hot-path calls; then 115
     files under `pdmount-test/` (15 per scenario folder, under 20 MiB) read without error. Logs: `target/m4.0.2/real-*`.
   - Behaviour change: a revision whose listing fails the check is EIO on every read (docs/sdk-patches.md).
   - `scripts/ci.sh` PASS (`target/m4.0.2/ci-2.out`).
 
 - **M4.0.2.1 (2026-10-27, Opus):** secrets out of logs (S-1 High, S-2, S-3).
-  - Fork P16 (`fix/no-secret-logs`, `ed2a9a6`; `pdmount` `e931883`, pinned): the passphrase, address-key, `/users`,
+  - Fork P16 (`fix/no-secret-logs`, `9290db0`; `pdmount` `946cf96`, pinned): the passphrase, address-key, `/users`,
     probe-body and serialized-passphrase debug logs are gone, and so are the drive SDK's share, thumbnail-block,
     link-move, copy, link-details and trash body logs; trash/share/thumbnail decode errors drop the body. The fork's
     generic decode helpers still put a malformed reply's body into the error (Known gaps, Low).
@@ -369,7 +375,7 @@ entry. At the end of a session, add its entry at the top of "Session entries" (A
   - Core infra and CLI: `store_layout` (twice), `paths::sqlite_files` (four loops), `doctor::find_in_path` reused by
     `notify`, `access::parse_mode`/`RuleSource::as_str`/`Connectivity::parse` in core, `reply_empty` in the FUSE
     adapter (six matches).
-  - Bug found by the 10 000-case proptest while checking this part (pre-dates the review: `a24c39b` fails the same
+  - Bug found by the 10 000-case proptest while checking this part (pre-dates the review: `00a84c7` fails the same
     replay on its first run): a listing that finds a folder gone removed its whole subtree, including a node the
     same listing shows here (the remote moved it out, then trashed the folder). The listing then needed an inode
     number it had not counted and panicked (`counted above`), so the event page failed for good. Followers inside a
@@ -718,8 +724,8 @@ entry. At the end of a session, add its entry at the top of "Session entries" (A
   - Do not smoke-test `pdmount login` without a running daemon: it starts a real web login (it only waits for a link, but it
     calls Proton).
 - **M3.1 (2026-10-22, Opus):**
-  - Fork: P14 `feat/caller-name-hash` (`2137adc`) and P15 `fix/link-trash-time` (`30c061a`), merged into `pdmount`
-    `d1c8994`, pinned; the fork's 281 tests pass. Edits to the fork's mixed CRLF/LF files went through a script that
+  - Fork: P14 `feat/caller-name-hash` (`0389db3`) and P15 `fix/link-trash-time` (`0459ebb`), merged into `pdmount`
+    `c837e03`, pinned; the fork's 281 tests pass. Edits to the fork's mixed CRLF/LF files went through a script that
     keeps each region's line endings (`git show --stat` stays small).
   - P15 fixes a real M2 bug on the real account: `trashed` was never set (F16), so an event for a node trashed on another
     device looked like an echo and was ignored. Approved by the user (D044).
@@ -880,11 +886,11 @@ entry. At the end of a session, add its entry at the top of "Session entries" (A
 - **Review:** the user reviews M3 with Opus at the end: `/code-review` over `m3-start..HEAD`.
 
 - **Done this session (2026-10-20/21):**
-  - D034 accepted by the user (`dae0dec`).
-  - Committed after `dae0dec` in one commit: M2.9 (pjdfstest, fsx and their fixes) and the M2.10 real-account check
+  - D034 accepted by the user (`ac21af3`).
+  - Committed after `ac21af3` in one commit: M2.9 (pjdfstest, fsx and their fixes) and the M2.10 real-account check
     (D035 proposed); full `scripts/ci.sh` and the property tests at 10 000 cases pass on it.
   - D035 checked against `cs/README.md`'s operational requirements: no rule broken, but one request per node where the
-    official SDKs batch. Fork patch P13 (`feat/fresh-node-batch` `7b4dcf9`, merged into `pdmount` `4548aa7`, pinned):
+    official SDKs batch. Fork patch P13 (`feat/fresh-node-batch` `f245e14`, merged into `pdmount` `7c92076`, pinned):
     `get_nodes_uncached`, 50 links per `get_details`; the adapter's `get_nodes` uses it; D035 amended, then accepted by the user.
     Run against the real account in the M2.8 matrix. The fork's files mix CRLF and LF: edit them with an editor that keeps line
     endings (a Python rewrite turned `node/mod.rs` into a whole-file diff).
@@ -918,9 +924,9 @@ Moved from `TODO.md` once the milestones were done; `TODO.md` keeps the mileston
 ### M0 tasks (in order)
 
 - [x] M0.1 Decide where the SDK fork is hosted (Q4): local bare repo `<fork>` (D022). Created, with branch `pdmount` and tag `base/0.4.0`.
-- [x] M0.2 All patches P1–P12 applied: one branch per patch, each with its own commit and tests. Merged into fork `pdmount` (`9176b0f`).
+- [x] M0.2 All patches P1–P12 applied: one branch per patch, each with its own commit and tests. Merged into fork `pdmount` (`8c7ff8b`).
   The combined branch passes 236 SDK tests (baseline 150) and pdcli's tests, and passes `cargo fmt --check`.
-- [x] M0.3 Workspace with `pdmount-core`, `pdmount-backend` and `pdmount`, `[patch.crates-io]` pinned to fork `9176b0f`, and clippy config.
+- [x] M0.3 Workspace with `pdmount-core`, `pdmount-backend` and `pdmount`, `[patch.crates-io]` pinned to fork `8c7ff8b`, and clippy config.
   `pdmount-fuse` is created in M1 together with its first code.
 - [x] M0.4 `Backend` trait, `FakeBackend` and Proton adapter:
   - The fake backend models name uniqueness, base-revision and name-hash preconditions, trash, quota, paged events with
@@ -1099,11 +1105,11 @@ Specifications: `docs/plans/m3.md` (one task per session, one commit per task, D
 
 ## Done
 
-- [x] 2026-10-19 Design documents: DESIGN.md, docs/pdcli-evaluation.md, docs/sdk-patches.md, README.md (`ea4b9b9`).
+- [x] 2026-10-19 Design documents: DESIGN.md, docs/pdcli-evaluation.md, docs/sdk-patches.md, README.md (`13d1e45`).
 - [x] 2026-10-19 SDK fork bare repo created (M0.1, D022).
-- [x] 2026-10-19 SDK patches P1–P12 (M0.2), fork `pdmount` `9176b0f`.
+- [x] 2026-10-19 SDK patches P1–P12 (M0.2), fork `pdmount` `8c7ff8b`.
 - [x] 2026-10-19 M0.3–M0.7: workspace, backend, auth, doctor, local CI.
-- [x] 2026-10-19 Handoff docs: AGENTS.md, CLAUDE.md, docs/decisions.md, TODO.md (the commit after `ea4b9b9`; `git log -1 -- AGENTS.md`).
+- [x] 2026-10-19 Handoff docs: AGENTS.md, CLAUDE.md, docs/decisions.md, TODO.md (the commit after `13d1e45`; `git log -1 -- AGENTS.md`).
 - [x] 2026-10-19 M0 exit check passed (browser opening waived).
 - [x] 2026-10-20 D011–D020 and D025–D027 accepted by the user.
 - [x] 2026-10-20 M2.0: D024 keyring hang reproduced with `scripts/repro/keyring-d024.sh`.

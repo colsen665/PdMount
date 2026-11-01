@@ -50,8 +50,8 @@ Rules for this log:
 | D019 | Denied writes return EROFS | accepted | claude | 2026-10-19 |
 | D020 | No AutoUnmount without `user_allow_other` | accepted (systemd part superseded by D059) | claude | 2026-10-19 |
 | D021 | Handoff docs: AGENTS.md (CLAUDE.md refers to it), TODO.md, this log | accepted | user | 2026-10-19 |
-| D022 | SDK fork hosted in a local bare repo | accepted | user | 2026-10-19 |
-| D023 | GitHub use postponed until further notice | accepted | user | 2026-10-19 |
+| D022 | SDK fork hosted in a local bare repo | superseded by D089 | user | 2026-10-19 |
+| D023 | GitHub use postponed until further notice | superseded by D089 | user | 2026-10-19 |
 | D024 | Keyring calls time out after 20 s and fall back to 0600 files | superseded by D029 | claude | 2026-10-19 |
 | D025 | Startup revalidation of listed directories until the event engine exists | superseded by D034 | claude | 2026-10-19 |
 | D026 | The mount daemon re-executes itself instead of forking | accepted | claude | 2026-10-19 |
@@ -117,6 +117,8 @@ Rules for this log:
 | D086 | The §5.7 SLO row is the median of 5 rounds on a quiet disk; `fsync` p99 < 40 ms (amends D057, D066) | accepted | user | 2026-10-31 |
 | D087 | A WAL fsync and a staging fsync take turns, so commits do not stall behind them | accepted | claude | 2026-11-01 |
 | D088 | No migration of passphrases stored before D085; such a profile logs in once (amends D085) | accepted | user | 2026-11-01 |
+| D089 | On GitHub: a real fork of the SDK and a public MIT repo, with rewritten history; upstream PRs once stable (supersedes D022, D023; history part superseded by D090) | accepted | user | 2026-11-01 |
+| D090 | PdMount's history is one commit per milestone; no references to local files or machine details in the repository | accepted | user | 2026-11-01 |
 
 ---
 
@@ -348,7 +350,7 @@ Rules for this log:
 - **Refs:** AGENTS.md; TODO.md; docs/handoff-log.md.
 
 ## D022 — SDK fork hosted in a local bare repo
-- **Status:** accepted
+- **Status:** superseded by D089
 - **Decided by:** user
 - **Date:** 2026-10-19
 - **Context:** D002 requires a fork of the SDK. Its hosting was open (TODO.md Q4).
@@ -366,7 +368,7 @@ Rules for this log:
 - **Refs:** docs/sdk-patches.md "Fork repository"; TODO.md Q4, Q8. The CI consequence was revised by D023: CI runs locally and reads the fork through `file://`, so no mirror is needed.
 
 ## D023 — GitHub use postponed until further notice
-- **Status:** accepted
+- **Status:** superseded by D089
 - **Decided by:** user
 - **Date:** 2026-10-19
 - **Context:** Upstream PRs (D002), hosted CI (DESIGN.md §15.1) and a possible GitHub fork (D022, Q8) all assumed GitHub.
@@ -1598,7 +1600,7 @@ Rules for this log:
 - **Decided by:** claude
 - **Date:** 2026-10-29
 - **Context:** The 10 000-case run of `two_devices_and_an_app_converge` during M4.6.2 found a case that fails on master
-  too (16 of 20 replays at `2380b62`): B creates `/a` while the app creates `/a` on the drive; B's event sync hides the
+  too (16 of 20 replays at `25f8118`): B creates `/a` while the app creates `/a` on the drive; B's event sync hides the
   app's node behind its own (a clash, D040); B unlinks its `/a` before it uploads, which queues a listing of the root
   (D046); B restarts before the executor runs it. The queue was memory only, and the unlinked node's row is gone, so
   nothing listed the root again: the app's `/a` stayed hidden on B for good. D046 had left persistence out because "a
@@ -2003,3 +2005,40 @@ Rules for this log:
 - **Alternatives:** Keeping the move (code and tests for one login saved, on no one's behalf).
 - **Consequences:** No profile is left with a passphrase in the old place: the user unmounted and wiped their own mount's state the same day.
 - **Refs:** D085; DESIGN.md §12.4.
+
+## D089 — On GitHub: a real fork of the SDK and a public MIT repo, with rewritten history; upstream PRs once stable
+- **Status:** accepted
+- **Decided by:** user
+- **Date:** 2026-11-01
+- **Context:** Before M5 the project goes on GitHub. It pinned the SDK through a local `file://` path, so nobody else could build it.
+- **Decision:**
+  - The SDK fork is a real GitHub fork of `tirbofish/proton-sdk-rs2`, `colsen665/proton-sdk-rs2` (claude's recommendation). PdMount pins it over HTTPS, and every pinned commit has a `pin/<short>` tag.
+  - PdMount is public under the MIT licence, at `colsen665/PdMount`.
+  - The fork's history was rewritten before its first push: author and committer are `colsen665@proton.me`; upstream's commits keep their hashes. PdMount's history: see D090.
+  - Upstream PRs go from the fork once the patches are stable, when the user says so; this answers Q8's route. Hosted CI and Actions stay off.
+- **Alternatives:** A separate new repo for the SDK: it would run the SDK's workflows, hide where the code came from, and give no PR route. Keeping the history: every hash in the docs would have stayed valid, but commits would not link to the account.
+- **Consequences:**
+  - Hashes of fork commits in the docs are the rewritten ones.
+  - The fork is published once its commits pass the publishing scan (D090). The scan changed no commit, so the hashes hold.
+  - The fork's fixes and `docs/sdk-patches.md` P16 on secrets in upstream 0.4.0's debug logs go public with the fork. The maintainer is told privately before anything is pushed, and P16 keeps its plain wording (user's choices). The fork goes up before PdMount, so PdMount builds from its first public commit.
+  - The repository is public from here on: no account names or personal paths (AGENTS.md).
+- **Refs:** docs/sdk-patches.md "Fork repository"; AGENTS.md "Git"; TODO.md Q8; D002, D022, D023.
+
+## D090 — PdMount's history is one commit per milestone; no references to local files or machine details in the repository
+- **Status:** accepted
+- **Decided by:** user
+- **Date:** 2026-11-01
+- **Context:** PdMount goes public. Local paths in its documents or history would point an attacker at what to steal, so the user asked for a rewrite before publication.
+- **Decision:**
+  - The repository has one commit per milestone (M0–M4) and one for the GitHub setup, each a cleaned tree.
+  - References to local files never go in documents or git history, SSH key paths included. Locations go in the gitignored `.pdmount-local.env` (AGENTS.md, "Local paths"); an agent that cannot find one asks the user and stores it there. `tests/fsx.sh` and `tests/pjdfstest.sh` read theirs from it.
+  - PdMount's own paths, standard system paths and test values stay: they describe the software on any machine.
+  - Machine details stay limited to the operating system and filesystem, on which design and test choices depend (Gentoo, btrfs); citations of Linux source versions stay. Disk models, device names and usernames stay out.
+  - `docs/security/` stays in the repository unless it reveals details of the local system. The repository is public; the user reviews before each publication step of this rewrite.
+  - A Betterleaks scan covers the whole history before publication, with rules for credentials and for local references. False positives are exempted by pattern, never by private value, in the tracked `.betterleaks.toml` and `.betterleaksignore`.
+- **Alternatives:** One commit for everything (loses the outline). Filtering all 123 commits (keeps log and bisect, but relies on patterns finding everything).
+- **Consequences:**
+  - Commit-level history before 2026-11-01 is gone from the repository, and so are the tags `m3-start` and `m4-start`. Hashes of PdMount commits in older documents, such as `docs/handoff-log.md`, resolve nowhere; hashes of fork commits still do.
+  - A new checkout needs `.pdmount-local.env` before it can push or run fsx or pjdfstest.
+  - Only the top commit was built and tested. The M0–M4 commits are snapshots that pin the fork's `pin/*` tags; they may not build.
+- **Refs:** AGENTS.md "Git", "Local paths"; D089.

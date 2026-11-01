@@ -1,4 +1,4 @@
-## Area 2 (`crates/pdmount-core` and `crates/pdmount-fuse`, M4 changes `m4-start..4903f03`): findings
+## Area 2 (`crates/pdmount-core` and `crates/pdmount-fuse`, M4 changes `m4-start..686ded8`): findings
 
 Reviewed from `git diff m4-start..HEAD -- crates/pdmount-core crates/pdmount-fuse` plus the full current `staging.rs`,
 `engine/pins.rs`, `engine/queue.rs` and the engine/journal paths they call. Threat model: `docs/security/threat-model.md`

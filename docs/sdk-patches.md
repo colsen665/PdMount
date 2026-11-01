@@ -4,27 +4,29 @@ PdMount depends on `proton-drive-sdk` 0.4 and `proton-sdk-rs2` 0.4 through a for
 
 ```toml
 [patch.crates-io]
-proton-drive-sdk = { git = "file://<local bare repo>", rev = "<pinned sha on pdmount>" }
-proton-sdk-rs2   = { git = "file://<local bare repo>", rev = "<pinned sha on pdmount>" }
+proton-drive-sdk = { git = "https://github.com/colsen665/proton-sdk-rs2", rev = "<pinned sha on pdmount>" }
+proton-sdk-rs2   = { git = "https://github.com/colsen665/proton-sdk-rs2", rev = "<pinned sha on pdmount>" }
 ```
 
 ## Fork repository
 
-Decision D022.
+Decisions D022, D089.
 
 | Item | Value |
 |---|---|
-| Location | `<fork>` (local bare repo) |
-| Remote `upstream` | `https://github.com/tirbofish/proton-sdk-rs2` (fetch: `git --git-dir=… fetch upstream`) |
-| Base | tag `base/0.4.0` = `409ca119` = upstream `main` = the commit of the published 0.4.0 crates (`.cargo_vcs_info.json`) |
-| Integration branch | `pdmount` (bare-repo HEAD). PdMount pins a commit on it with `rev = …` |
+| Location | `https://github.com/colsen665/proton-sdk-rs2`, a public GitHub fork; Actions stay off. Its `main` is upstream's plus the user's README note |
+| Working copy | `<working copy>` (AGENTS.md, "Local paths"), `origin` = the fork over SSH; authentication is set in its repo-local git config |
+| Remote `upstream` | `https://github.com/tirbofish/proton-sdk-rs2` (fetch only) |
+| Base | tag `base/0.4.0` = `409ca119` = the commit of the published 0.4.0 crates (`.cargo_vcs_info.json`). Upstream `main` has moved on; the patches are not rebased onto it |
+| Integration branch | `pdmount`. PdMount pins a commit on it with `rev = …` |
+| Publication | The fork goes up before PdMount, after the publishing scan and after the maintainer has been told (D089). Push `pdmount`, the patch branches, `pin/*` and `base/0.4.0`; the scan covers everything the target remote does not already hold |
+| Pin tags | `pin/<short sha>` on every commit PdMount has pinned, so a rebuilt `pdmount` never orphans one; push the tag before the PdMount commit that pins it |
 | Patch branches | one per patch, created from `base/0.4.0`, named as in the tracking table below; merged into `pdmount` when tested |
 | Crates in the repo | `crates/proton-drive-sdk`, `crates/proton-sdk-rs2` (and `crates/pdcli`, unused) |
 
 Working on a patch:
 
 ```sh
-git clone <fork> <working copy>   # working copy
 cd <working copy>
 git switch -c fix/block-pagination base/0.4.0
 # … edit, test with cargo test -p proton-drive-sdk …
@@ -37,14 +39,15 @@ git switch pdmount && git merge --no-ff fix/block-pagination && git push origin 
 2. Rebase each unmerged patch branch onto the new upstream tag.
 3. Rebuild `pdmount` from the new base plus those branches.
 4. Tag the new base as `base/<version>`.
+5. Keep the old `pin/*` tags: old PdMount commits build from them.
 
 **Open:**
-- Upstream submission is deferred (D023, TODO.md Q8). Local CI reads the fork through `file://`.
+- Upstream PRs go from the fork once the patches are stable, when the user says so (D089, TODO.md Q8). CI stays local.
 
 Rules:
 
 - One patch is one self-contained, upstream-ready branch, rebased on upstream `main`, each with its own tests. Submitting
-  upstream is deferred (D023).
+  upstream waits until the user says the patches are stable (D089).
 - The fork carries only unmerged patches. When upstream merges a patch, the next fork rebase drops it.
 - PdMount code depends on the `Backend` trait (DESIGN.md §3), never on fork-only API outside `pdmount-backend/src/proton/`.
   If a patch is rejected upstream, an adapter there replaces it.
@@ -249,34 +252,34 @@ Path prefixes: `sdk/` = `proton-drive-sdk-0.4.0/src/`, `rs2/` = `proton-sdk-rs2-
 
 | Patch | Fork branch | Commit | Based on | Upstream | State |
 |---|---|---|---|---|---|
-| P1 | `fix/block-pagination` | `312d9d0` | `base/0.4.0` | deferred (D023) | merged into `pdmount` |
-| P2 | `fix/block-verification` | `f8513ca` | `base/0.4.0` | deferred (D023) | merged into `pdmount` |
-| P3 | `feat/block-map` | `9ef1094` | P1 + P2 merged | deferred (D023) | merged into `pdmount` |
-| P4 | `fix/revision-xattr-decode` | `2aa1e1f` | `base/0.4.0` | deferred (D023) | merged into `pdmount` |
-| P5 | `feat/folder-mtime` | `4036915` | `base/0.4.0` | deferred (D023) | merged into `pdmount` |
-| P6 | `feat/upload-revision-uid` | `3a6186a` | `base/0.4.0` | deferred (D023) | merged into `pdmount` |
-| P7 | `feat/transfer-concurrency` | `e157e1d` | `base/0.4.0` | deferred (D023) | merged into `pdmount` |
-| P8 | `feat/typed-api-error` | `28d124f` | `base/0.4.0` | deferred (D023) | merged into `pdmount` |
-| P9 | `fix/token-refresh-errors` | `6b794ac` | `base/0.4.0` | deferred (D023) | merged into `pdmount` |
-| P10 | `feat/move-with-rename` | `c7bf10b` | `base/0.4.0` | deferred (D023) | merged into `pdmount` |
-| P11 | `feat/revision-conflict-error` | `1e777f3` | P8 | deferred (D023) | merged into `pdmount` |
-| P12 | `feat/metadata-retry` | `59fca73` | P8 | deferred (D023) | merged into `pdmount` |
-| P13 | `feat/fresh-node-batch` | `7b4dcf9` | `base/0.4.0` | deferred (D023) | merged into `pdmount` |
-| P14 | `feat/caller-name-hash` | `2137adc` | `pdmount` at `4548aa7` (needs P10, P13) | deferred (D023) | merged into `pdmount` |
-| P15 | `fix/link-trash-time` | `30c061a` | `base/0.4.0` | deferred (D023) | merged into `pdmount` |
-| P16 | `fix/no-secret-logs` | `ed2a9a6`, `1de736a` (rustfmt) | `pdmount` at `d1c8994` | deferred (D023) | merged into `pdmount` |
-| P17 | `feat/block-map-manifest` | `d6e26ba`, `b0da02f` (keys decoding) | `pdmount` at `0c3d32c` (after P16) | deferred (D023) | merged into `pdmount` |
-| P18 | `feat/block-parallelism` | `cc50981` | `pdmount` at `28cacff` (needs P7) | deferred (D023) | merged into `pdmount` |
+| P1 | `fix/block-pagination` | `8048435` | `base/0.4.0` | after stable (D089) | merged into `pdmount` |
+| P2 | `fix/block-verification` | `09999b6` | `base/0.4.0` | after stable (D089) | merged into `pdmount` |
+| P3 | `feat/block-map` | `5e169ab` | P1 + P2 merged | after stable (D089) | merged into `pdmount` |
+| P4 | `fix/revision-xattr-decode` | `9bc1ace` | `base/0.4.0` | after stable (D089) | merged into `pdmount` |
+| P5 | `feat/folder-mtime` | `03a4f1f` | `base/0.4.0` | after stable (D089) | merged into `pdmount` |
+| P6 | `feat/upload-revision-uid` | `3cd9ead` | `base/0.4.0` | after stable (D089) | merged into `pdmount` |
+| P7 | `feat/transfer-concurrency` | `d46e7a2` | `base/0.4.0` | after stable (D089) | merged into `pdmount` |
+| P8 | `feat/typed-api-error` | `af6ec76` | `base/0.4.0` | after stable (D089) | merged into `pdmount` |
+| P9 | `fix/token-refresh-errors` | `152a028` | `base/0.4.0` | after stable (D089) | merged into `pdmount` |
+| P10 | `feat/move-with-rename` | `8c525e6` | `base/0.4.0` | after stable (D089) | merged into `pdmount` |
+| P11 | `feat/revision-conflict-error` | `7cacdae` | P8 | after stable (D089) | merged into `pdmount` |
+| P12 | `feat/metadata-retry` | `ca42587` | P8 | after stable (D089) | merged into `pdmount` |
+| P13 | `feat/fresh-node-batch` | `f245e14` | `base/0.4.0` | after stable (D089) | merged into `pdmount` |
+| P14 | `feat/caller-name-hash` | `0389db3` | `pdmount` at `7c92076` (needs P10, P13) | after stable (D089) | merged into `pdmount` |
+| P15 | `fix/link-trash-time` | `0459ebb` | `base/0.4.0` | after stable (D089) | merged into `pdmount` |
+| P16 | `fix/no-secret-logs` | `9290db0`, `6c6617f` (rustfmt) | `pdmount` at `c837e03` | after stable (D089) | merged into `pdmount` |
+| P17 | `feat/block-map-manifest` | `6f6276d`, `5dd08b3` (keys decoding) | `pdmount` at `981bb1b` (after P16) | after stable (D089) | merged into `pdmount` |
+| P18 | `feat/block-parallelism` | `faf4691` | `pdmount` at `631b4aa` (needs P7) | after stable (D089) | merged into `pdmount` |
 
-Integration: `pdmount` = `base/0.4.0` + all branches above, merged with `--no-ff`. It also contains `9176b0f`, a test-only fix
+Integration: `pdmount` = `base/0.4.0` + all branches above, merged with `--no-ff`. It also contains `8c7ff8b`, a test-only fix
 setting the new `FolderNode` field (from P5) in a test helper added by P10. Checks on 2026-10-19: 236 SDK tests pass (baseline
-150), pdcli builds and its tests pass, and `cargo fmt --check` passes. The fork's own tests are all offline. P13 was merged on 2026-10-21 (`4548aa7`, pinned by PdMount); the
+150), pdcli builds and its tests pass, and `cargo fmt --check` passes. The fork's own tests are all offline. P13 was merged on 2026-10-21 (`7c92076`, pinned by PdMount); the
 fork's workspace tests (278) pass on it. Through PdMount, the patches ran against the live API in the M2.8 real-account matrix
-(60 of 60 runs passed, 2026-10-22). P14 (`e3c576a`) and P15 (`d1c8994`, pinned by PdMount) were merged on 2026-10-22;
+(60 of 60 runs passed, 2026-10-22). P14 (`df38c89`) and P15 (`c837e03`, pinned by PdMount) were merged on 2026-10-22;
 the fork's workspace tests (281) pass, and both ran against the live API in the M3.1 probe.
-P16 was merged on 2026-10-27 (`e931883`; its rustfmt follow-up `0c3d32c`); the fork's workspace tests (281) pass. P17 was
-merged on 2026-10-27 (`8181251`, then `28cacff` with the keys-decoding fix); the fork's workspace tests (288) pass.
-P18 was merged on 2026-10-28 (`2ae4aa3`, pinned by PdMount); the fork's workspace tests (290) pass.
+P16 was merged on 2026-10-27 (`946cf96`; its rustfmt follow-up `981bb1b`); the fork's workspace tests (281) pass. P17 was
+merged on 2026-10-27 (`9037d6b`, then `631b4aa` with the keys-decoding fix); the fork's workspace tests (288) pass.
+P18 was merged on 2026-10-28 (`caafaea`, pinned by PdMount); the fork's workspace tests (290) pass.
 
 ## Behaviour changes
 

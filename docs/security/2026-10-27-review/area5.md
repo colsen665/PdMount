@@ -1,6 +1,6 @@
 ## Area 5 (SDK fork patches P1–P15, repo scripts): findings
 
-Fork files: `pdmount:crates/proton-drive-sdk/src/...` (fork `<fork>`, branch `pdmount` = d1c8994). Repo files relative to the worktree.
+Fork files: `pdmount:crates/proton-drive-sdk/src/...` (fork `<fork>`, branch `pdmount` = c837e03). Repo files relative to the worktree.
 
 ### A5-1: BlockMap reads trust unauthenticated block hashes (manifest not verified for random access)
 - **Rating**: Medium

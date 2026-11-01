@@ -1,6 +1,6 @@
 ## Area 4 (backend crate, build configuration): findings
 
-Paths relative to the worktree unless prefixed `sdk/` (= `~/.cargo/git/checkouts/proton-sdk-rs2-<hash>/d1c8994/crates/proton-drive-sdk/src/`) or `rs2/` (`.../crates/proton-sdk-rs2/src/`).
+Paths relative to the worktree unless prefixed `sdk/` (= `~/.cargo/git/checkouts/proton-sdk-rs2-<hash>/c837e03/crates/proton-drive-sdk/src/`) or `rs2/` (`.../crates/proton-sdk-rs2/src/`).
 
 ### A4-1: Uploader-claimed block `plain_size` passed through unbounded, drives a per-block heap allocation
 - **Rating**: Medium
@@ -66,4 +66,4 @@ Paths relative to the worktree unless prefixed `sdk/` (= `~/.cargo/git/checkouts
 - Unknown event types dropped with a warning.
 - Block-map cache bounded; URL TTL 600 s.
 - `xdg-open` argv only; honest app version and client UID; SDK caches 0600; `proton-root.json` atomic in 0700 dir.
-- Fork pinned to d1c8994, `--locked`; `unsafe_code = deny`; `panic = unwind`.
+- Fork pinned to c837e03, `--locked`; `unsafe_code = deny`; `panic = unwind`.

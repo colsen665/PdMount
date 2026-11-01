@@ -2,7 +2,7 @@
 # Local CI (TODO.md M0.7; hosted CI is deferred by decision D023).
 #
 # Runs formatting, lints, build and tests for the whole workspace. The SDK
-# fork is fetched from the local bare repo through the file:// URL in
+# fork is fetched from GitHub at the commit pinned in
 # Cargo.toml. Building proton-crypto needs Go, clang and protoc.
 #
 # Usage: scripts/ci.sh [--quick | --full]

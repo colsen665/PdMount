@@ -4,9 +4,9 @@ Written for the first security review (M4.0.1, 2026-10-27); every later review r
 
 PdMount is a single-user Linux FUSE daemon (Rust, fuser 0.18) that mounts Proton Drive "My Files" read-write, using
 the community Proton SDK through a patched fork. A CLI (`pdmount`) talks to the per-profile daemon over a Unix socket.
-Reviews: 2026-10-27 (M4.0.1) at commit e55ed49 (`m4-start`), SDK fork `pdmount` d1c8994 (diff from `base/0.4.0`);
-reports in `docs/security/2026-10-27-review/`. 2026-10-31 (M4.16), the M4 changes: `m4-start..4903f03`, SDK fork `pdmount`
-`d1c8994..2ae4aa3`; reports in `docs/security/2026-10-31-review/`.
+Reviews: 2026-10-27 (M4.0.1) at commit 8c5eda9 (`m4-start`), SDK fork `pdmount` c837e03 (diff from `base/0.4.0`);
+reports in `docs/security/2026-10-27-review/`. 2026-10-31 (M4.16), the M4 changes: `m4-start..686ded8`, SDK fork `pdmount`
+`c837e03..caafaea`; reports in `docs/security/2026-10-31-review/`.
 
 ## Assets
 - A1 Proton session: access/refresh tokens, key passphrase, SDK secret cache and key store (`sdk-secrets.db`, `sdk-keys.db`, encrypted with a key
