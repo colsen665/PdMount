@@ -2,8 +2,8 @@
 # Runs scenarios in verify modes and prints one line per run (DESIGN.md §15.3).
 #
 # Usage: tests/scenarios/run-all.sh [scenario ...]
-#   SCENARIOS  default when no arguments: every scenario (the M scenarios m1..m7 and e2 run in
-#              live mode only and skip the others)
+#   SCENARIOS  default when no arguments: every scenario (the M scenarios m1..m7, e2 and the X
+#              scenarios x1..x4, x11..x17 run in live mode only and skip the others)
 #   MODES      verify modes (default: live remount crash fresh; `second` adds device B, lib.sh)
 #   STOP_ON    comma-separated stop conditions (default: 429,fail for the real account, none
 #              for BACKEND=fake): 429 stops the matrix after a run whose daemon log lines
@@ -15,7 +15,8 @@
 #   TRASH_MIN_FREE  bytes; on the real account, a run that would start with less storage free
 #              unmounts and empties the account's trash first (D036). Default 1073741824
 #              (1 GiB); 0 turns it off. Not on the fake
-# The environment (BACKEND, sizes, ...) is passed through; see lib.sh.
+# The environment (BACKEND, sizes, ...) is passed through; see lib.sh. TARGET=share
+# (BACKEND=fake) runs the scenarios in a share's tree instead of My Files.
 set -uo pipefail
 # A relative LOG_DIR is taken from the caller's directory, before the cd.
 if [[ -n "${LOG_DIR:-}" ]]; then
@@ -23,7 +24,7 @@ if [[ -n "${LOG_DIR:-}" ]]; then
     LOG_DIR=$(cd "$LOG_DIR" && pwd)
 fi
 cd "$(dirname "$0")"
-default="r1 r2 r3 r4 r5 r6 r7 g1 g2 g3 g4 g5 g6 g6_read g7 n1 a1 a2 a3 a4 a5 a6 e1 e2 m1 m3 m4 m5 m6 m7 queue ops sha"
+default="r1 r2 r3 r4 r5 r6 r7 g1 g2 g3 g4 g5 g6 g6_read g7 n1 a1 a2 a3 a4 a5 a6 e1 e2 m1 m3 m4 m5 m6 m7 queue ops sha svc x1 x2 x3 x4 x11 x12 x13 x14 x15 x16 x17"
 scenarios=("$@")
 ((${#scenarios[@]})) || read -ra scenarios <<<"${SCENARIOS:-$default}"
 read -ra modes <<<"${MODES:-live remount crash fresh}"

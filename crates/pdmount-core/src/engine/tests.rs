@@ -980,6 +980,51 @@ async fn fsync_reports_a_deferred_error_once_across_a_crash() {
     assert!(engine.fsync(ino).await.is_ok(), "reported once");
 }
 
+/// `status` counts an entry's age from when it was queued, across a
+/// restart (D105).
+#[tokio::test]
+async fn the_oldest_age_survives_a_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let ino = {
+        // No executor: the entry stays queued.
+        let (engine, _inval) = open(&backend, dir.path()).await;
+        engine.ensure_listed(ROOT_INO).await.expect("list");
+        let ino = write_file(&engine, ROOT_INO, "queued.txt", b"left behind");
+        assert_eq!(engine.queue_counts().pending, 1);
+        assert!(engine.queue_oldest().expect("oldest") < Duration::from_secs(5));
+        engine.store.flush().await.expect("flush");
+        // The entry was queued five minutes before the session ended.
+        let before = unix_ms_now() - 300_000;
+        engine.store.write(move |conn| {
+            conn.execute("UPDATE queued SET queued_at_ms = ?1", [before])
+                .map(drop)
+        });
+        engine.shutdown().await.expect("shutdown");
+        ino
+    };
+    let (engine, _inval) = open(&backend, dir.path()).await;
+    assert_eq!(engine.queue_counts().pending, 1);
+    let oldest = engine.queue_oldest().expect("oldest");
+    assert!(oldest >= Duration::from_secs(300), "{oldest:?}");
+    assert!(oldest < Duration::from_secs(330), "{oldest:?}");
+    // The entry uploads as usual and its row goes.
+    engine.start_background();
+    settle(&engine).await;
+    assert!(engine.queue_oldest().is_none());
+    assert_eq!(read_file(&engine, ino).await, b"left behind");
+    engine.store.flush().await.expect("flush");
+    let rows: i64 = engine
+        .store
+        .read(|conn| conn.query_row("SELECT COUNT(*) FROM queued", [], |row| row.get(0)))
+        .expect("rows");
+    assert_eq!(rows, 0, "no row for an entry that left");
+}
+
+fn unix_ms_now() -> i64 {
+    crate::journal::unix_ms(std::time::SystemTime::now())
+}
+
 #[tokio::test]
 async fn an_open_unlinked_file_stays_readable() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1121,6 +1166,407 @@ async fn pdignore_keeps_new_entries_local() {
 
 fn is_read_only<T: std::fmt::Debug>(result: Result<T>) -> bool {
     matches!(result, Err(CoreError::ReadOnly))
+}
+
+/// D080, D110: a closed write gate refuses every change as `mount -o ro`
+/// does; it opens and closes at runtime, and the kernel's cached modes are
+/// invalidated each time.
+#[tokio::test]
+async fn the_write_gate_closes_and_opens_at_runtime() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let mut options =
+        EngineOptions::in_dir(dir.path(), config(), test_device("dev-a"), fixed_clock());
+    options.write_gate = false;
+    let (engine, mut invalidations) = Engine::open(Arc::new(backend.clone()), options)
+        .await
+        .expect("engine");
+    engine.start_background();
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    let docs = found(engine.lookup(ROOT_INO, b"docs").expect("lookup")).ino;
+    engine.ensure_listed(docs).await.expect("list docs");
+    let file = found(engine.lookup(docs, b"a.txt").expect("lookup")).ino;
+
+    assert!(!engine.write_gate_open());
+    assert!(!engine.is_read_only(), "not a read-only mount");
+    assert!(is_read_only(
+        engine.create(docs, b"new", 0o644, true, WRITE)
+    ));
+    assert!(is_read_only(engine.mkdir(ROOT_INO, b"d", 0o755)));
+    assert!(is_read_only(engine.open_file(file, WRITE)));
+    assert!(is_read_only(engine.unlink(docs, b"a.txt")));
+    assert!(is_read_only(engine.rename(
+        docs,
+        b"a.txt",
+        ROOT_INO,
+        b"out",
+        RenameMode::Replace
+    )));
+    let chmod = SetAttr {
+        mode: Some(0o777),
+        ..SetAttr::default()
+    };
+    assert!(is_read_only(engine.setattr(file, &chmod)));
+    assert!(is_read_only(engine.access(file, MAY_WRITE)));
+    assert_eq!(engine.getattr(file).expect("attr").perm, 0o400);
+    assert_eq!(
+        engine
+            .xattr(file, "user.pdmount.access")
+            .expect("xattr")
+            .as_deref(),
+        Some("ro")
+    );
+    assert!(engine.open_file(file, READ).is_ok(), "reads still work");
+
+    // Open: the full write path, and the modes the kernel cached go.
+    while invalidations.try_recv().is_ok() {}
+    engine.set_write_gate(true);
+    let mut invalidated = Vec::new();
+    while let Ok(message) = invalidations.try_recv() {
+        invalidated.push(message);
+    }
+    assert!(
+        invalidated.contains(&Invalidation::Inode { ino: file }),
+        "{invalidated:?}"
+    );
+    assert_eq!(engine.getattr(file).expect("attr").perm, 0o600);
+    write_file(&engine, docs, "ok.txt", b"allowed");
+    let (handle, _) = engine.open_file(file, WRITE).expect("open for writing");
+    settle(&engine).await;
+    assert!(fake_tree(&backend).await.contains_key("/docs/ok.txt"));
+
+    // Closed again: a handle opened before can no longer write (§11.4).
+    engine.set_write_gate(false);
+    assert!(is_read_only(engine.write_local(handle, 0, b"x")));
+    engine.release_file(handle);
+    // Setting the same state again changes nothing.
+    while invalidations.try_recv().is_ok() {}
+    engine.set_write_gate(false);
+    assert!(invalidations.try_recv().is_err());
+}
+
+/// D114: a share's tree that follows the server: a refused change closes
+/// the gate and holds the queue; the files stay readable, a local change
+/// does not lift the hold, and access coming back uploads them.
+#[tokio::test]
+async fn a_refused_change_closes_the_gate_and_holds_the_queue() {
+    use pdmount_backend::fake::FakeRole;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = FakeBackend::new();
+    let added = fake
+        .add_root("Team", Some("owner@example.test"), Some(FakeRole::Editor))
+        .expect("share");
+    let share = added.share.clone().expect("share id");
+    let tree = fake.tree(&added.volume, added.root.clone());
+    let mut options =
+        EngineOptions::in_dir(dir.path(), config(), test_device("dev-a"), fixed_clock());
+    options.cache.disk_bytes = 1 << 20;
+    let (engine, _inval) = Engine::open(Arc::new(tree), options).await.expect("engine");
+    let told = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook = {
+        let told = Arc::clone(&told);
+        Arc::new(move |held: usize| {
+            told.fetch_add(held.max(1), Ordering::SeqCst);
+        })
+    };
+    engine.follow_write_refusals(hook);
+    engine.start_background();
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    engine.reserve_inos(16).await.expect("inos");
+    write_file(&engine, ROOT_INO, "a.txt", b"first");
+    settle(&engine).await;
+
+    // The owner makes the user a viewer; the next upload is refused.
+    fake.set_own_role(&share, Some(FakeRole::Viewer))
+        .expect("viewer");
+    let b = write_file(&engine, ROOT_INO, "b.txt", b"second");
+    let start = Instant::now();
+    while engine.write_gate_open() && start.elapsed() < Duration::from_secs(10) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!engine.write_gate_open(), "the refusal closes the gate");
+    assert!(engine.write_was_refused());
+    assert!(told.load(Ordering::SeqCst) >= 1, "the hook is told");
+    let counts = engine.queue_counts();
+    assert_eq!((counts.pending, counts.parked), (0, 1), "{counts:?}");
+    assert_eq!(
+        engine.parked(),
+        [("/b.txt".to_owned(), rights::NO_WRITE_ACCESS.to_owned())]
+    );
+    assert!(is_read_only(
+        engine.create(ROOT_INO, b"c.txt", 0o644, true, WRITE)
+    ));
+    assert_eq!(read_file(&engine, b).await, b"second", "still readable");
+    // Reading and closing again does not lift the hold.
+    let (handle, _) = engine.open_file(b, READ).expect("open");
+    engine.release_file(handle);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(engine.queue_counts().parked, 1);
+
+    // Editor again: the gate opens and the held change uploads.
+    fake.set_own_role(&share, Some(FakeRole::Editor))
+        .expect("editor");
+    assert_eq!(engine.restore_write_access(), 1);
+    assert!(engine.write_gate_open() && !engine.write_was_refused());
+    settle(&engine).await;
+    let names: Vec<String> = fake
+        .tree(&added.volume, added.root.clone())
+        .list_children(&added.root)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|node| node.name)
+        .collect();
+    assert!(names.contains(&"b.txt".to_owned()), "{names:?}");
+}
+
+/// D114: an engine that does not follow the server (My Files) parks only
+/// the refused entry and keeps its gate open.
+#[tokio::test]
+async fn my_files_keeps_its_gate_when_a_change_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let engine = running(&backend, dir.path()).await;
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    backend.inject_failure(
+        pdmount_backend::fake::FakeOp::UploadNew,
+        BackendError::PermissionDenied,
+    );
+    write_file(&engine, ROOT_INO, "x.txt", b"x");
+    let start = Instant::now();
+    while engine.queue_counts().parked == 0 && start.elapsed() < Duration::from_secs(10) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(engine.queue_counts().parked, 1);
+    assert!(engine.write_gate_open());
+    assert!(!engine.write_was_refused());
+}
+
+/// D114: the queued changes of a tree that goes away are written out with
+/// their content, and a file whose base cannot be read is listed with the
+/// reason.
+#[tokio::test]
+async fn queued_changes_are_exported_with_their_content() {
+    use crate::engine::orphan::{FILES_DIR, OrphanManifest};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let mut config = config();
+    // Nothing uploads: no executor runs.
+    config.upload.debounce = HumanDuration(Duration::from_secs(3600));
+    let (engine, _inval) = open_with(&backend, dir.path(), config).await;
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    let docs = found(engine.lookup(ROOT_INO, b"docs").expect("lookup")).ino;
+    engine.ensure_listed(docs).await.expect("list docs");
+    let a = found(engine.lookup(docs, b"a.txt").expect("lookup")).ino;
+    let top = found(engine.lookup(ROOT_INO, b"top.bin").expect("lookup")).ino;
+    // An edit of a remote file whose base is read (cached) ...
+    assert_eq!(read_file(&engine, a).await, b"hello world");
+    let (handle, _) = engine.open_file(a, WRITE).expect("open");
+    engine
+        .write(handle, 11, b"!!".to_vec())
+        .await
+        .expect("append");
+    engine.release_file(handle);
+    // ... a new file in a new folder, and a delete.
+    let sub = engine.mkdir(ROOT_INO, b"sub", 0o755).expect("mkdir").ino;
+    write_file(&engine, sub, "new.txt", b"brand new");
+    engine.unlink(docs, b"a.txt").expect("unlink");
+    // The other remote file is only read.
+    assert_eq!(read_file(&engine, top).await, b"0123456789");
+    assert_eq!(engine.withdraw_write_access(), engine.journal.inos().len());
+
+    let entries = engine.export_queued(out.path()).await.expect("export");
+    let manifest = OrphanManifest::new("Team", "the share was revoked", entries);
+    manifest.write(out.path()).expect("manifest");
+    let back = OrphanManifest::read(out.path()).expect("read back");
+    assert_eq!(back, manifest);
+    let files = out.path().join(FILES_DIR);
+    assert_eq!(
+        std::fs::read(files.join("sub/new.txt")).expect("new.txt"),
+        b"brand new"
+    );
+    assert!(files.join("sub").is_dir());
+    let by_path = |path: &str| {
+        manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .unwrap_or_else(|| panic!("{path} in {:?}", manifest.entries))
+            .clone()
+    };
+    assert_eq!(by_path("/sub").change, "create-folder");
+    let new = by_path("/sub/new.txt");
+    assert_eq!(new.change, "upload");
+    assert_eq!(new.file.as_deref(), Some("files/sub/new.txt"));
+    assert_eq!(manifest.incomplete(), 0, "{:?}", manifest.entries);
+    // The deleted file is listed as a trash, without content.
+    let trashed = by_path("/docs/a.txt");
+    assert_eq!(trashed.change, "trash");
+    assert!(trashed.file.is_none());
+}
+
+/// D114: an edit whose base blocks cannot be read any more is listed with
+/// the reason instead of its content.
+#[tokio::test]
+async fn an_edit_whose_base_cannot_be_read_is_listed_with_the_reason() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = tempfile::tempdir().expect("tempdir");
+    let backend = FakeBackend::new();
+    let root = backend.root().await.expect("root").link_id;
+    let size = crate::staging::GRID as usize + 10;
+    backend
+        .upload_new(
+            &root,
+            "big.bin",
+            UploadSource::Bytes(Bytes::from(vec![7u8; size])),
+            meta(),
+        )
+        .await
+        .expect("upload");
+    let mut config = config();
+    config.upload.debounce = HumanDuration(Duration::from_secs(3600));
+    let (engine, _inval) = open_with(&backend, dir.path(), config).await;
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    let big = found(engine.lookup(ROOT_INO, b"big.bin").expect("lookup")).ino;
+    // An edit of the tail: the first staging block stays on the server.
+    let (handle, _) = engine.open_file(big, WRITE).expect("open");
+    engine
+        .write(handle, crate::staging::GRID, b"tail".to_vec())
+        .await
+        .expect("write");
+    engine.release_file(handle);
+    engine.withdraw_write_access();
+    for _ in 0..8 {
+        backend.inject_failure(
+            pdmount_backend::fake::FakeOp::FetchBlock,
+            BackendError::NotFound,
+        );
+    }
+    let entries = engine.export_queued(out.path()).await.expect("export");
+    let entry = entries
+        .iter()
+        .find(|entry| entry.path == "/big.bin")
+        .expect("big.bin");
+    assert!(entry.file.is_none(), "{entry:?}");
+    assert!(entry.error.is_some(), "{entry:?}");
+    assert!(!out.path().join("files/big.bin").exists());
+}
+
+/// An engine of a tree on another user's volume (D124): the profile's
+/// rules in `local`, the root's `/.pdignore` not taken.
+async fn share_engine(
+    backend: &FakeBackend,
+    dir: &std::path::Path,
+    config: Config,
+    local: &[u8],
+) -> Arc<Engine> {
+    let rules = dir.join("profile.pdignore");
+    std::fs::write(&rules, local).expect("profile rules");
+    let mut options = EngineOptions::in_dir(dir, config, test_device("dev-a"), fixed_clock());
+    options.cache.disk_bytes = 1 << 20;
+    options.local_ignore = Some(rules);
+    options.remote_ignore = false;
+    let (engine, _inval) = Engine::open(Arc::new(backend.clone()), options)
+        .await
+        .expect("engine");
+    engine
+}
+
+/// D124: in a tree on another user's volume, the root's `/.pdignore` is an
+/// ordinary file. Its `*` keeps nothing of the member's local-only, its
+/// `!*` undoes none of the member's own rules; the file itself syncs.
+#[tokio::test]
+async fn a_share_tree_takes_no_rules_from_its_root_pdignore() {
+    let backend = seeded().await;
+    let root = backend.root().await.expect("root").link_id;
+    remote_file(&backend, &root, ".pdignore", b"*\n").await;
+    // The same rules do apply in a tree of the user's own volume.
+    let own_dir = tempfile::tempdir().expect("tempdir");
+    let own = running(&backend, own_dir.path()).await;
+    own.ensure_listed(ROOT_INO).await.expect("list");
+    eventually("the root's rules in an own tree", || {
+        own.is_ignored(ROOT_INO, "a.txt", false)
+    })
+    .await;
+    own.shutdown().await.expect("shutdown");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = share_engine(&backend, dir.path(), config(), b"*.env\n").await;
+    engine.start_background();
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !engine.is_ignored(ROOT_INO, "a.txt", false),
+        "the share's `*`"
+    );
+    assert!(engine.is_ignored(ROOT_INO, "x.env", false), "the own rule");
+    write_file(&engine, ROOT_INO, "a.txt", b"shared");
+    let env = write_file(&engine, ROOT_INO, "x.env", b"secret");
+    assert!(engine.tree.read().get(env).expect("x.env").local_only);
+    // Another member turns the share's rules into `!*`.
+    engine.unlink(ROOT_INO, b".pdignore").expect("unlink");
+    write_file(&engine, ROOT_INO, ".pdignore", b"!*\n");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        engine.is_ignored(ROOT_INO, "y.env", false),
+        "`!*` undoes nothing"
+    );
+    write_file(&engine, ROOT_INO, "y.env", b"secret too");
+    settle(&engine).await;
+    let tree = fake_tree(&backend).await;
+    assert_eq!(tree["/a.txt"].content, b"shared");
+    assert_eq!(tree["/.pdignore"].content, b"!*\n", "the rules file syncs");
+    assert!(!tree.contains_key("/x.env"));
+    assert!(!tree.contains_key("/y.env"));
+    engine.shutdown().await.expect("shutdown");
+}
+
+/// V-1, D124: a gone tree's local-only files are exported like queued ones
+/// (their content is only in the staging), listed as `local-only`, though
+/// the queue is empty: the journal let them go.
+#[tokio::test]
+async fn local_only_files_are_exported_with_the_queued_changes() {
+    use crate::engine::orphan::{FILES_DIR, LOCAL_ONLY, OrphanManifest};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let engine = share_engine(&backend, dir.path(), config(), b"*.env\nbuild/\n").await;
+    engine.start_background();
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    write_file(&engine, ROOT_INO, "secret.env", b"local secret");
+    let build = engine.mkdir(ROOT_INO, b"build", 0o755).expect("mkdir").ino;
+    write_file(&engine, build, "out.o", b"object");
+    settle(&engine).await;
+    let counts = engine.queue_counts();
+    assert_eq!(counts.pending + counts.parked, 0, "nothing queued");
+    assert_eq!(engine.local_only_staged().len(), 2);
+
+    engine.withdraw_write_access();
+    let entries = engine.export_queued(out.path()).await.expect("export");
+    let manifest = OrphanManifest::new("Team", "the share was revoked", entries);
+    assert_eq!(manifest.incomplete(), 0, "{:?}", manifest.entries);
+    let files = out.path().join(FILES_DIR);
+    for (path, content) in [
+        ("secret.env", &b"local secret"[..]),
+        ("build/out.o", b"object"),
+    ] {
+        assert_eq!(std::fs::read(files.join(path)).expect(path), content);
+    }
+    let change = |path: &str| {
+        manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .unwrap_or_else(|| panic!("{path} in {:?}", manifest.entries))
+            .change
+            .clone()
+    };
+    assert_eq!(change("/secret.env"), LOCAL_ONLY);
+    assert_eq!(change("/build/out.o"), LOCAL_ONLY);
+    assert_eq!(manifest.entries.len(), 2, "{:?}", manifest.entries);
+    assert!(!fake_tree(&backend).await.contains_key("/secret.env"));
+    engine.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]
@@ -2258,6 +2704,7 @@ fn official_app() -> FakeClient {
         uid: Some("app".to_owned()),
         claims_sha1: false,
         claims_mode: false,
+        ..FakeClient::default()
     }
 }
 
@@ -3207,6 +3654,238 @@ async fn a_folder_waits_for_children_moved_out() {
     assert_eq!(tree["/docs/moved.txt"].content, b"old");
     assert!(is_trashed(&backend, &sub_link).await);
     assert!(engine.conflicts().is_empty(), "{:?}", engine.conflicts());
+}
+
+/// Levels of the deep tree below `docs` (pjdfstest's PATH_MAX trees have
+/// about 30).
+const DEEP: usize = 10;
+
+/// `docs/d0/d1/.../d9`, a file `f` in each folder. Returns the links, top
+/// first.
+async fn deep_remote_tree(backend: &FakeBackend, docs_link: &LinkId) -> Vec<LinkId> {
+    let mut links: Vec<LinkId> = Vec::new();
+    for level in 0..DEEP {
+        let parent = links.last().unwrap_or(docs_link).clone();
+        let link = backend
+            .create_folder(&parent, &format!("d{level}"), UNIX_EPOCH)
+            .await
+            .expect("mkdir");
+        backend
+            .upload_new(
+                &link,
+                "f",
+                UploadSource::Bytes(Bytes::from_static(b"f")),
+                meta(),
+            )
+            .await
+            .expect("f");
+        links.push(link);
+    }
+    links
+}
+
+/// Lists the deep tree; returns its folders' inodes, `docs` first.
+async fn list_deep(engine: &Arc<Engine>, docs: Ino) -> Vec<Ino> {
+    let mut inos = vec![docs];
+    for level in 0..DEEP {
+        let parent = *inos.last().expect("docs");
+        let name = format!("d{level}");
+        let ino = found(hot(|| engine.lookup(parent, name.as_bytes())).expect("lookup")).ino;
+        engine.ensure_listed(ino).await.expect("list");
+        inos.push(ino);
+    }
+    inos
+}
+
+/// `rm -rf` of the levels `levels` (deepest first): the file, then the
+/// folder.
+fn remove_levels(engine: &Engine, inos: &[Ino], levels: impl Iterator<Item = usize>) {
+    for level in levels {
+        engine.unlink(inos[level + 1], b"f").expect("unlink");
+        engine
+            .rmdir(inos[level], format!("d{level}").as_bytes())
+            .expect("rmdir");
+    }
+}
+
+/// [`settle`] that shows what is left.
+async fn settle_deep(engine: &Engine) {
+    let counts = engine.drain(Duration::from_secs(10)).await;
+    assert_eq!(
+        (counts.pending, counts.parked),
+        (0, 0),
+        "{:#?}",
+        engine.describe_pending()
+    );
+}
+
+/// Each folder's trash waits for the folders deleted inside it, so a deep
+/// tree goes to the trash one level at a time. A level must start as soon
+/// as the one inside it is trashed: as a failing step with its back-off,
+/// level n waited about 2^n seconds (minutes from the tenth level on).
+#[tokio::test]
+async fn a_deep_tree_removed_locally_is_trashed_level_after_level() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let root = backend.root().await.expect("root").link_id;
+    let docs_link = remote_child(&backend, &root, "docs").await.link_id;
+    let links = deep_remote_tree(&backend, &docs_link).await;
+    let (engine, docs, _) = listed_lazy(&backend, dir.path()).await;
+    let inos = list_deep(&engine, docs).await;
+    remove_levels(&engine, &inos, (0..DEEP).rev());
+
+    start_journal(&engine);
+    settle_deep(&engine).await;
+    for link in &links {
+        assert!(is_trashed(&backend, link).await, "{link:?}");
+    }
+    assert!(engine.conflicts().is_empty(), "{:?}", engine.conflicts());
+}
+
+/// The report: an `rm -rf` cut off by a stop, finished after the next
+/// start. The folders deleted before the stop wait for each other like
+/// those deleted after it.
+#[tokio::test]
+async fn a_deep_rm_rf_cut_off_by_a_stop_is_trashed_after_the_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let root = backend.root().await.expect("root").link_id;
+    let docs_link = remote_child(&backend, &root, "docs").await.link_id;
+    let links = deep_remote_tree(&backend, &docs_link).await;
+    let inos = {
+        let (engine, docs, _) = listed_lazy(&backend, dir.path()).await;
+        let inos = list_deep(&engine, docs).await;
+        // Cut off halfway: the deeper half is gone locally, none trashed.
+        remove_levels(&engine, &inos, (DEEP / 2..DEEP).rev());
+        engine.shutdown().await.expect("shutdown");
+        inos
+    };
+    let (engine, _inval) = open_with(&backend, dir.path(), lazy_config()).await;
+    remove_levels(&engine, &inos, (0..DEEP / 2).rev());
+
+    start_journal(&engine);
+    settle_deep(&engine).await;
+    for link in &links {
+        assert!(is_trashed(&backend, link).await, "{link:?}");
+    }
+    assert!(engine.conflicts().is_empty(), "{:?}", engine.conflicts());
+}
+
+/// A remote file moved into a `.pdignore`d folder stays in its old folder
+/// remotely: no node moves into a local-only folder (§7.7). When that old
+/// folder is deleted, its trash cannot wait for the file to move out, nor
+/// take it along: the folder is kept like one with a child the local delete
+/// does not account for, and the server is not asked again. Its trash used
+/// to wait on the file's entry, which left at once and woke it: two calls
+/// about once a second, forever (D121).
+#[tokio::test]
+async fn a_folder_whose_child_went_into_a_local_only_folder_is_kept() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let root = backend.root().await.expect("root").link_id;
+    let docs_link = remote_child(&backend, &root, "docs").await.link_id;
+    let engine = running(&backend, dir.path()).await;
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    write_file(&engine, ROOT_INO, ".pdignore", b"ignored/\n");
+    eventually("the ignore rules", || {
+        engine.is_ignored(ROOT_INO, "ignored", true)
+    })
+    .await;
+    let ignored = engine
+        .mkdir(ROOT_INO, b"ignored", 0o755)
+        .expect("mkdir")
+        .ino;
+    let docs = found(engine.lookup(ROOT_INO, b"docs").expect("lookup")).ino;
+    engine.ensure_listed(docs).await.expect("list docs");
+    engine
+        .rename(docs, b"a.txt", ignored, b"a.txt", RenameMode::NoReplace)
+        .expect("into the local-only folder");
+    engine.rmdir(ROOT_INO, b"docs").expect("rmdir");
+
+    eventually("the folder is kept", || {
+        kinds(&engine).contains(&ConflictKind::LocalDeleteRemoteChildren)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    engine.metrics().reset_latency();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    // A trash check is a `get_nodes` and a `list_children` of the folder;
+    // applying an event may fetch one node.
+    let calls = backend_calls(&engine);
+    let count = |op: &str| {
+        calls
+            .iter()
+            .find(|(name, _)| *name == op)
+            .map_or(0, |(_, count)| *count)
+    };
+    assert_eq!(
+        count("backend_list_children"),
+        0,
+        "the folder is not checked again: {calls:?}"
+    );
+    assert!(count("backend_get_nodes") <= 1, "{calls:?}");
+    assert!(!is_trashed(&backend, &docs_link).await);
+    let tree = fake_tree(&backend).await;
+    assert!(tree.contains_key("/docs/a.txt"), "{:?}", tree.keys());
+    assert!(!tree.contains_key("/ignored"));
+    let a = found(hot(|| engine.lookup(ignored, b"a.txt")).expect("lookup")).ino;
+    assert_eq!(read_file(&engine, a).await, b"hello world");
+    found(hot(|| engine.lookup(ROOT_INO, b"docs")).expect("the folder is back"));
+}
+
+/// A deleted folder whose name a node took is trashed under a temporary
+/// name (D117); until then its entry is shown, and found, at the folder's
+/// own path, also after a restart (D121).
+#[tokio::test]
+async fn a_folder_moved_aside_keeps_its_path_in_the_queue() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let docs_path = || "/docs".to_owned();
+    {
+        let (engine, docs, _) = listed_lazy(&backend, dir.path()).await;
+        let a = found(engine.lookup(docs, b"a.txt").expect("lookup")).ino;
+        let mv = |from: Ino, name: &[u8], to: Ino, new: &[u8]| {
+            engine
+                .rename(from, name, to, new, RenameMode::NoReplace)
+                .expect("rename")
+        };
+        mv(docs, b"a.txt", ROOT_INO, b"b");
+        engine.rmdir(ROOT_INO, b"docs").expect("rmdir");
+        mv(ROOT_INO, b"b", ROOT_INO, b"docs");
+        // The file waits; the folder's trash goes on as far as it can.
+        engine
+            .queue_park(&queue::QueueTarget::Id(a))
+            .await
+            .expect("park");
+        start_journal(&engine);
+        eventually("the folder moved aside", || {
+            remote_of(&engine, docs)
+                .is_some_and(|remote| remote.name.starts_with(crate::journal::SWAP_PREFIX))
+        })
+        .await;
+        let path_of = |entries: &[queue::QueueEntry]| {
+            entries
+                .iter()
+                .find(|entry| entry.id == docs)
+                .map(|entry| entry.path.clone())
+        };
+        assert_eq!(path_of(&queue_all(&engine).await), Some(docs_path()));
+        // Once the file leaves the name, the path finds the folder's entry.
+        mv(ROOT_INO, b"docs", ROOT_INO, b"x");
+        let by_path = engine
+            .queue_entries(&queue_path("/docs"))
+            .await
+            .expect("found by its own path");
+        assert_eq!(path_of(&by_path), Some(docs_path()));
+        engine.shutdown().await.expect("shutdown");
+    }
+    let (engine, _inval) = open_with(&backend, dir.path(), lazy_config()).await;
+    let entries = queue_all(&engine).await;
+    assert!(
+        entries.iter().any(|entry| entry.path == docs_path()),
+        "{:?}",
+        entries.iter().map(|e| &e.path).collect::<Vec<_>>()
+    );
 }
 
 /// A create/create conflict, uploaded: `/docs/new.txt` holds B's content, the
@@ -4887,3 +5566,566 @@ async fn a_late_materialize_does_not_write_into_a_newer_staging() {
     backend.set_latency(Duration::ZERO);
     assert_eq!(read_file(&engine, ino).await, b"Y");
 }
+
+// ---- shutdown flush (D075) ----
+
+/// The barrier's files upload at once, within an hour's debounce; a file
+/// written after the barrier does not extend the wait and stays queued.
+#[tokio::test]
+async fn a_flush_uploads_the_barrier_without_the_debounce() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let (engine, docs) = queue_forced_only(&backend, dir.path()).await;
+    write_file(&engine, docs, "one.txt", b"1");
+    write_file(&engine, ROOT_INO, "two.txt", b"2");
+    let barrier = engine.flush_barrier();
+    assert_eq!(barrier.len(), 2);
+    write_file(&engine, ROOT_INO, "later.txt", b"3");
+    let outcome = engine
+        .flush_to(&barrier, Instant::now() + Duration::from_secs(10))
+        .await;
+    assert_eq!(outcome.ended, crate::journal::FlushEnd::Reached);
+    assert_eq!(
+        (outcome.barrier, outcome.left, outcome.flushed()),
+        (2, 0, 2)
+    );
+    let tree = fake_tree(&backend).await;
+    assert_eq!(tree["/docs/one.txt"].content, b"1");
+    assert_eq!(tree["/two.txt"].content, b"2");
+    assert!(
+        !tree.contains_key("/later.txt"),
+        "a later write was waited for"
+    );
+    let left: Vec<String> = queue_all(&engine)
+        .await
+        .into_iter()
+        .map(|e| e.path)
+        .collect();
+    assert_eq!(left, ["/later.txt"]);
+}
+
+/// Offline or in `needs_login` the flush does not wait (D075).
+#[tokio::test]
+async fn a_flush_does_not_wait_while_offline() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let (engine, docs) = queue_forced_only(&backend, dir.path()).await;
+    write_file(&engine, docs, "one.txt", b"1");
+    for state in [Connectivity::Offline, Connectivity::NeedsLogin] {
+        engine.health().set(state);
+        let barrier = engine.flush_barrier();
+        let outcome = engine
+            .flush_to(&barrier, Instant::now() + Duration::from_secs(10))
+            .await;
+        assert_eq!(outcome.ended, crate::journal::FlushEnd::NotOnline(state));
+        assert_eq!(outcome.left, 1);
+        assert!(outcome.elapsed < Duration::from_secs(1));
+    }
+}
+
+/// The grace ends the wait: an upload slower than the deadline is left.
+#[tokio::test]
+async fn a_flush_ends_at_the_deadline() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let (engine, docs) = queue_forced_only(&backend, dir.path()).await;
+    let pause = backend.pause_at(FakePoint::NewBeforeCommit);
+    write_file(&engine, docs, "one.txt", b"1");
+    let barrier = engine.flush_barrier();
+    let outcome = engine
+        .flush_to(&barrier, Instant::now() + Duration::from_millis(300))
+        .await;
+    assert_eq!(outcome.ended, crate::journal::FlushEnd::Deadline);
+    assert_eq!(outcome.left, 1);
+    assert!(outcome.elapsed < Duration::from_secs(1));
+    pause.release();
+    settle(&engine).await;
+}
+
+// ---- pending marker (D076) ----
+
+/// A drive with `/docs` and blocks of the real size, so a marker is one
+/// block.
+async fn marker_drive() -> FakeBackend {
+    let backend = FakeBackend::new();
+    let root = backend.root().await.expect("root").link_id;
+    backend
+        .create_folder(&root, "docs", UNIX_EPOCH)
+        .await
+        .expect("mkdir");
+    backend
+}
+
+fn marker_config() -> Config {
+    let mut config = config();
+    config.upload.debounce = HumanDuration(Duration::from_secs(3600));
+    config.sync.pending_marker = true;
+    config
+}
+
+/// The content of `/.pdmount/<device>.pending` on the drive.
+async fn marker_on_drive(backend: &FakeBackend, device: &str) -> Option<Vec<u8>> {
+    let name = marker::marker_name(&test_device(device).id);
+    fake_tree(backend)
+        .await
+        .remove(&format!("/{}/{name}", marker::MARKER_DIR))
+        .map(|file| file.content)
+}
+
+/// A marker another device left, uploaded as that device would.
+async fn upload_marker(backend: &FakeBackend, device: &str, body: &[u8]) {
+    let root = backend.root().await.expect("root").link_id;
+    let existing = backend
+        .list_children(&root)
+        .await
+        .expect("list")
+        .into_iter()
+        .find(|node| node.name == marker::MARKER_DIR);
+    let folder = match existing {
+        Some(node) => node.link_id,
+        None => backend
+            .create_folder(&root, marker::MARKER_DIR, UNIX_EPOCH)
+            .await
+            .expect("mkdir"),
+    };
+    backend
+        .upload_new(
+            &folder,
+            &marker::marker_name(&test_device(device).id),
+            UploadSource::Bytes(Bytes::copy_from_slice(body)),
+            meta(),
+        )
+        .await
+        .expect("upload");
+}
+
+async fn wait_for<F: std::future::Future<Output = bool>>(what: &str, mut check: impl FnMut() -> F) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !check().await {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Device A leaves a marker with what is queued, no file names; B reads it
+/// through its event stream and announces it once; A's drain trashes it,
+/// and B forgets it.
+#[tokio::test]
+async fn a_marker_is_written_read_by_another_device_and_trashed_after_the_drain() {
+    let backend = marker_drive().await;
+    let dir_b = tempfile::tempdir().expect("tempdir");
+    let (b, _inval_b) = open_device(&backend, dir_b.path(), config(), "dev-b").await;
+    b.gate.set_interval(Duration::ZERO);
+    b.ensure_listed(ROOT_INO).await.expect("list");
+    let mut notices = b.subscribe_incoming();
+
+    let dir_a = tempfile::tempdir().expect("tempdir");
+    let (a, _inval_a) = open_device(&backend, dir_a.path(), marker_config(), "dev-a").await;
+    a.gate.set_interval(Duration::ZERO);
+    a.start_background();
+    a.ensure_listed(ROOT_INO).await.expect("list");
+    let docs = found(a.lookup(ROOT_INO, b"docs").expect("lookup")).ino;
+    a.ensure_listed(docs).await.expect("list");
+    write_file(&a, docs, "secret-name.txt", b"0123456789");
+    write_file(&a, ROOT_INO, "other.txt", b"abc");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    assert_eq!(
+        a.leave_pending_marker(deadline).await,
+        marker::MarkerOutcome::Written {
+            entries: 2,
+            bytes: 13
+        }
+    );
+    let body = marker_on_drive(&backend, "dev-a").await.expect("a marker");
+    let text = String::from_utf8(body.clone()).expect("utf-8");
+    assert!(!text.contains("secret-name"), "{text}");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "version": 1, "device": "dev-a", "time": CLOCK_SECS, "entries": 2, "bytes": 13
+        })
+    );
+    // A second unfinished stop gives it a new revision, not a second file.
+    assert!(matches!(
+        a.leave_pending_marker(deadline).await,
+        marker::MarkerOutcome::Written { .. }
+    ));
+    let tree = fake_tree(&backend).await;
+    assert_eq!(
+        tree.keys()
+            .filter(|path| path.starts_with("/.pdmount/"))
+            .count(),
+        1,
+        "{tree:?}"
+    );
+    assert!(a.own_pending_marker().is_some());
+
+    b.sync_events().await.expect("events");
+    b.scan_markers().await.expect("scan");
+    let incoming = b.incoming_markers();
+    assert_eq!(incoming.len(), 1, "{incoming:?}");
+    assert_eq!(incoming[0].device.as_deref(), Some("dev-a"));
+    assert_eq!((incoming[0].entries, incoming[0].bytes), (2, 13));
+    assert_eq!(
+        notices.try_recv().expect("a notice").markers[0].device_id,
+        incoming[0].device_id
+    );
+    b.scan_markers().await.expect("scan");
+    assert!(notices.try_recv().is_err(), "announced twice");
+
+    // The drain: the watcher trashes the marker.
+    a.drain(Duration::from_secs(10)).await;
+    wait_for("the marker's trash", || async {
+        marker_on_drive(&backend, "dev-a").await.is_none()
+    })
+    .await;
+    wait_for("the watcher", || async { a.own_pending_marker().is_none() }).await;
+    b.sync_events().await.expect("events");
+    b.scan_markers().await.expect("scan");
+    assert!(b.incoming_markers().is_empty());
+}
+
+/// Nothing queued, no marker.
+#[tokio::test]
+async fn an_empty_queue_leaves_no_marker() {
+    let backend = marker_drive().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (engine, _inval) = open_with(&backend, dir.path(), marker_config()).await;
+    assert_eq!(
+        engine
+            .leave_pending_marker(Instant::now() + Duration::from_secs(5))
+            .await,
+        marker::MarkerOutcome::Empty
+    );
+    assert!(!fake_tree(&backend).await.contains_key("/.pdmount"));
+}
+
+/// A marker from another device is untrusted: too large, malformed or of
+/// an unknown version, it is ignored; its device name is cleaned.
+#[tokio::test]
+async fn markers_of_other_devices_are_bounded_and_cleaned() {
+    let backend = marker_drive().await;
+    upload_marker(&backend, "big", &vec![b' '; marker::MAX_MARKER_BYTES + 1]).await;
+    upload_marker(&backend, "junk", b"{\"version\":1,\"entries\":\"x\"}").await;
+    upload_marker(
+        &backend,
+        "v2",
+        br#"{"version":2,"time":1,"entries":1,"bytes":1}"#,
+    )
+    .await;
+    let evil = serde_json::json!({
+        "version": 1, "device": "\u{1b}]0;title\u{7}evil\u{202e}", "time": 5, "entries": 4, "bytes": 9
+    });
+    upload_marker(&backend, "evil", &serde_json::to_vec(&evil).expect("json")).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (engine, _inval) = open_device(&backend, dir.path(), config(), "dev-b").await;
+    engine.gate.set_interval(Duration::ZERO);
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    engine.scan_markers().await.expect("scan");
+    let incoming = engine.incoming_markers();
+    assert_eq!(incoming.len(), 1, "{incoming:?}");
+    assert_eq!(incoming[0].device.as_deref(), Some("?]0;title?evil?"));
+    assert_eq!(incoming[0].entries, 4);
+}
+
+/// `.pdmount` is read-only in the mount (EROFS, D019): its name in the
+/// root cannot be taken or removed, nothing in it changes, and its
+/// attributes have no write bits. Reading works.
+#[tokio::test]
+async fn the_marker_folder_is_read_only() {
+    let backend = marker_drive().await;
+    upload_marker(
+        &backend,
+        "dev-x",
+        &marker::encode(Some("x"), CLOCK_SECS, 1, 1),
+    )
+    .await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (engine, _inval) = open(&backend, dir.path()).await;
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    let folder = found(engine.lookup(ROOT_INO, b".pdmount").expect("lookup"));
+    assert_eq!(folder.perm & 0o222, 0);
+    engine.ensure_listed(folder.ino).await.expect("list");
+    let name = marker::marker_name(&test_device("dev-x").id);
+    let file = found(engine.lookup(folder.ino, name.as_bytes()).expect("lookup"));
+    assert_eq!(file.perm & 0o222, 0);
+    assert_eq!(engine.getattr(file.ino).expect("attr").perm & 0o222, 0);
+    assert!(!read_file(&engine, file.ino).await.is_empty());
+    assert_eq!(
+        engine
+            .xattr(file.ino, surface::XATTR_ACCESS)
+            .expect("xattr")
+            .as_deref(),
+        Some("ro")
+    );
+
+    let ro = |result: Result<()>| assert!(matches!(result, Err(CoreError::ReadOnly)), "{result:?}");
+    let chmod = |mode| SetAttr {
+        mode: Some(mode),
+        ..SetAttr::default()
+    };
+    ro(engine.rmdir(ROOT_INO, b".pdmount"));
+    ro(engine.unlink(folder.ino, name.as_bytes()));
+    ro(engine
+        .create(folder.ino, b"new", 0o644, true, WRITE)
+        .map(drop));
+    ro(engine.mkdir(folder.ino, b"d", 0o755).map(drop));
+    ro(engine.open_file(file.ino, WRITE).map(drop));
+    ro(engine.setattr(file.ino, &chmod(0o644)).map(drop));
+    ro(engine.setattr(folder.ino, &chmod(0o777)).map(drop));
+    ro(engine.access(file.ino, MAY_WRITE));
+    let rename = |from: Ino, name: &[u8], to: Ino, new_name: &[u8]| {
+        engine.rename(from, name, to, new_name, RenameMode::Replace)
+    };
+    ro(rename(ROOT_INO, b".pdmount", ROOT_INO, b"moved"));
+    ro(rename(folder.ino, name.as_bytes(), ROOT_INO, b"out"));
+    let top = write_file(&engine, ROOT_INO, "top.txt", b"t");
+    ro(rename(ROOT_INO, b"top.txt", folder.ino, b"in"));
+    ro(rename(ROOT_INO, b"top.txt", ROOT_INO, b".pdmount"));
+    assert!(engine.getattr(top).is_ok());
+    engine.access(file.ino, MAY_READ).expect("readable");
+}
+
+/// The name is taken in the root even before the folder exists, and only
+/// in the root.
+#[tokio::test]
+async fn the_marker_folder_name_cannot_be_created_in_the_root() {
+    let backend = marker_drive().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (engine, _inval) = open(&backend, dir.path()).await;
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    assert!(matches!(
+        engine.mkdir(ROOT_INO, b".pdmount", 0o755),
+        Err(CoreError::ReadOnly)
+    ));
+    assert!(matches!(
+        engine.create(ROOT_INO, b".pdmount", 0o644, true, WRITE),
+        Err(CoreError::ReadOnly)
+    ));
+    let docs = found(engine.lookup(ROOT_INO, b"docs").expect("lookup")).ino;
+    engine.ensure_listed(docs).await.expect("list");
+    engine
+        .mkdir(docs, b".pdmount", 0o755)
+        .expect("elsewhere it is a name");
+}
+
+/// A marker that another client trashed, or that the store remembers after
+/// it was trashed, is forgotten at the drain without a second trash.
+#[tokio::test]
+async fn a_marker_trashed_elsewhere_is_forgotten_at_the_drain() {
+    let backend = marker_drive().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (engine, _inval) = open_with(&backend, dir.path(), marker_config()).await;
+    engine.gate.set_interval(Duration::ZERO);
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    write_file(&engine, ROOT_INO, "f.txt", b"f");
+    assert!(matches!(
+        engine
+            .leave_pending_marker(Instant::now() + Duration::from_secs(5))
+            .await,
+        marker::MarkerOutcome::Written { .. }
+    ));
+    let link = engine.own_pending_marker().expect("recorded");
+    backend
+        .trash(std::slice::from_ref(&link))
+        .await
+        .expect("trash")
+        .remove(0)
+        .expect("trashed");
+    engine.start_background();
+    settle(&engine).await;
+    wait_for("the watcher", || async {
+        engine.own_pending_marker().is_none()
+    })
+    .await;
+    assert!(marker_on_drive(&backend, "dev-a").await.is_none());
+}
+
+/// A flush that left a marker and then reached its barrier with nothing
+/// left trashes the marker itself, before the stop ends the drain watcher
+/// (D096); with entries left it keeps it.
+#[tokio::test]
+async fn the_end_of_a_flush_trashes_a_marker_it_no_longer_needs() {
+    let backend = marker_drive().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (engine, _inval) = open_with(&backend, dir.path(), marker_config()).await;
+    engine.gate.set_interval(Duration::ZERO);
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    write_file(&engine, ROOT_INO, "f.txt", b"f");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    assert!(matches!(
+        engine.leave_pending_marker(deadline).await,
+        marker::MarkerOutcome::Written { .. }
+    ));
+    assert!(
+        !engine.trash_pending_marker_by(deadline).await,
+        "the queue is not empty"
+    );
+    assert!(marker_on_drive(&backend, "dev-a").await.is_some());
+
+    // No drain watcher: only the journal runs, as at the end of a stop.
+    start_journal(&engine);
+    let barrier = engine.flush_barrier();
+    let outcome = engine.flush_to(&barrier, deadline).await;
+    assert_eq!(
+        outcome.ended,
+        crate::journal::FlushEnd::Reached,
+        "{outcome:?}"
+    );
+    assert!(engine.trash_pending_marker_by(deadline).await);
+    assert!(engine.own_pending_marker().is_none());
+    assert!(marker_on_drive(&backend, "dev-a").await.is_none());
+    // Nothing left to trash.
+    assert!(engine.trash_pending_marker_by(deadline).await);
+}
+
+/// A marker announced before a restart is not announced again when its
+/// first fetch after the restart fails once.
+#[tokio::test]
+async fn a_failed_fetch_after_a_restart_does_not_announce_a_marker_again() {
+    let backend = marker_drive().await;
+    upload_marker(
+        &backend,
+        "dev-x",
+        &marker::encode(Some("x"), CLOCK_SECS, 1, 1),
+    )
+    .await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let (engine, _inval) = open_device(&backend, dir.path(), config(), "dev-b").await;
+        engine.gate.set_interval(Duration::ZERO);
+        let mut notices = engine.subscribe_incoming();
+        engine.ensure_listed(ROOT_INO).await.expect("list");
+        engine.scan_markers().await.expect("scan");
+        assert!(notices.try_recv().is_ok(), "announced");
+        engine.shutdown().await.expect("shutdown");
+    }
+    let (engine, _inval) = open_device(&backend, dir.path(), config(), "dev-b").await;
+    engine.gate.set_interval(Duration::ZERO);
+    let mut notices = engine.subscribe_incoming();
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    backend.inject_failure(
+        pdmount_backend::fake::FakeOp::Blocks,
+        BackendError::Transient("once".into()),
+    );
+    engine.scan_markers().await.expect("scan");
+    assert!(engine.incoming_markers().is_empty(), "not read yet");
+    engine.scan_markers().await.expect("scan");
+    assert_eq!(engine.incoming_markers().len(), 1);
+    assert!(notices.try_recv().is_err(), "announced again");
+}
+
+/// D058, D110: the trees of a session share its upload limit and its
+/// background gate: two trees that each write several files upload at most
+/// `upload.concurrency` of them at once together.
+#[tokio::test]
+async fn trees_sharing_the_session_limits_upload_concurrency_files_at_most() {
+    let backend = FakeBackend::new();
+    backend.set_block_size(4);
+    backend.set_profile(pdmount_backend::fake::NetProfile {
+        rtt: Duration::from_millis(50),
+        up_bytes_per_sec: None,
+        down_bytes_per_sec: None,
+    });
+    let mut config = config();
+    config.upload.concurrency = 2;
+    let limits = crate::limits::SessionLimits::new(&config);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut engines = Vec::new();
+    for name in ["One", "Two"] {
+        let root = backend.add_root(name, None, None).expect("root");
+        let mut options = EngineOptions::in_dir(
+            &dir.path().join(name),
+            config.clone(),
+            test_device("dev-a"),
+            fixed_clock(),
+        );
+        options.limits = Some(Arc::clone(&limits));
+        let (engine, _inval) = Engine::open(
+            Arc::new(backend.tree(&root.volume, root.root.clone())),
+            options,
+        )
+        .await
+        .expect("engine");
+        engine.ensure_listed(ROOT_INO).await.expect("list");
+        engine.reserve_inos(16).await.expect("inos");
+        engines.push(engine);
+    }
+    assert!(Arc::ptr_eq(&engines[0].gate, &engines[1].gate));
+    backend.take_peak_uploads();
+    for engine in &engines {
+        for index in 0..6 {
+            write_file(engine, ROOT_INO, &format!("f{index}"), b"0123456789");
+        }
+    }
+    for engine in &engines {
+        engine.start_background();
+    }
+    for engine in &engines {
+        settle(engine).await;
+    }
+    assert_eq!(backend.take_peak_uploads(), 2, "two trees, one session");
+    for engine in &engines {
+        engine.shutdown().await.expect("shutdown");
+    }
+}
+
+/// D114 (review): once a tree is retired (a gone share), the reply of a
+/// change whose commit ends later answers EIO, so a write is never
+/// acknowledged and then left out of the export; the write gate is closed.
+/// A change that committed before is acknowledged.
+#[tokio::test]
+async fn a_retired_engine_acknowledges_no_change_after_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let (engine, _inval) = open(&backend, dir.path()).await;
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    let reply = |engine: &Engine| {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        engine.after_commit_kept(move |kept| {
+            let _ = sender.send(kept);
+        });
+        receiver
+    };
+    let (attr, handle) = engine
+        .create(ROOT_INO, b"kept.txt", 0o644, true, WRITE)
+        .expect("create");
+    engine.write_local(handle, 0, b"before").expect("write");
+    let before = reply(&engine);
+    engine.store.flush().await.expect("flush");
+    assert!(before.recv().expect("reply").is_ok());
+
+    // A write in flight when the tree is retired: queued, then retired,
+    // then committed (the writer thread waits for `release` first).
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    engine.store.write(move |_| {
+        let _ = wait.recv();
+        Ok(())
+    });
+    engine.write_local(handle, 6, b" in flight").expect("write");
+    let in_flight = reply(&engine);
+    engine.retire();
+    release.send(()).expect("release");
+    engine.store.flush().await.expect("flush");
+    assert!(matches!(
+        in_flight.recv().expect("reply"),
+        Err(CoreError::Errno(nix::libc::EIO))
+    ));
+    assert!(engine.is_retired() && !engine.write_gate_open());
+    assert!(matches!(
+        engine.write_local(handle, 0, b"after"),
+        Err(CoreError::ReadOnly)
+    ));
+    engine.release_file(handle);
+    // Its content stays queued for the export.
+    assert!(engine.queue_counts().pending > 0);
+    assert_eq!(read_file(&engine, attr.ino).await, b"before in flight");
+    engine.shutdown().await.expect("shutdown");
+}
+
+mod brought_back;
+mod lifecycle;
+mod markers;
+mod scan;
+mod swap;

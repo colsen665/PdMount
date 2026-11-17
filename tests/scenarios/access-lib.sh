@@ -4,6 +4,13 @@
 # the scenarios check only what reached the backend. Device B of the `second`
 # mode never had the rules, so it is checked like a fresh mount.
 
+# `pdmount access` reaches My Files only (D110): in a share's tree the role
+# is the write gate (x16).
+if [[ ${TARGET:-my-files} == share ]]; then
+    echo "$(basename "$0" .sh): access rules reach My Files only (D110); skipped for TARGET=share"
+    exit 0
+fi
+
 # Runs a command that must fail with "Read-only file system" (EROFS, D019).
 expect_erofs() { # <what> <command...>
     local what=$1 err

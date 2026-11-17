@@ -7,6 +7,12 @@
 #   2. The session is rejected: `status` shows `needs login`, local writes
 #      are accepted. When the fault is cleared (the fake daemon's stand-in for
 #      signing in again), the queue drains.
+#   3. The daemon is restarted while the drive is unreachable, then while the
+#      session is rejected: it starts from the stored account (offline, then
+#      needs login) and goes online when the fault is cleared.
+# `pdmount login` (D108): offline and online it says the profile is already
+# signed in and exits 0; with a rejected session, or with `--force`, it asks
+# for a sign-in, which the fake does not have.
 # Everything must be on the drive afterwards and nothing parked.
 source "$(dirname "$0")/lib.sh"
 [[ $BACKEND == fake ]] || { echo "E2 needs fault injection; skipped for BACKEND=$BACKEND"; exit 0; }
@@ -34,6 +40,8 @@ until status_text | grep -q '^Connection: offline'; do
     sleep 1
 done
 echo "offline after $((SECONDS - start)) s"
+out=$(pd login 2>&1) || fail "login while offline failed: $out"
+grep -q "already signed in as" <<<"$out" || fail "login while offline: $out"
 [[ "$(cat "$area/cached")" == cached ]] || fail "a cached file does not read while offline"
 [[ -n "$(find "$area/dst" -type f -print -quit)" && "$(cat "$area/dst/$(cd "$work/src" && find . -type f -size +0 | head -1)" | wc -c)" -gt 0 ]] ||
     fail "files written offline do not read back"
@@ -59,6 +67,8 @@ until status_text | grep -q '^Connection: needs login'; do
     sleep 1
 done
 echo "needs login after $((SECONDS - start)) s"
+if out=$(pd login --no-browser 2>&1); then fail "login with a rejected session did not ask for a sign-in: $out"; fi
+grep -q 'the fake backend has no login' <<<"$out" || fail "login with a rejected session: $out"
 printf written >"$area/while-rejected"
 mkdir "$area/dir-while-rejected"
 [[ "$(cat "$area/while-rejected")" == written && -d "$area/dir-while-rejected" ]] ||
@@ -70,6 +80,53 @@ until status_text | grep -q '^Connection: online'; do
     sleep 1
 done
 
+out=$(pd login 2>&1) || fail "login while online failed: $out"
+grep -q "already signed in as" <<<"$out" || fail "login while online: $out"
+if out=$(pd login --force --no-browser 2>&1); then fail "login --force did not ask for a sign-in: $out"; fi
+grep -q 'the fake backend has no login' <<<"$out" || fail "login --force: $out"
+
+step "E2: a mount that starts while the drive is unreachable (§9.6)"
+# Like the Proton backend, the daemon starts from the account stored by the
+# last online mount, in `offline`, and goes online when the drive is back.
+pd unmount "$MNT"
+start=$SECONDS
+fake_fault offline --client "$uid_a"
+mount_now || fail "the daemon did not start while the drive is unreachable"
+until status_text | grep -q '^Connection: offline'; do
+    ((SECONDS - start < 60)) || fail "status never showed offline after the start: $(status_text)"
+    sleep 1
+done
+status_text | grep -q '^Account: *.' || fail "status shows no account: $(status_text)"
+[[ "$(cat "$area/cached")" == cached ]] || fail "a cached file does not read after an offline start"
+[[ -d "$area/dst" && -e "$area/remote-big" ]] || fail "the listing is not served after an offline start"
+if timeout 10 head -c 1 "$area/remote-big" >/dev/null 2>&1; then fail "an uncached file read after an offline start"; fi
+printf started-offline >"$area/started-offline"
+[[ "$(cat "$area/started-offline")" == started-offline ]] || fail "a file written after an offline start does not read back"
+start=$SECONDS
+fake_fault clear
+wait_queue_empty
+until status_text | grep -q '^Connection: online'; do
+    ((SECONDS - start < 120)) || fail "status never showed online after an offline start: $(status_text)"
+    sleep 1
+done
+[[ "$(head -c 1 "$area/remote-big" | wc -c)" == 1 ]] || fail "an uncached file does not read after going online"
+
+step "E2: a mount that starts with a rejected session (D042)"
+pd unmount "$MNT"
+start=$SECONDS
+fake_fault unauthorized --client "$uid_a"
+mount_now || fail "the daemon did not start with a rejected session"
+until status_text | grep -q '^Connection: needs login'; do
+    ((SECONDS - start < 60)) || fail "status never showed needs login after the start: $(status_text)"
+    sleep 1
+done
+start=$SECONDS
+fake_fault clear
+until status_text | grep -q '^Connection: online'; do
+    ((SECONDS - start < 120)) || fail "status never showed online after the rejected start: $(status_text)"
+    sleep 1
+done
+
 step "E2: everything is on the drive"
 status_text | grep -q '^Queue: *0 pending, 0 parked' || fail "queue not empty: $(status_text | grep '^Queue')"
 VERIFY_MODE=fresh verify_cycle
@@ -77,6 +134,7 @@ VERIFY_MODE=fresh
 assert_same_tree "$work/src" "$TEST_ROOT/e2/dst"
 expect_eq "rejected" "$(cat "$TEST_ROOT/e2/rejected")" rejected
 expect_eq "while-rejected" "$(cat "$TEST_ROOT/e2/while-rejected")" written
+expect_eq "started-offline" "$(cat "$TEST_ROOT/e2/started-offline")" started-offline
 [[ -d "$TEST_ROOT/e2/dir-while-rejected" ]] || fail "the folder made while rejected is gone"
 [[ "$(wc -c <"$TEST_ROOT/e2/remote-big")" == $((6 << 20)) ]] || fail "remote-big changed"
 check_hot_path

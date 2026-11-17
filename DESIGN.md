@@ -33,7 +33,7 @@ Source citations use these prefixes:
 | RQ5 | Web authentication either opens the link in the default browser or only prints it on the command line | §12.2 |
 | RQ6 | Crash-safe: acknowledged writes survive a daemon crash; fsync'd writes also survive a power loss; both are uploaded later | §4.3, §5.6, §7, §9 |
 | RQ7 | A mount never hangs indefinitely, and recovery never needs a reboot | §4, §14.4 |
-| RQ8 | Scope is My Files read-write; from M5, Computers and writable shares read-write, and other shares and Photos read-only, as further roots (D078–D081) | §14.5 |
+| RQ8 | Scope is My Files read-write; from M5, writable shares read-write, and other shares and Photos read-only, as further roots (D078–D081); Computers out of M5's scope (D122) | §14.5 |
 
 ### 1.2 Non-goals (v1)
 
@@ -112,41 +112,72 @@ All of these are fixed in the fork (`docs/sdk-patches.md`) and are hidden behind
 PdMount/
 ├── Cargo.toml                 workspace; [patch.crates-io] → SDK fork at a pinned rev
 ├── crates/
-│   ├── pdmount-core/          no fuser dependency; all logic; unit + property tests
-│   │   ├── engine.rs          M1: hot/slow operations for the FUSE adapter, prefetch, revalidation
-│   │   ├── events.rs          M2: event loop, echo filter, refresh (§9, D034)
-│   │   ├── singleflight.rs    M1: shared in-flight work (listings, block maps, blocks)
-│   │   ├── vfs/               inode table, dentries, handles, dir locks, attrs, name rules
-│   │   ├── access/            access rules, effective-mode resolution (§11)
-│   │   ├── store/             SQLite schema, migrations, single writer, group commit
-│   │   ├── cache/             block cache (disk, encrypted), RAM LRU, dedup, scheduler, pins
-│   │   ├── staging/           per-inode staging files, materialization bitmap, snapshots
-│   │   ├── journal/           desired-state reconciler, executor, dependencies, backoff, parking
-│   │   ├── sync/              event loop, refresh reconcile, remote apply, echo suppression
-│   │   ├── conflict/          detection, policy, naming, records
-│   │   ├── notify/            kernel invalidation queue (trait over fuser::Notifier)
-│   │   ├── policy/            .pdignore (local-only rules), device identity
-│   │   ├── metrics/           histograms, counters, hot-path network guard
+│   ├── pdmount-core/src/      no fuser dependency; all logic; unit + property tests
+│   │   ├── engine.rs          hot/slow operations for the FUSE adapter, prefetch, refresh walk; `Engine::open` returns the invalidation receiver (§9.5)
+│   │   ├── engine/            `impl Engine` by job (module map in `engine.rs`): open, accessors, background, shutdown, cache_glue, namespace, io, listing, staging, access, ignore, inos, prefetch, scan (the bulk-read guard's side); marker (pending marker, §14.4), pins (§5.3), queue (queue tooling, §8.2), surface (conflicts, `user.pdmount.*` xattrs), rights (write access a share can lose, §14.5), orphan (a gone share's queued changes, §14.5); proptests, tests
+│   │   ├── events.rs          sync engine: applying event pages, echo filter, refresh (§9, D034)
+│   │   ├── poller.rs          one event poller per volume for the trees on it; intervals, the volume in use (§9.2, §14.5, D110)
+│   │   ├── vfs.rs             inode tree, dentries, attrs, name rules; derives the kernel invalidations (`Effects::finish`)
+│   │   ├── access.rs          access rules, effective-mode resolution (§11)
+│   │   ├── store/             SQLite schema (`000n.sql` migrations), single writer, group commit
+│   │   ├── rows.rs            inode rows in the store (`inodes`, `remote`)
+│   │   ├── cache.rs, cache/   block cache (module map in `cache.rs`): layout, read, ram, disk (encrypted), budget (profile-wide cap, D110), block_cache (facade: dedup, scheduler)
+│   │   ├── pool.rs            block memory reserved at startup (§6.2)
+│   │   ├── staging.rs         per-inode staging files, materialization bitmap, snapshots
+│   │   ├── journal.rs         desired-state reconciler, executor, dependencies, backoff, parking
+│   │   ├── conflicts.rs       conflict naming and the conflict registry (§10.7, §10.8)
+│   │   ├── pdignore.rs        `.pdignore` (local-only rules)
+│   │   ├── device.rs          device identity
+│   │   ├── gate.rs            pacing of speculative API work: prefetch, refresh (§5.3, D027)
+│   │   ├── scan.rs            the bulk-read guard: scan detection, the scan reads' turns, their cache share (§6.4, D111)
+│   │   ├── health.rs          online / offline / needs_login, the `Monitored` backend wrapper (§9.6)
+│   │   ├── singleflight.rs    shared in-flight work (listings, block maps, blocks)
+│   │   ├── metrics.rs         histograms, counters, hot-path network guard
+│   │   ├── lock_order.rs      ranked locks, checked in debug builds (module doc of engine.rs)
+│   │   ├── config.rs, paths.rs, units.rs   config file, profile paths (§13), duration and size units
 │   │   └── errors.rs          CoreError → errno
-│   ├── pdmount-backend/
+│   ├── pdmount-backend/src/
 │   │   ├── lib.rs             trait Backend, RemoteNode, BlockInfo, BackendError
-│   │   ├── proton.rs          SDK adapter: block-map memo, error classification (401 retry: M3)
+│   │   ├── proton.rs          SDK adapter: block-map memo, error classification, one token refresh and retry on 401
 │   │   └── fake.rs            in-memory Proton model: clones share a drive, events, faults, latency
-│   ├── pdmount-fuse/          fuser::Filesystem impl → core; catch_unwind; reply dispatch
-│   └── pdmount/               binary: CLI, daemon, control socket, auth, service unit
+│   ├── pdmount-fuse/src/      `lib.rs`: fuser::Filesystem impl → core; catch_unwind; reply dispatch. `router.rs`: the inode router (§14.5). `mount.rs`: `mount()`, `mount_trees()` and the `pdmount-notify` threads (§9.5). `convert.rs`: type conversions, reply helpers
+│   └── pdmount/src/           binary
+│       ├── main.rs            CLI (§14); `fake` subcommands in fake-backend builds
+│       ├── daemon.rs, daemon/, mounts.rs   mount daemon, mount, unmount, reset (module map in `daemon.rs`: launch, run, backend, handler, stop, client, process, reset); mount-table lookups
+│       ├── roots.rs           further roots: their trees, engines and mounts in the daemon (§14.5, D110)
+│       ├── control.rs         control socket
+│       ├── supervise.rs       the daemon under a service manager: readiness, double-start checks (D074, D093)
+│       ├── service.rs         `service` command: user service under OpenRC or systemd (D074, D094)
+│       ├── autostart.rs       `autostart` command: XDG autostart entry (D059); the service's attach entry (D102)
+│       ├── bus.rs             the desktop's session bus kept for `notify-send` and the keyring helper; the bus chosen per service; the attach saved across restarts (D102)
+│       ├── keywait.rs         `session attach`; a start before the keyring answers: stand-in backend, retries (D106)
+│       ├── flush.rs           the flush at a stop (§14.4, D075)
+│       ├── logind.rs          logind shutdown delay lock (D091)
+│       ├── logind_stub.rs     stand-in for logind on a private bus (fake-backend builds, scenario X11)
+│       ├── resume.rs          warning at start when the last session left changes (D075)
+│       ├── incoming.rs        pending markers of other devices: one notification per tree and pass, capped `status` lines (D076, D126)
+│       ├── auth.rs, session.rs, credentials.rs, secret_cache.rs   session, sign-in, keyring and file secrets, SDK secret cache (§12)
+│       ├── status.rs, stats.rs, doctor.rs, notify.rs   `status`, `stats`, `doctor`, desktop notifications
+│       ├── access.rs, cache.rs, conflicts.rs, pins.rs, queue.rs, trash.rs   command clients of the control socket (`trash empty` runs without a daemon)
+│       └── probe.rs           Q1/Q6 API probe (test builds)
 ├── tests/
-│   ├── scenarios/             rsync_*.sh, git_*.sh, access_*.sh, multi_*.sh (VERIFY_MODE)
+│   ├── scenarios/             r*.sh, g*.sh, a*.sh, n1, e*, x*, m*, queue, ops, kill9, … (VERIFY_MODE); run-all.sh
 │   ├── pjdfstest.sh           runner: the subset, expected failures from pjdfstest.list
 │   ├── pjdfstest.list
-│   └── fsx.sh
-├── benches/
+│   ├── fsx.sh
+│   └── soak.sh
+├── scripts/
+│   ├── ci.sh                  local CI
+│   ├── bench/                 benchmarks: read, latency, M4 exit benchmarks
+│   ├── repro/                 probes and reproductions (keyring, session end)
+│   └── testdata/              the M1 dataset
 └── docs/
 ```
 
 **Adapted from pdcli (MIT, with attribution in file headers):**
 - `pdcli/credentials.rs`: keyring storage with a 0600 file fallback
 - `pdcli/pdignore.rs`: matcher only; the default list is emptied
-- `pdcli/service.rs` (systemd user unit): not used; an XDG autostart entry replaces the unit (D059)
+- `pdcli/service.rs` (systemd user unit): rewritten as `service.rs`, which also supports OpenRC and runs the daemon in the foreground under the manager (D074, D093, D094); the XDG autostart entry (`autostart.rs`, D059) remains for desktop login
 
 ### 3.2 Backend trait
 
@@ -156,13 +187,14 @@ The core talks only to this trait, implemented by `proton::ProtonBackend` (SDK a
 #[async_trait]
 pub trait Backend: Send + Sync + 'static {
     async fn account(&self) -> Result<AccountInfo>;                              // username, root (cached)
-    async fn root(&self) -> Result<RemoteNode>;                                  // My Files root
+    fn upload_block_size(&self) -> u64;      // plaintext block size of uploads (default 4 MiB); seeds the cache after an upload
+    async fn root(&self) -> Result<RemoteNode>;                                  // the tree's root (My Files' for the main backend)
     async fn list_children(&self, folder: &LinkId) -> Result<Vec<RemoteNode>>;  // paginated inside
     async fn get_nodes(&self, ids: &[LinkId]) -> Result<Vec<Option<RemoteNode>>>;
     async fn blocks(&self, file: &LinkId, rev: &RevisionId) -> Result<Vec<BlockInfo>>; // {index, plain_size?}
-    async fn fetch_block(&self, file: &LinkId, rev: &RevisionId, idx: u32) -> Result<Bytes>; // verified plaintext
+    async fn fetch_block(&self, file: &LinkId, rev: &RevisionId, idx: u32) -> Result<Bytes>; // verified plaintext; default over fetch_block_into (probes, tests)
     async fn fetch_block_into(&self, file: &LinkId, rev: &RevisionId, idx: u32, buf: &mut [u8])
-        -> Result<usize>;                    // into a pool slot (§6.2); default: fetch_block and copy
+        -> Result<usize>;                    // into a pool slot (§6.2); required, every backend and wrapper implements it
     async fn upload_new(&self, parent: &LinkId, name: &str, src: UploadSource, meta: FileMeta)
         -> Result<(LinkId, RevisionId)>;
     async fn upload_revision(&self, file: &LinkId, base: &RevisionId, src: UploadSource, meta: FileMeta)
@@ -171,8 +203,9 @@ pub trait Backend: Send + Sync + 'static {
     async fn rename(&self, node: &LinkId, new_parent: Option<&LinkId>, new_name: &str, expect: Option<&NameHash>)
         -> Result<()>;
     async fn trash(&self, nodes: &[LinkId]) -> Result<Vec<Result<()>>>;
+    async fn revisions(&self, file: &LinkId) -> Result<Vec<RevisionMeta>>;       // oldest first; default Unsupported (tests, diagnostics)
     async fn latest_event_id(&self) -> Result<EventId>;
-    async fn poll_events(&self, since: &EventId) -> Result<EventPage>;          // {next, more, refresh, events}
+    async fn poll_events(&self, since: &EventId) -> Result<EventPage>;          // {next, more, refresh, events}; the backend's volume, called by its poller (§9.2)
     async fn storage_info(&self) -> Result<StorageInfo>;                          // used, max
 }
 ```
@@ -193,6 +226,10 @@ pub trait Backend: Send + Sync + 'static {
 `BackendError` is a typed enum: `NotFound`, `AlreadyExists`, `PermissionDenied`, `QuotaExceeded`, `FileTooLarge`, `TooManyChildren`,
 `NestingTooDeep`, `RevisionConflict{current}`, `NameConflict`, `InvalidMove`, `RateLimited{retry_after}`, `Transient`, `Unauthorized`, `Integrity`,
 `Offline`, `Unsupported`, `Other`.
+
+A backend serves one tree: a volume and a root folder on it (D080, D110). `ProtonBackend::new` resolves My Files;
+`ProtonBackend::tree(volume, root)` makes the backend of a further tree over the same session, client and transfer
+limits, and `account().root` and `root()` name that tree's root. `FakeBackend::tree` does the same on the fake.
 
 The SDK's `BlockMap` (content key, URLs, tokens, hashes) stays inside the Proton adapter, memoized per revision for 10 minutes with
 one fetch per revision at a time. The core sees only `BlockInfo` and asks for blocks by index.
@@ -215,7 +252,7 @@ one fetch per revision at a time. The core sees only `BlockInfo` and asks for bl
         │   ▲        ▲                ▲                                     │
         │   │   journal executor ── conflict ──┐                            │
         │   │        │                         │                            │
-        │   └── sync engine (events) ──► notify queue ──► fuser::Notifier   │
+        │   └── sync engine (events) ──► invalidation channel ──► (§9.5)    │
         └────────────┬─────────────────────────┬────────────────────────────┘
                      │ Backend trait           │
         ┌────────────▼──────────┐   ┌──────────▼─────────┐
@@ -224,6 +261,8 @@ one fetch per revision at a time. The core sees only `BlockInfo` and asks for bl
                      ▼
               Proton Drive API
 ```
+
+The channel's receiver goes to `pdmount-fuse`, whose notify thread calls `fuser::Notifier` (§9.5).
 
 ### 3.4 Data flows
 
@@ -235,7 +274,7 @@ one fetch per revision at a time. The core sees only `BlockInfo` and asks for bl
 - **Write:** kernel `write` → access check → `pwrite` to staging, bump `content_gen`, reply. Then `release`
   → debounce → journal executor → snapshot → upload → commit to store (clean only if the generation is unchanged).
 - **Remote change:** sync loop → `poll_events` → resolve nodes → one store transaction (apply and advance the cursor)
-  → notify queue → `inval_entry`/`inval_inode`/`delete`.
+  → invalidation channel → notify thread → `inval_entry`/`inval_inode`/`delete` (§9.5).
 
 ---
 
@@ -276,7 +315,9 @@ When a deadline expires, the request replies EIO and logs it. The background fet
   staged inodes is unlocked: on btrfs, closing a file that was truncated to 0 bytes flushes it and waits for a commit
   in progress.
 - **Lock order**, outermost first: one inode's staging lock, the map of staged inodes, the access rules (§11), the
-  table, then leaf locks that take nothing while held (journal entries, the conflict registry, `.pdignore` rules). A
+  table, then leaf locks that take nothing while held (journal entries, the conflict registry, `.pdignore` rules); queueing
+  a store write (a short mutex and an unbounded channel send, no wait) is below all of them (the journal's `queued` rows,
+  D105). A
   lock is taken only while holding locks above it, so the table is never read recursively (with a writer waiting, the
   second read blocks for good). Debug builds check the order on every acquisition and panic on a violation
   (`lock_order.rs`), so the tests and property tests enforce it. No lock is held across `.await` or while calling the
@@ -299,7 +340,7 @@ When a deadline expires, the request replies EIO and logs it. The background fet
   committed (`synchronous=NORMAL`, no fsync). The fuser thread does not wait: the Reply goes into a waiter list, which
   the writer drains after each commit, and is sent from there; waiting adds no write of its own. A request that queued nothing, or whose rows are already committed, is answered at once; on the
   hot path only the rows queued by the handler's own thread count. Errors are answered at once.
-- **Kernel notifications** go through a single async notify task (§9.5). They are never sent from a FUSE handler thread, because invalidating
+- **Kernel notifications** go through a single notify thread, fed by a channel (§9.5). They are never sent from a FUSE handler thread, because invalidating
   an inode with a request in flight on the same channel can deadlock.
 
 ### 4.4 Runtime layout
@@ -309,11 +350,12 @@ main
  ├─ tokio multi-thread runtime (workers = num_cpus, max 8)
  │   ├─ sync engine task
  │   ├─ journal executor (upload workers = 4, namespace worker = 1 ordered)
- │   ├─ cache scheduler (block downloads: 5 in total; interactive 5, readahead 2, prefetch 1; D033)
- │   ├─ notify task
+ │   ├─ cache scheduler (block downloads: 5 in total per session; interactive 5, readahead 2, prefetch 1; D033)
  │   ├─ auth task (proactive refresh, needs_login)
+ │   ├─ logind task (system bus: delay lock, PrepareForShutdown; §14.4) and, at a stop, the flush task
  │   └─ control socket server
  ├─ store writer thread and store sync thread (§4.3)
+ ├─ `pdmount-notify` thread (kernel invalidations, §9.5; owned by pdmount-fuse)
  └─ fuser BackgroundSession (4 threads, clone_fd)
 ```
 
@@ -334,7 +376,7 @@ opens a file wait for an RCU grace period: 30–80 ms stalls of all FUSE threads
   answered from RAM. The SQLite store persists the tree, so a remount serves the last known state immediately and catches up in
   the background.
 - **Catching up after a mount (D034):** the event task resumes the stream from the stored cursor (§9.1), so remote changes
-  made while unmounted arrive as events and reach the kernel through the invalidation queue (§9.5). The listed tree is
+  made while unmounted arrive as events and reach the kernel through the invalidations (§9.5). The listed tree is
   walked (every listed directory listed again, one at a time, paced as in §5.3 by D027, root first) only when the server
   asks for a `refresh` or the profile has no cursor (§9.4). This replaced startup revalidation on every mount (D025).
 - **Network guard:** handlers marked hot run inside a `metrics::hot` scope. Any `Backend` call within that scope increments
@@ -354,12 +396,24 @@ opens a file wait for an RCU grace period: 30–80 ms stalls of all FUSE threads
 |---|---|---|
 | Listing prefetch | On a user opendir, once per directory per mount, background-list subdirectories to depth 2 | 32 listings per trigger, prefetch priority |
 | Small-file prefetch | Files ≤ 256 KiB in that directory are fetched into the block cache | 16 MiB per directory |
-| Sequential readahead | A per-handle detector prefetches the next 2–4 blocks (8–16 MiB) | readahead permits |
-| Pins (`pdmount pin <path>`, D060) | Every file at or below the path is downloaded and kept, and new revisions are fetched as the tree learns of them. One background task looks at the tree when woken (pin, unpin, a listing or event that changed nodes, a rename, a removal, an upload), at the start and every 5 minutes: it pins the current revision of each clean remote file, lets go of the others, lists unlisted pinned folders depth first, then fetches what is missing at prefetch priority, one background turn per file or 16 blocks. Failures back off like the journal, without parking; it waits while offline or needing a login. A pin follows its inode; a file replacing a pinned one takes the pin over (atomic save); deleting the node deletes the pin | Not counted against `cache.max_bytes`, reported apart. `pin` is refused when what is known of the path does not fit in the free disk space less 1 GiB; the fetcher stops below 1 GiB free, with a WARN |
+| Sequential readahead | A per-handle detector prefetches the next 2–4 blocks (8–16 MiB); none for scan reads (§6.4) | readahead permits |
+| Pins (`pdmount pin <path>`, D060) | Every file at or below the path is downloaded and kept, and new revisions are fetched as the tree learns of them. One background task looks at the tree when woken (pin, unpin, a listing or event that changed nodes, a rename, a removal, an upload), at the start and every 5 minutes: it pins the current revision of each clean remote file, lets go of the others, lists unlisted pinned folders depth first, then fetches what is missing: a file's block list in a background turn, its blocks at prefetch priority without one (D120), bounded by the prefetch download slot (§6.4). Failures back off like the journal, without parking; it waits while offline or needing a login. A pin follows its inode; a file replacing a pinned one takes the pin over (atomic save); deleting the node deletes the pin | Not counted against `cache.max_bytes`, reported apart. `pin` is refused when what is known of the path does not fit in the free disk space less 1 GiB; the fetcher stops below 1 GiB free, with a WARN |
 
 Background API work (listing prefetch, small-file prefetch, the event loop and refresh listings, §9) is paced (D027): one request at a time,
-at most two starts per second, and none while a foreground listing or read is in flight. Proton rate-limits bursts with
+at most two starts per second, and none while a foreground listing or read is in flight. With further roots these count over the
+session, all trees together (§6.4, "Per session"). Proton rate-limits bursts with
 HTTP 429, and the SDK's retry back-off exceeds the 20 s metadata deadline, so unpaced prefetch turns into EIO for users.
+
+How the gate works (`gate.rs`, D120): a turn is a place in one queue, held for the spacing and the request only. Work waits for
+the foreground to end before it queues, and again, out of the queue, when a request came meanwhile, so a waiting guess never
+holds up anything behind it. A turn holds metadata requests only: block downloads (readahead, a pin's blocks, Photos'
+thumbnails, whose URL request starts in a turn) are bounded by the download permits (§6.4) instead, so no turn lasts a
+download of many MiB. The event sync is not a guess: each of its steps (a poll, a `get_nodes` batch, a listing of an event
+page, a fresh cursor) waits for the foreground at most 2 s (`EVENT_PATIENCE`), then takes its place in the queue and the
+spacing like any turn, so remote changes arrive under a steady load in any tree, at the same pacing. Refresh listings (§9.4)
+stay speculative. The refresh task is one of the engine's background tasks, so a stop ends it; it ends by itself when the
+tree's root is gone or refused (a revoked share), with the refresh still owed (no cursor stored) and the tree left to the
+daemon to remove.
 
 ### 5.4 Kernel caching
 
@@ -459,10 +513,11 @@ These are measured in the daemon from request receipt to reply, on SSD, warm pro
   - **Backend calls** (`backend_<method>`, one per `Backend` method): the call into the backend as the engine makes
     it, inside the connectivity monitor (calls it refuses while signed out are not timed).
 - **Counters:** cache RAM/disk hits, misses, evictions and corrupt entries, pool fallbacks, prefetched blocks, listings,
-  backend calls, `rate_limited` (backend calls answered HTTP 429), uploads, expired deadlines, handler panics and
+  scans begun, scan reads and blocks evicted for the scan share (`scans`, `scan_reads`, `scan_evictions`, §6.4), backend
+  calls, `rate_limited` (backend calls answered HTTP 429), uploads, expired deadlines, handler panics and
   `hot_path_network_calls`.
 - **Gauges,** computed when read: `queue_pending` and `queue_parked` (journal entries), `queue_oldest_secs` (how long the
-  oldest entry that is not parked has been dirty), `staged_open_files` (staging descriptors open in the LRU, §7.1).
+  oldest entry that is not parked has been queued, counted across restarts, D105), `staged_open_files` (staging descriptors open in the LRU, §7.1).
 - `pdmount stats [--json] [--reset]` prints counters, pool slots, gauges and a latency table (`count`, p50, p99, max;
   operations not seen are left out) over the control socket. `--json` prints the reply (adds p90); `--reset` clears the
   histograms after reading them (counters stay).
@@ -489,7 +544,7 @@ These are measured in the daemon from request receipt to reply, on SSD, warm pro
 - Sizes are the uploader's claim, so they are bounded before they size anything (S-5, S-6):
   - A file's size is the sum of its claimed block sizes when the revision has them (saturating); a claimed `Size` that
     differs is logged at DEBUG and ignored. Without block sizes, the claimed `Size` is used, and staging bounds it (§7.1).
-  - A layout (`cache.rs` `Layout::new`) refuses, as `Integrity` (EIO), a declared block above 4 MiB, an empty block
+  - A layout (`cache/layout.rs` `Layout::new`) refuses, as `Integrity` (EIO), a declared block above 4 MiB, an empty block
     before the last, and declared sizes that do not add up to the file size. A block fetch refuses an expected length
     above 4 MiB before it takes a buffer.
 - `BlockMap` = content key plus a list of `{index, url, token, sha256, plain_size}` (P1 pagination, P3 public type). It is kept in RAM
@@ -501,9 +556,13 @@ These are measured in the daemon from request receipt to reply, on SSD, warm pro
 | Layer | Key | Content | Limit | Eviction |
 |---|---|---|---|---|
 | RAM LRU | `(link, rev, idx)` | decrypted plaintext blocks, in block pool slots | 32 MiB (`cache.ram_bytes`, at least 16 MiB), reserved at startup | LRU per pool class, when a slot is needed |
-| Disk | `(link, rev, idx)` → `cache/blocks/xx/<blake3(key)>` | nonce ‖ XChaCha20-Poly1305 (key = `blake3::derive_key("pdmount block cache v1", cache master key)`, AAD = block key) | `cache.max_bytes` (10 GiB), 90 %/80 % watermarks on the unpinned bytes | LRU by `last_access`, kept ordered in memory; RAM hits count too (stored in batches every 60 s) |
+| Disk | `(link, rev, idx)` → `cache/blocks/xx/<blake3(key)>` | nonce ‖ XChaCha20-Poly1305 (key = `blake3::derive_key("pdmount block cache v1", cache master key)`, AAD = block key) | `cache.max_bytes` (10 GiB), 90 %/80 % watermarks on the unpinned bytes, of all trees together (§14.5) | LRU by `last_access`, kept ordered in memory; RAM hits count too (stored in batches every 60 s) |
 
 Revisions are immutable, so cache entries never need invalidation, only eviction.
+
+The disk layer can get its key after the start (D106): a daemon that starts before the keyring answers opens the index
+(`cache_blocks`) without a cipher. Eviction, pins and the `cache` commands work; reads miss (never "corrupt", so nothing is
+deleted), and downloads go to RAM only, nothing is sealed or seeded. `BlockCache::unlock` sets the key once.
 
 The RAM LRU is sized to the working set of blocks being read, not to a long-term cache: a block arrives as 4–32 FUSE reads of
 at most 1 MiB, and without it each read would decrypt the whole block again (AEAD per block). Long-term caching of file
@@ -567,7 +626,7 @@ transparently. Local corruption is treated as a cache miss, never as a fatal err
 ### 6.4 Scheduling
 
 - **In-flight dedup:** a `HashMap<BlockKey, Shared<BoxFuture<…>>>` running a spawned task means readers, readahead, prefetch, and materialization share one download.
-- **Three priority classes** with separate permits: interactive (reads and foreground materialization), readahead (also materialization and base reads for uploads), prefetch.
+- **Four priority classes** with separate permits: interactive (reads and foreground materialization), readahead (also materialization and base reads for uploads), prefetch, and scan (1 permit, below).
 - **Transfer limits (D033), kept slightly below the official SDKs:**
   - Downloads: at most 5 blocks in flight over all classes. The C# SDK allows 6 block transfers per direction, shared by
     all files (`cs/client/cs/src/Proton.Drive.Sdk/ProtonDriveClient.cs:28`, `Nodes/TransferQueue.cs:39-41`); the JS
@@ -580,8 +639,42 @@ transparently. Local corruption is treated as a cache miss, never as a fatal err
     files with 6 blocks in total (C#). The client's download queue gets the same limits: the adapter's block
     downloads (`download_verified`) take a block permit from it, 5 now as `DOWNLOADS` above (before, 6), and take no
     file permit.
+  - *Per session* (D110): Proton's rate limits are per session and user (`cs/README.md:40`), and a daemon's trees share
+    one session and one drive client (`ProtonBackend::tree`, so the client's queues above are already shared). PdMount's
+    own limits are counted the same way: one `pdmount_core::limits::SessionLimits` per daemon, made by My Files' engine
+    and passed to every further tree (`EngineOptions::limits`, and `PhotosOptions::limits` for Photos), holds the download permits (5 in total, per class as
+    above), the `upload.concurrency` permits (an upload takes one of its tree's and one of the session's) and the gate of
+    the background turns (§5.3), so a request a user waits on in any tree holds back the background work of all. An
+    engine opened without one (tests) has its own. Not shared: the FUSE slow-path limit (64, per mount, as the kernel's
+    `max_background`) and each tree's journal steps other than uploads (one at a time per tree). A batch of Photos'
+    thumbnails holds the session's prefetch slot while it downloads (D120).
 - **Seeding:** after a successful upload, the snapshot is split into blocks and inserted under the new revision. When git reads a pack it
   just wrote, nothing is downloaded.
+- **Bulk-read guard (D081, D111; `crates/pdmount-core/src/scan.rs`, `[scan]` in Appendix B).** A thumbnailer, a content-type
+  sniffer or a recursive `grep` opens many files and reads the start of each; as interactive reads they would take every download
+  slot, readahead and the block cache. One guard per session sees the opens of every tree (My Files and the further roots, §14.5):
+  - *Detection:* only opens for reading alone count, and only those a program asked for (not the engine's own reads, not
+    `O_CREAT` of an existing file). A scan begins
+    when `scan.opens` (10) different files were opened within `scan.window` (5 s), counted over all trees, and ends at an open after
+    which at most one file was opened within the window. A handle is classed when it is opened: one opened while no scan runs is
+    interactive for good, so opening one photo after a scan stays fast.
+  - *Scan reads* are the reads through a handle opened during a scan until `scan.first_bytes` (8 MiB, two blocks) were read through
+    it; the rest of the file is read interactively, so a large file copied whole is held back only at its start. A scan read that
+    needs the network (its block list or a block that is neither cached nor being downloaded) first takes a turn of the guard's
+    gate (`gate.rs`): one at a time over the session, starts `scan.interval` (100 ms) apart, and none while a request a user waits
+    on (an interactive read, a listing, a write that fetches) is in flight in any tree. A turn waits at most a third of
+    `timeouts.block` (20 s), then the read goes anyway, so the guard slows a scan but never makes it time out. The download takes the
+    scan permit and a download slot; scan reads do not hold back the tree's background work (§5.3) and get no readahead. An
+    interactive read that joins a scan download still waiting for the scan permit raises it: the download waits for an
+    interactive permit instead, so a user's read never queues behind the scan (D120).
+  - *Cache share:* blocks that scan reads stored on disk are tracked by the guard, by age; above `scan.cache_share` (10 %) of
+    `cache.max_bytes` the oldest of them are evicted, whichever tree holds them (pinned and protected blocks excepted). An
+    interactive read of such a block takes it out of the scan blocks, and so does any download of it other than a scan read's, a
+    pin of its revision, and its leaving the disk by another path (the cap, `cache gc`, a wipe, a corrupt file; D120), so the
+    share counts only scan blocks on disk. The share is not kept across a restart: earlier scan blocks
+    are ordinary blocks then. The RAM pool is shared as before (§6.2).
+  - The guard is per session, not per process: during a scan, a file another program opens is classed as part of it.
+    `scan.opens = 0` turns the guard off.
 
 ### 6.5 Reads of dirty inodes
 
@@ -726,6 +819,13 @@ Locally, the rename is always atomic: one in-RAM swap plus one store transaction
 - A local-only file renamed to a non-ignored name becomes a normal pending upload. If it is renamed over an existing remote target, it becomes a
   revision of the target (§7.6). pdcli instead trashed the original (`docs/pdcli-evaluation.md` §2 #4).
 - Matchers are compiled once per `.pdignore` content generation.
+- **Whose rules (D124):** in My Files, and in a further tree on the user's own volume, the rules are the profile's file
+  followed by the tree root's `/.pdignore`. In a tree on another user's volume (every share, §14.5) only the profile's
+  file applies: the share's `/.pdignore` is an ordinary file that syncs like any other, so its writers (the owner, any
+  editor) decide nothing about what of the user's stays local-only, and a `!` line there cannot undo the user's rules
+  (`EngineOptions::remote_ignore`).
+- **When a share goes (D124):** its local-only files are exported to `orphaned/` with its queued changes (§14.5,
+  "Revocation with changes queued"); their content is only in the staging, so nothing deletes it first.
 
 ### 7.8 Quota and errors
 
@@ -756,12 +856,23 @@ Locally, the rename is always atomic: one in-RAM swap plus one store transaction
   Trash. Sequences coalesce naturally. For example, create → write → rename → unlink before the first upload produces nothing remotely.
 - **Dependencies are by inode.** A create or move waits until the parent's `link_id` is known. A rename or trash waits until its own
   `link_id` is known. A blocked entry records what it waits for; the executor has one wake signal and rechecks a blocked entry after 5 s at the latest. No remote ids are captured at enqueue time.
+  A step can also find a dependency (a folder's trash, §8.4): the entry records it and is planned again when that entry
+  finishes a step or leaves, otherwise after a back-off by its waits in a row (1 s → 5 min; D116). Waits are not failed
+  attempts, and a wait found while the entry changed, or was retried or forced, changes nothing (D121). An entry made
+  only because something waits for it, and that leaves at its first look without a change or a step, wakes nothing:
+  its node is as the waiting entry saw it, and may have nothing to do ever (D121). An entry that starts to wait for such
+  a waiting entry makes it look again at once, since it may be what that entry waits for (D117).
 - **Listings are merged, not copied:** a node follows its remote placement and attributes only while it has no pending
   local change of that kind; local nodes the server does not know are kept; a node removed remotely while something below
   it changed locally is reported as vanished and, once the server confirms it is gone, only the minimal chain of pending
   items and their folders is created again (§10.5, D040).
 - **Name reservation:** before creating or moving a node to `(P, N)` remotely, any remote occupant that the local state has moved or
-  deleted is processed first. Cycles (a ↔ b swaps) are broken through a temporary `.pdmount-swap-<ino>` name.
+  deleted is processed first. Cycles are broken through a temporary `.pdmount-swap-<ino>` name in the node's remote folder
+  (D117): a node with a remote place whose occupant (or, while its folder has no link yet, that folder) leads back to it,
+  following for each node the folder it goes into while that has no link or else the occupant of its target name, moves
+  there first. This covers a swap of two names, a rotation of three or more, and a folder created at the old name of a
+  node moved into it. A cycle through a deleted folder is broken by the folder's trash (§8.4). A temporary name never
+  becomes a node's local name, also when the reply to the move aside is lost (§8.3).
 - **Backoff and parking:** transient errors back off exponentially (1 s → 5 min with jitter). Permanent errors (typed, P8) park
   the item with a reason, at once for quota, size, permission, too-many-children, nesting-too-deep and unsupported errors, after 5 attempts for the others.
   Nothing is retried in a tight loop, and parked items never grow without bound (one entry per inode).
@@ -777,7 +888,8 @@ Locally, the rename is always atomic: one in-RAM swap plus one store transaction
 
 - `list` shows id, kind (`upload`, `create-folder`, `move`, `trash`, `metadata`), state (`waiting`, `running`, `backoff until T`,
   `parked: reason`), attempts, age and path; `show` adds the last error, the base revision and what the entry waits for. A deleted
-  file's entry is listed, and selected, at the place of its remote file. An entry the planner is about to remove is left out.
+  file's entry is listed, and selected, at the place of its remote file; a deleted folder moved aside to a temporary name (§8.4)
+  under its own name (D121). An entry the planner is about to remove is left out.
 - `retry` clears park and back-off and forces the entry.
 - `park` holds an entry with the reason `parked by user`. Unlike an automatic park, a local change does not resume it; `retry` or
   the next mount does. A step that is running finishes.
@@ -805,6 +917,11 @@ fuser routes RENAME and RENAME2 to `rename(.., flags)` (`fuser/lib.rs:536`).
 Before each remote rename or move the executor fetches the node fresh (`get_nodes`, one call) and decides (D040):
 
 - **Gone or trashed:** the node is settled like any vanished one (§10.5), then planned again.
+- **At its own `.pdmount-swap-<ino>` in the folder it is known in remotely:** this device's move aside (§8.2) took effect,
+  but its reply was lost (a timeout, a 5xx after the commit, the SDK's resend answered with `NameConflict`) or a crash
+  did not commit its row. Only the node's remote state takes the temporary name; its local placement stays, the move
+  aside counts as done, and the plan goes on to the local name. No record is written. A listing (§9) that shows the node
+  there does the same: the node does not follow to its own temporary name (D117 amended, V-7).
 - **Moved or renamed remotely** since the plan was made (the remote committed first): the inode follows the remote placement
   and a `RenameRename` record is written. If it cannot follow (the folder is not shown here, the name is taken locally),
   the local placement is kept and pushed at the next plan, with a record saying so. A remote move to the very target
@@ -833,8 +950,11 @@ a rename race would be last writer wins; a test documents that case.
   A file whose active revision differs from the one the local delete was based on (or that is marked `remote_newer`) is
   not trashed: the tombstone is forgotten, the parent is listed so that the file reappears, and `LocalDeleteRemoteEdit` is
   recorded. A folder is listed uncached (`list_children`): a child that moves out locally but has not moved remotely yet,
-  or a child folder deleted locally and not trashed yet (its own check lists it), makes the folder wait (transient,
-  retried with backoff); an unknown child, or a child file that changed, keeps the
+  or a child folder deleted locally and not trashed yet (its own check lists it), makes the folder wait for that
+  child's entry (§8.2; a deep tree goes one level per executor turn, D116). If a local node is placed where such a
+  folder still is remotely, the folder first moves to `.pdmount-swap-<ino>` in its remote folder and is trashed under that
+  name: the node may be the very child the folder waits for, or wait for one (D117). An unknown child, a child file that changed, or a
+  child moved into a local-only folder (§7.7: it never leaves this folder remotely, and the trash would take it along; D121) keeps the
   folder (`LocalDeleteRemoteChildren`, with the count) and the folder comes back with them. Known, unchanged children
   are trashed through their own entries. A write that lands between the check and the trash call ends up in the
   trash with the file (recoverable, no server precondition).
@@ -901,7 +1021,7 @@ On first mount, the engine calls `latest_event_id()` (`sdk/client.rs:1110`) and 
 listing, so no change can fall into a gap. The cursor is stored in `event_cursor`. It is queued to the store after the rows a
 page changed, so a crash never stores it without them, and is not stored at all while a refresh runs (§9.4). Every mount
 resumes the stream from the stored cursor, so changes made while unmounted arrive as events; a profile without a cursor
-refreshes.
+refreshes. Every tree (§14.5) keeps its volume's cursor in its own store; trees on one volume share its poller (§9.2).
 
 ### 9.2 Loop
 
@@ -909,12 +1029,24 @@ refreshes.
 loop {
     page = poll_events(cursor)                    // sdk/client.rs:1121
     if page.refresh { cursor = start_refresh(); continue }   // §9.4, in the background
-    apply(page.events)                            // §9.3; invalidations queued
+    apply(page.events)                            // §9.3; invalidations sent
     cursor = page.next; store(cursor) unless refreshing
     if page.more { continue }                     // drain immediately
     sleep(sync.poll_interval)                     // 30 s, as the official clients (D033)
 }
 ```
+
+**One poller per volume (D080, D110).** The loop runs in `pdmount_core::poller`: a `Poller` reads one volume's
+stream once per pass and hands each page to every tree on that volume, each applying it as below. A pass locks the
+cursors of all its trees in tree order and polls from the first tree's; a tree whose cursor differs (added later, a
+crash between two stores) refreshes from it (§9.4), as does a tree that failed to apply a page while others succeeded;
+only a page every tree failed is retried. An engine without a daemon's pollers (no `[[roots]]`, tests) runs a poller
+with itself as the only tree, which is the loop above. Intervals (D107): the user's own volume (My Files', devices')
+every `sync.poll_interval`; other users' volumes every 10 min, except the one whose tree was used last through a
+mount (a lookup, an open or an opendir in it), which polls at `sync.poll_interval`; when that volume changes, its
+poller recomputes its wait at once. Every poller polls at its start, and at once when a tree is added.
+While a Shared mount is mounted, one more task polls the core event stream every `sync.poll_interval`
+(`Pollers::watch_core`, M5.12, D112); a `DriveShareRefresh` calls `Pollers::share_refresh`, which reads the listing again (§14.5).
 
 Every API call of the loop (poll, `get_nodes`, listings) takes a background turn (D027), so user requests go first.
 The interval runs from the end of a pass, not from its start, as in the official event manager
@@ -954,7 +1086,7 @@ So remote changes take the same path as listings (`Tree::apply_listing_at`, §8.
 | Create (Create) | Inserted. `inval_entry(parent, name)` drops any cached negative dentry | A local node holds the name: the remote node is not shown and the occupant is a clash, settled when the journal next looks at it (§10.6). A `.pdignore`d occupant is renamed to a conflict name at once (`NameTaken`) |
 | Rename, move (UpdateContent) | Applied. `inval_entry` on the old and new names, `inval_inode` on the directories. Onto a name a local node holds: the clean node is detached and returns when the name is free | A pending local rename loses against a remote one: the inode takes the remote placement (`RenameRename`, the first committer wins). Onto a used name, a node with local changes becomes a new local node under its old name or a conflict name (`NameTaken`); a folder keeps only its pending items and the folders that lead to them, and nodes moved into it from outside keep their pending move (with their subtree), while its clean contents stay in the remote folder and return with it; renames inside it that are the only pending change lose (`RenameRename`) (D052) |
 | New revision (UpdateMetadata) | Rev, size, mtime and mode updated, the content epoch bumped (no `FOPEN_KEEP_CACHE` at the next open), `inval_inode` | Local content kept, `remote_newer` set and a notice sent (layer 1, §10.4); the upload settles it |
-| Trash (UpdateContent) | Subtree removed, `notifier.delete(parent, ino, name)` (`fuser/notify.rs:102`) | Reported as *vanished*; the engine asks the server and resurrects the minimal chain (§10.5). A tombstone (local delete) whose file got a new revision is revived instead |
+| Trash (UpdateContent) | Subtree removed, `notifier.delete(parent, ino, name)` (`fuser/notify.rs:102`); a file still open that is written afterwards comes back (§10.5, D128) | Reported as *vanished*; the engine asks the server and resurrects the minimal chain (§10.5). A tombstone (local delete) whose file got a new revision is revived instead |
 
 A listing never decides a vanished node itself: it keeps the old remote state and returns the node in `Changes::vanished`.
 `Engine::resolve_vanished` then fetches the node and its remote ancestors fresh (children of a trashed folder are not
@@ -968,12 +1100,17 @@ When `refresh = true`, the engine keeps serving the current state. It takes a fr
 stream from it at once, while a background task lists every listed directory again (one at a time, paced, D027) through the same
 rules as §9.3. Only when that pass succeeds is a cursor stored again, so a crash during a refresh finds the old cursor and the
 next mount refreshes again. A refresh asked for while one runs makes it run once more, because listings made before the newer
-cursor may have missed changes. A failed pass is retried after 30 s.
+cursor may have missed changes. A failed pass is retried after 30 s. A pass whose listing of the tree's root fails with
+`NotFound` or `PermissionDenied` (a revoked share) ends the task instead, with no cursor stored (`events_refreshing` stays
+true); the daemon removes such a tree. The task is one of the engine's background tasks: a stop ends it, and none starts
+after one (D120). The refresh listings take plain background turns; the sync's own steps take patient ones (§5.3).
 
-### 9.5 Kernel invalidation queue
+### 9.5 Kernel invalidation
 
-- One task owns a clone of `fuser::Notifier` (`Clone`, `fuser/notify.rs:52-53`). It receives `{InvalEntry, InvalInode, Delete}`
-  messages from the store writer for every change that did **not** originate from a kernel request.
+- The messages are `Invalidation::{Entry, Inode, Delete}` (`vfs.rs`), for every change that did **not** originate from a kernel
+  request. `Engine::apply_changes` sends them on an unbounded mpsc channel after it has queued the rows; `Engine::open` returns
+  the receiver. `pdmount_fuse::mount` hands it to `notify_loop`, which runs on a thread named `pdmount-notify` and owns a
+  clone of `fuser::Notifier` (`Clone`, `fuser/notify.rs:52-53`). The store writer sends nothing.
 - The tree derives the messages; no mutation lists them by hand. Mutations record which directory entries they touch
   (`place`/`unplace` in `vfs.rs`, a listing records all entries of its directory) and which nodes' attributes changed.
   One pass at the end (`Effects::finish`) compares each touched entry with its state before the first change. For each
@@ -983,11 +1120,12 @@ cursor may have missed changes. A failed pass is retried after 30 s.
   inside a removed subtree get nothing: the `delete` of its top covers them. Then `inval_inode` goes to each node whose
   attributes changed.
 - ENOENT from the kernel (nothing cached) is ignored.
-- The task never runs on a FUSE thread and never holds core locks while calling into the kernel.
+- The notify thread is not a FUSE thread and holds no core locks while calling into the kernel.
 
 ### 9.6 Offline mode
 
-One `Health` per engine holds the state `online`, `offline` or `needs_login` (`crates/pdmount-core/src/health.rs`, D041).
+One `Health` per session holds the state `online`, `offline` or `needs_login` (My Files' engine makes it; further trees
+share it through `EngineOptions::health` and do not probe it themselves, D110) (`crates/pdmount-core/src/health.rs`, D041).
 The backend the engine uses is wrapped in `Monitored`, which shows every result to `Health`:
 
 - `Offline` (a connection failure, Appendix A): the shared failure count goes up; at 3 in a row the state becomes `offline`.
@@ -1013,6 +1151,10 @@ The backend the engine uses is wrapped in `Monitored`, which shows every result 
 (§13.1). If the session check cannot connect, the daemon builds the session from the stored tokens (unchecked), creates the
 backend from that file, opens the engine on the stored state (which makes no request once the profile was mounted online),
 and starts in `offline`. A profile that was never mounted online cannot be mounted offline.
+The fake backend does the same (M5.6 finding 4): an online start stores the drive's account and root in the same file
+(volume `fake`); when the fake's `account` call fails with `Offline` the daemon starts in `offline` from it, and with
+`Unauthorized` in `needs_login` (D042); the handle then answers `account` from the stored value without a request, as
+`ProtonBackend::with_root` does. Without a stored account, or with any other error, the start fails.
 
 ---
 
@@ -1065,7 +1207,7 @@ Server behaviour, verified on the real API in M3.1 (TODO.md Q1, Q6; docs/plans/m
 | Situation | Resolution |
 |---|---|
 | Edit/edit | The server version stays at the name. Local content is uploaded as a new file with the conflict name. Locally, the dirty inode is renamed to the conflict name (open fds follow it), and the server version appears at the original name as a new inode |
-| Remote delete, local edit | **Resurrect**: upload the local content as a new file at the same path, recreating missing ancestors with new links (conflict name if the path is now occupied) |
+| Remote delete, local edit | **Resurrect**: upload the local content as a new file at the same path, recreating missing ancestors with new links (conflict name if the path is now occupied). This also holds for an edit that comes after the delete removed the clean file locally, through a handle opened before (a write or truncate on the detached node): the file comes back with the removed folders above it that are still in memory, each with only the chain to it; the topmost goes into the nearest folder still shown, under its old name or its conflict name, or into the root if that folder is no longer known (D128). A file removed by a local `unlink` or `queue drop` does not come back |
 | Local delete, remote edit | Before trashing, check `active_rev == base_rev` (§8.4). If not, **do not trash**: the newer remote revision reappears locally and a `LocalDeleteRemoteEdit` record is written. Trash has no server precondition, so a small window remains: a revision written inside it is in the trash with the file. The trash is recoverable, which mitigates it |
 | Remote delete, local clean rename | The delete wins (content is in the Proton trash). Recorded. This holds for a node whose remote placement is inside the deleted folder. A node renamed into the deleted folder from outside it is not deleted on the drive: its rename loses, and it returns to its remote placement (`adopt_remote_placement`; a rename step whose destination folder is gone settles the folder, not the node) |
 | Rename/rename (same node, different targets) | Fresh pre-check, then the `OriginalHash` precondition (enforced, §10.4; §8.3). The first committer wins: the inode moves to the remote name, and a `RenameRename` record is written |
@@ -1076,8 +1218,8 @@ Server behaviour, verified on the real API in M3.1 (TODO.md Q1, Q6; docs/plans/m
 The tree carries the pure steps of these resolutions (`vfs.rs`, unit-tested; the listing rules and `resolve_vanished` call them since M3.8, the journal from M3.9 on, including its rename and trash steps since M3.11):
 `split_conflict` (edit/edit: the local inode takes the conflict name, the server version becomes a new inode at the original name),
 `yield_name` (a local rename to a free conflict name), `unbind_tombstone`, `adopt_remote_placement` (refuses cycles, unlisted
-folders and taken names), and `resurrect_minimal` (keeps the pending items and the folders that lead to them as nodes to create
-again, removes the rest, and reports the removed nodes whose clean rename lost). `Changes` also carries `vanished`, `clashes`,
+folders and taken names), `resurrect_minimal` (keeps the pending items and the folders that lead to them as nodes to create
+again, removes the rest, and reports the removed nodes whose clean rename lost), and `bring_back` (a removed file written through an open handle, D128). `Changes` also carries `vanished`, `clashes`,
 `notes` and `remote_newer` for them.
 
 ### 10.6 Create/create
@@ -1198,6 +1340,11 @@ system".
 | `rename` | source parent **and** target parent (and the target entry when replaced) |
 
 - Moving an entry with a rule carries the rule. Moving a subtree out of a `ro` area is denied, because its source parent is `ro`.
+- **Write gate (D080, D110, D114):** each tree has one, open for My Files; a share's follows its role (§14.5). It is
+  checked with the rules above: closed, every operation of the table answers EROFS, reported modes lose their write
+  bits and `user.pdmount.access` reads `ro`, as under `mount -o ro`; work already accepted still uploads. It changes at
+  runtime (`Engine::set_write_gate`), invalidating the tree's cached attributes; unlike `-o ro` it is not a kernel
+  read-only mount.
 - **Reported attributes:** in `ro` subtrees, `getattr`/`lookup`/`readdirplus` clear the write bits (`& !0o222`). Tools see read-only
   before they try to write. The stored mode is unchanged, so switching back to `rw` restores the exact original mode.
 - **Permission checks** are the daemon's, not the kernel's: the mount has no `default_permissions`, which would answer
@@ -1283,6 +1430,12 @@ Config rules are imported at mount time. From then on the database is authoritat
 
 This applies to `pdmount login` and to `pdmount mount` when there is no valid session.
 
+- **`pdmount login` with a working session (D108):** without a daemon, `login` first resumes a stored session as
+  `status` does (§14.2), but may prompt for a locked keyring (D104). A session that resumes is kept: `login` prints
+  `Profile <p> is already signed in as <account>` and exits 0. One the server rejects (or whose keys cannot be
+  unlocked, D085), or no stored session, leads to the web sign-in. Any other failure (Proton unreachable, keyring
+  unavailable) is reported, exit 1, with a pointer to `--force`. `pdmount login --force` skips the check and signs in
+  anew, replacing the stored session.
 - The sign-in URL and user code from the `on_sign_in(url, code)` callback are **always printed** on the command line.
 - The link is **also opened in the default browser** (`xdg-open`) according to `--browser` / `--no-browser`, or
   config `auth.browser = "auto" | "always" | "never"`.
@@ -1291,15 +1444,28 @@ This applies to `pdmount login` and to `pdmount mount` when there is no valid se
   - If launching the browser fails, PdMount prints a warning; the printed link remains the fallback.
 - **`mount` without a session:** `mount` runs the login flow before mounting (browser per `auth.browser`). With `--no-login`, it
   exits with an error instead (for scripts).
-- **`pdmount login` while a daemon runs:** the daemon runs the sign-in and keeps its mount (D042). The command asks for the link
-  (control request `login`), presents it as above and polls `status` until the daemon's login is over. A login as another
-  account than the mounted one is refused.
+- **`pdmount login` while a daemon runs:** the command sends the control request `login` (`force` with `--force`). A daemon
+  waiting for the keyring tries it first (D106). Then, without `force`, a daemon that is `online` or `offline` answers
+  that no sign-in is needed, with the mount's account, and `login` prints that the profile is already signed in and
+  exits 0 (D108); offline is a network state, not a rejected session. In `needs_login`, or with `force`, the daemon runs
+  the sign-in and keeps its mount (D042): the command presents the link as above and polls `status` until the daemon's
+  login is over; the new session replaces the old one there. A login as another account than the mounted one is refused.
+  The fake backend has no sign-in: there `login` answers like a Proton daemon when no sign-in is needed, and fails
+  otherwise.
 - **From autostart or in the background:**
   - The daemon shows the link in `pdmount status` (`Sign-in:` and `Code:` under `Session:`), which reads it over the 0600 control
     socket. The log carries only the code and a hint to run `pdmount login` or `pdmount status`; the desktop notification
     (`notify-send`, only with a session bus; at most one per 30 s) says "Sign-in needed for profile <p>: run `pdmount login`".
+    A sign-in the user asked for (`login`, `login --force`) is announced instead as "PdMount: sign-in link ready", "Sign-in
+    link ready for profile <p>: open it from `pdmount login` or `pdmount status`" (an INFO log line); a running sign-in
+    keeps the reason it started with (D108).
     Neither carries the link: its fragment holds half of the fork secret, and `notify-send`'s argv is readable by other users (D071).
   - The mount stays up in `needs_login` and does not exit. The flow lasts 10 min; `pdmount login` starts a new one on demand.
+
+```
+$ pdmount login
+Profile default is already signed in as <account>; the mount continues (`pdmount login --force` signs in anew).
+```
 
 ```
 $ pdmount login --no-browser
@@ -1314,6 +1480,16 @@ Waiting for sign-in… done. Logged in as <account>.
 - **Rotation:** `token_credential.subscribe_tokens_refreshed()` (`rs2/auth.rs:284`) persists every rotation immediately, in a task of
   its own (a keyring prompt may take 120 s). A rotated refresh token that is lost would force a re-login. A 60 s timer stays as a
   fallback.
+- **Storing the tokens (D106 amended, finding 8):** a resume writes the session only when the check changed its tokens
+  (compared with the session as loaded). A write that fails after the server accepted the session does not fail the
+  resume: the session is active with its tokens unsaved (`LoggedIn::unsaved`). The daemon goes online with it and its
+  token saver writes them later (the 60 s timer, the next rotation, the shutdown's last save); while they are unsaved,
+  the timer and a rotation first probe the collection without a prompt (`keyring_state`) and write only when it is
+  unlocked (in allow mode also when the keyring is unavailable, since the write then goes to the file), so a retry
+  never opens an unlock dialog. The log has one WARN per failure streak and an INFO when a save ends it; `status`
+  prints `Tokens:     not yet saved to the keyring (<reason>)`. A one-off command (`status`, `login`, `trash empty`)
+  goes on with the session; `login` warns that the next mount may need a sign-in, since the stored tokens are the
+  ones the check replaced.
 - **Reactive refresh (`with_reauth` around every `Backend` call):** when the adapter classifies a response as 401, it calls `token_credential.get_refreshed_access_token(rejected)`
   (`rs2/auth.rs:335`, single-flight; `token_credential` is public at `rs2/session.rs:37`) and retries once. Clones share token state
   (`rs2/auth.rs:22-73`), so the drive client never needs rebuilding.
@@ -1325,6 +1501,32 @@ Waiting for sign-in… done. Logged in as <account>.
   - the link presentation of §12.2 starts;
   - a login for the mounted account replaces the backend's session (`replace_session`), kicks the probe (§9.6) and the queue drains.
     A mount can start in `needs_login` when it has local state and a known root (D042).
+- **Start without the keyring (M5.17, D106):** when the session or the cache key cannot be read because the keyring is
+  unavailable (no Secret Service on the bus, a dismissed unlock dialog; in allow mode too), a profile that has mounted
+  before (a known root, and `state.db` made for it: `meta.root_link` equal) mounts at once in `needs_login` instead of
+  exiting, which a supervisor would answer with a respawn loop. The engine runs on a stand-in backend
+  (`keywait::Deferred`: the stored account, every other call `Unauthorized`) with the disk cache closed (§6.2, its
+  blocks are sealed with the cache key): the stored tree, staged content and all local writes work, clean content reads
+  EIO, the queue waits. Readiness is signalled once the mount answers (§14.4).
+  - *Under a service* (`--service`): the start's keyring calls wait 30 s at most in all, and a profile that has mounted
+    before first probes the default collection without a prompt (`keyring_state`); unless it is unlocked, every keyring
+    call of the start fails at once as unavailable (`credentials::hold_keyring`), so the start reads nothing, shows no
+    dialog and is ready in seconds. A foreground `mount` without `--service` reads and may prompt.
+  - *Retries* (`keywait::Wait`): at `session attach` (D102) and at `pdmount login`, which read and may prompt (`login`
+    then answers "already signed in" unless the mount came up in `needs_login` or `--force` is given, D108; an attempt still running after the keyring
+    timeout plus 60 s is reported as running). The timer depends on what the last attempt waits for: the keyring
+    (unavailable or locked) every 60 s, only when the collection is then unlocked (probe first, no prompt); the user (no
+    session, no cache key, another account's session) never, `status` and `login` say what to do; the backend (the
+    start's network failed) after an exponential back-off from 60 s up to 30 min and at least Proton's `Retry-After`,
+    which an attach or a login within it respects too.
+  - *When it answers:* the cache key is read but never made (a daemon with its caches open makes none,
+    `credentials::caches_open`; a missing one waits for the user, and nothing is deleted); the backend is opened as at a
+    start (`open_backend`) with the mount's root expected, so another account's root is refused before it is stored;
+    the disk cache is unlocked; a Proton session's token watch starts before the backend replaces the stand-in; the
+    state becomes the backend's; then the refresh and D042's sign-in start.
+  - The wait's keyring calls run on threads of their own: a stop does not wait for one waiting for an unlock dialog.
+    One WARN in the log; `status` gives the reason; one desktop notification, once one can be delivered (a bus, the
+    attached one or the own, with a notification server that owns or can start its name; chosen per service, §14.4).
 
 ### 12.4 Secrets at rest
 
@@ -1345,20 +1547,65 @@ Waiting for sign-in… done. Logged in as <account>.
 
   - **Keyring answers:** found, missing, or unavailable. Unavailable covers no Secret Service, a dismissed prompt
     (Cancel), a timeout and any other error. Only "missing" counts as no entry.
-  - **Waiting:** a locked collection waits for its unlock prompt; `dbus-secret-service` waits up to a year. Each keyring
+  - **Waiting:** a locked collection waits for its unlock prompt; `dbus-secret-service` waits up to a year. Every other
+    D-Bus call of `dbus-secret-service` 4.1 times out after 2 s ("Did not receive a reply"), which is what a Secret Service
+    that is still starting, or never starts, produces. M5.16 (D101): before a call on the process's own bus or, without
+    an attached bus, the service's (§14.4, D102 amended 2026-11-14), `bus::state_on` asks whether `org.freedesktop.secrets` is
+    owned or activatable (`NameHasOwner`, `ListActivatableNames`; the 30 s cache of §14.4; at most the call's own
+    timeout, 6 s at most). Owned: the call goes ahead and the note after 2 s names an unlock dialog. Activatable only: it
+    goes ahead, the note says that D-Bus is starting the Secret Service, and a failure is reported as "the Secret
+    Service did not start" with the bus address and the `Exec` line of the activation file (found in `$XDG_DATA_HOME`
+    and `$XDG_DATA_DIRS`, `dbus-1/services`; on the service's bus the message says "the service's session bus"), without
+    a prompt of its own. Neither bus: fail at once with "no Secret Service on the session bus", naming the own bus and,
+    when it was asked, the service's, no call made; likewise "no session bus" (no `DBUS_SESSION_BUS_ADDRESS` and no
+    `$XDG_RUNTIME_DIR/bus`) and a bus that does not answer. The failure counts as the keyring being unavailable (the
+    flag below). Each keyring
     call runs on a helper thread and is abandoned after 120 s (`PDMOUNT_KEYRING_TIMEOUT_SECS` overrides it for tests). After 2 s, a note on stderr says that an unlock dialog may
-    be open, possibly behind other windows. Once the keyring is unavailable, the process does not call it again, except
-    for the daemon's last token save at shutdown.
+    be open, possibly behind other windows. Once a read, a delete or a probe finds the keyring unavailable, the
+    process does not call it again until a probe (`keyring_state`, which clears this) or the daemon's last token save
+    at shutdown.
+    A failed write does not stop later calls (D106 amended): it comes after a read worked, so the keyring is there.
+  - **Timed-out writes (D106 amended):** gnome-keyring rewrites its whole file in `SetSecret`/`CreateItem`, which can
+    take longer than the 2 s per call. A write that fails with `org.freedesktop.DBus.Error.NoReply` (found in the
+    error's chain as a `dbus-secret-service` D-Bus error) is read back after 500 ms and compared (equality only, never
+    logged); if the value differs or cannot be read, it is written once more, and a second time-out is read back too.
+    Only then does it fail; any other error fails at once. This runs inside the call's timeout, in the process or in
+    the keyring helper, so moving a file into the keyring gets it too.
   - **Reads:** a secrets file, if present, is the newest copy, because every successful keyring write deletes it. It is
     read first, in every mode. Outside force mode it is then moved into the keyring and deleted, unless another daemon of
     the profile is running (the pid file, §13.1), in which case it is left in place.
+  - **Queries do not prompt (D104):** a command that reads secrets only to display something must not open an unlock
+    dialog. `status` without a daemon asks the Secret Service whether the default collection is locked (as `doctor`
+    does, without a prompt) before it resumes the session; when it is, it reads nothing and prints
+    `Session:    unknown (keyring locked; unlock it or run `pdmount login`)`, still showing device and mount state,
+    and exits 1. With a daemon, `status` takes everything from the control socket and reads no secret. Force mode never
+    makes the probe. `stats`, `queue`, `conflicts`, `cache`, `sync`, `access`, `pin` and `doctor` need no secret from
+    the keyring or, for `doctor`, probe first.
   - **Cache key:** creating a new cache key deletes the SDK caches and the block cache, which the old key encrypted.
     The SDK secret cache goes with them, so in force mode the session and the cache key must both be in files. In
     allow-file mode, an unavailable keyring with no key file creates a key only when none of these caches exist;
-    otherwise the command fails, because the key that encrypted them may be in the keyring.
+    otherwise the command fails, because the key that encrypted them may be in the keyring. A daemon that has opened
+    its caches makes no key at all (`credentials::caches_open`, D106): a missing key is an error there (`NoCacheKey`),
+    not a new key that would delete the caches under its mount.
   - **Daemon:** `mount` reads the stored session in the foreground process before it starts the daemon, so an unlock
     dialog appears while the user waits at the terminal. The daemon gets the same flag. It stores tokens only when they
-    have changed (§12.3).
+    have changed (§12.3). A daemon whose keyring does not answer at its start mounts and waits for it (§12.3, D106).
+  - **The desktop's bus (M5.17, D102):** `keyring` and `dbus-secret-service` take the bus from the environment only, and
+    the daemon never changes its own. While `session attach` has handed it a bus other than its own (§14.4), each keyring
+    call (get, set, delete and the lock probe `keyring_state`, which `doctor`, D104's `read_would_prompt` and the
+    waiting daemon use) first chooses its bus by the per-service order of §14.4 (D102 amended: `org.freedesktop.secrets`
+    owned on the attached bus, else owned on the own bus, else activatable on the attached, else on the own; with none,
+    unavailable at once without a call). On the own bus the call runs in the process as without an attach; on the
+    attached bus it runs in a child, `pdmount keyring-helper` (hidden; `/proc/self/exe`), with that bus in the
+    child's environment. One JSON request goes to its stdin and one JSON reply comes from its stdout
+    (`found`/`missing`/`done`/`state`/`failed`); key and value never go into argv (D071), the child writes no log and no
+    stderr, and the replies' `Debug` hides values. The call runs under the same 120 s timeout and the child is killed at
+    it; the request is written to its stdin from a thread of its own, so the timeout covers the write too. Before each
+    run the kept address is checked (`bus::route`: it answers `GetId` and its socket's peer has the daemon's uid,
+    §14.4) and dropped if not. A failed call, on either bus, clears the cached choice; on the attached bus it also checks
+    the bus (`GetId`, 2 s) and drops the address when it does not answer (logout); later calls use the daemon's own bus
+    until the next attach. A keyring on the own bus opens its unlock dialog on the desktop once an attach has passed the
+    desktop's display to that bus (§14.4, D102 amended).
   - **Tests:** tests use force mode, except the keyring tests (`scripts/repro/keyring-d024.sh`).
 - Staging is plaintext with mode 0700 (§17).
 - The SDK fork never logs secrets or response bodies (P16, `docs/sdk-patches.md`). Upstream 0.4 logs the key passphrase
@@ -1394,8 +1641,13 @@ Waiting for sign-in… done. Logged in as <account>.
 | `~/.local/share/pdmount/<profile>/proton-root.json` | volume, root folder and account name from the last online mount, for mounting offline (§9.6) or waiting for a login (§12.3) |
 | `~/.local/share/pdmount/<profile>/device-id` | device identity (§10.2). Stays a file so `reset --keep-login` keeps it |
 | `~/.cache/pdmount/<profile>/sdk-entities.db` | SDK entity cache (encrypted, rebuildable) |
+| `~/.local/share/pdmount/<profile>/trees/<key>/` | a further tree's `state.db` and `staging/` (§14.5, D110); `<key>`: 32 hex digits of a BLAKE3 hash of its volume and root link. My Files' paths above are unchanged |
+| `~/.local/share/pdmount/<profile>/orphaned/<share> (<time>)/` | the queued changes and local-only files of a share that went away with them: `files/`, `pdmount-orphaned.json`, and `state/` when some content could not be written (§14.5, D114, D124); the user deletes it |
+| `~/.local/share/pdmount/<profile>/shared-names.json` | the names the Shared mount shows its shares under, by share key, so a remount keeps them (§14.5, D125); kept by `reset` |
+| `~/.cache/pdmount/<profile>/trees/<key>/blocks/` | a further tree's block cache (16 MiB RAM pool; counted against the profile's `cache.max_bytes` with My Files', D110 amended, §14.5) |
 | `$XDG_RUNTIME_DIR/pdmount/<profile>.sock` | control socket (0600); `~/.local/share/pdmount/<profile>/control.sock` when the session has no runtime directory |
 | `<profile>.pid` beside the control socket (`control.pid` in the fallback) | process id and mountpoint of the mount daemon, for `unmount --force` and for `status` after a crash |
+| `$XDG_RUNTIME_DIR/pdmount/<profile>.attach` | the desktop's bus and display kept by the last `session attach`, JSON (0600), read at the next daemon start (§14.4, D102 amended); none without a runtime directory |
 | `$XDG_STATE_HOME/pdmount/<profile>.log` | log; a background `mount` moves one above 16 MiB to `<profile>.log.1`, replacing that; 0600 in a 0700 directory, set again at every background `mount` |
 
 ### 13.2 Schema
@@ -1403,7 +1655,8 @@ Waiting for sign-in… done. Logged in as <account>.
 ```sql
 meta(key TEXT PRIMARY KEY, value BLOB)
   -- root_link, ino_reserved (inode numbers up to it are handed out; reserved 16 384 at a time, durably),
-  -- access_version, access_config_imported:/<path>, relist (folders to list again, space-separated inode numbers, D069).
+  -- access_version, access_config_imported:/<path>, relist (folders to list again, space-separated inode numbers, D069),
+  -- pending_marker (link of this device's marker on the drive, D076), incoming_notified (marker revisions announced, JSON).
   -- The schema version is `PRAGMA user_version`.
 
 inodes(ino INTEGER PRIMARY KEY, kind INTEGER, parent_ino INTEGER NULL, name TEXT NULL,
@@ -1428,6 +1681,14 @@ staging(ino INTEGER PRIMARY KEY, base_rev TEXT NULL, size INTEGER, materialized 
 journal(ino INTEGER PRIMARY KEY, kind INTEGER, state INTEGER, attempts INTEGER, next_at INTEGER,
         last_error TEXT NULL, parked_reason TEXT NULL, updated_at INTEGER)
   -- not used: the journal is derived from the inode rows at mount (§8.2)
+
+queued(ino INTEGER PRIMARY KEY, queued_at_ms INTEGER NOT NULL)
+  -- since migration 4 (D105): when a journal entry was queued, in unix milliseconds. The journal inserts a row when it makes
+  -- the entry and deletes it when the entry leaves (uploaded, forgotten), through the store's write queue, so the rows follow
+  -- the entries in order. At mount the rows are read: an entry made for a restored inode starts with the age
+  -- `now - queued_at_ms`, clamped to 0 .. 365 days, so `status` and `queue list` count from when the entry was queued. Rows
+  -- of inodes with no entry at mount are deleted. A lost row (a crash) only means an age counted from the mount. The age is
+  -- display only: `upload.max_dirty_age`, the debounce and the back-offs keep the monotonic time of this process.
 
 own_revisions(link_id TEXT, rev TEXT, created_at INTEGER, PRIMARY KEY(link_id, rev))
 
@@ -1457,8 +1718,9 @@ access_rules(id INTEGER PRIMARY KEY, ino INTEGER UNIQUE, link_id TEXT NULL, path
 **Migrations:**
 - Numbered SQL files, applied in one transaction at startup.
 - A downgrade is refused.
+- Migration 4 (M5.6, D105) creates `queued`.
 - `inodes.state`, `inodes.nlookup_persist`, `remote.trashed` and `revision_blocks.sha256` are not used.
-- `pdmount reset --keep-login` deletes the store, staging and block cache; the session, the SDK caches, `proton-root.json` and the device identity stay. It is refused while the journal has pending rows.
+- `pdmount reset --keep-login` deletes the store, staging and block cache (the further trees' under `trees/` too, D110); the session, the SDK caches, `proton-root.json` and the device identity stay. It is refused while the journal has pending rows; a refusal for further trees names their `trees/<key>/` directories. `--orphan-trees` moves those trees' state to `orphaned/tree <key> (<time>)/state/`, with a manifest that `status` lists, instead of refusing: a gone share's kept state cannot be uploaded by mounting it (D118).
 
 ---
 
@@ -1474,28 +1736,29 @@ Options come first, then verb or mode arguments, then **the path last**, with at
 
 | Command | Purpose |
 |---|---|
-| `login [--browser\|--no-browser]` | Web sign-in (§12.2); with a running daemon, the daemon runs it (D042) |
+| `login [--browser\|--no-browser] [--force]` | Web sign-in (§12.2); with a running daemon, the daemon runs it (D042). A working session is kept: with a daemon that is not in `needs_login`, or without one when the stored session resumes, `login` says the profile is already signed in as <account> and exits 0; without a daemon, a check that fails for another reason than a rejected session exits 1. `--force` signs in anew all the same (D108) |
 | `logout` | Remove the session and keys |
-| `mount [--foreground] [--browser\|--no-browser] [--no-login] [-o ro] [--backend proton\|fake:<dir>] [<mountpoint>]` | Start the daemon and mount (mountpoint overrides config). `--backend fake:<dir>` and `pdmount fake seed\|changes\|rename\|trash\|write\|create\|mkdir\|fault\|profile` exist only in test builds (feature `fake-backend`, §15.1). `--no-login` fails instead of signing in (M3.16). `-o ro`: every write path answers EROFS, as a root `ro` rule would, without changing the rules (D019); pending work still uploads |
-| `unmount [--wait\|--force] [<mountpoint>]` | `--wait` (the default): upload what is pending first, up to 10 minutes, and list parked items (§8.2). `--force`: see §14.4 |
-| `status` | Online/offline/needs_login, queue depth, oldest pending, parked items, conflicts, cache use, sign-in link if pending. M2: session, quota, mount, `Queue: N pending, M parked`, inodes, cache. M3.14: `Conflicts:  N open` when N > 0. M4.12: `Queue: N pending (oldest 3m), M parked`, `Events: last poll 12 s ago[, refreshing]`, `read-only` on the mount line. Without a mount it resumes the session itself, but not while the daemon is still shutting down (a resume could rotate the tokens the daemon is about to save) |
+| `mount [--foreground] [--browser\|--no-browser] [--no-login] [-o ro] [--backend proton\|fake:<dir>] [<mountpoint>]` | Start the daemon and mount (mountpoint overrides config). `--backend fake:<dir>` and `pdmount fake seed\|changes\|rename\|trash\|write\|create\|mkdir\|fault\|profile` exist only in test builds (feature `fake-backend`, §15.1). `--no-login` fails instead of signing in (M3.16). Only with `--foreground`, for a supervisor (M5.3, D093, §14.4): `--service openrc\|systemd`, `--notify-fd <n>` (n ≥ 3), `--clear-stale`; `$NOTIFY_SOCKET` needs no option. `-o ro`: every write path answers EROFS, as a root `ro` rule would, without changing the rules (D019); pending work still uploads |
+| `unmount [--wait\|--force\|--if-stale] [<mountpoint>]` | `--wait` (the default): upload what is pending first, up to 10 minutes, and list parked items (§8.2). `--force`: see §14.4. Under a service (`--service`) the plain form refuses, exit 1, and names the service's stop command; `--force` still works and says what the supervisor then does (OpenRC restarts the daemon, the systemd unit stays stopped; D093). `--if-stale`: detach the mountpoint only if it is a stale pdmount mount, else do nothing, exit 0; the systemd unit's `ExecStopPost=` (D094). Another profile's live mount at the mountpoint is never detached: `--if-stale` and the plain form refuse it (exit 1), `--force` refuses one whose source names another profile (D127) |
+| `status` | Online/offline/needs_login, queue depth, oldest pending, parked items, conflicts, cache use, sign-in link if pending. M2: session, quota, mount, `Queue: N pending, M parked`, inodes, cache. M3.14: `Conflicts:  N open` when N > 0. M4.12: `Queue: N pending (oldest 3m), M parked` (the oldest counts from when the entry was queued, also across a restart, D105), `Events: last poll 12 s ago[, refreshing]`, `read-only` on the mount line. `Tokens:     not yet saved to the keyring (<reason>)` while the session's current tokens are not stored (§12.3, D106 amended). Without a mount it resumes the session itself, but not while the daemon is still shutting down (a resume could rotate the tokens the daemon is about to save). It never opens a keyring unlock dialog (D104): with a daemon it reads no secret; without one, a locked default collection gives `Session:    unknown (keyring locked; unlock it or run `pdmount login`)` and exit 1 (§12.4) |
 | `sync [--timeout <s>] [<path>]` | Remote barrier (§5.6): upload now and wait until nothing under `<path>` is pending. Exit 1 with parked entries or at the timeout (default 600 s) |
 | `access set ro\|rw <path>` / `access unset <path>` / `access list [<path>]` / `access effective <path>` | §11.5 |
 | `pin <path>` / `unpin <path>` / `pin list` | Keep offline (§5.3), through the daemon. `list`: path, files, bytes fetched of known total, state (`fetching`, `complete`, `waiting-offline`, `waiting-space`). `unpin` takes the path of the pin itself and names it when given a path inside. `status` adds `Pinned: N paths, X of Y fetched` when N > 0 |
 | `queue list [<path>]` / `queue show [--id <ino>] [<path>]` / `queue retry\|park\|drop [--id <ino>] [--all] [<path>]` | Inspect and control the journal (§8.2, D061). Ids are inode numbers; a path selects its entry or, for a folder, every entry under it. `drop` prints what it would discard and changes nothing without `--yes` (exit 1) |
 | `conflicts list [--all] [<path>]` / `conflicts show <id\|path>` / `conflicts resolve keep-both\|keep-local\|keep-remote <id\|path>` | §10.8 |
-| `cache stats` / `cache gc [--target <bytes>]` / `cache wipe [<path>]` | Block cache maintenance, through the daemon. `stats`: disk bytes against the cap, blocks, pinned bytes, protected revisions, pool slots. `gc`: evicts the oldest blocks down to the target (default 80 % of `cache.max_bytes`) and prints what it freed. `wipe`: evicts every block that may go, also from RAM, or only those of files at or below the path. Pinned and protected blocks stay (§6.2) |
+| `cache stats` / `cache gc [--target <bytes>]` / `cache wipe [<path>]` | Block cache maintenance, through the daemon. `stats`: disk bytes against the cap, blocks, pinned bytes, protected revisions, pool slots; with further trees, My Files' bytes and blocks and the profile's total against the cap (§14.5). `gc`: evicts My Files' oldest blocks down to the target (default: as far as takes the profile's total to 80 % of `cache.max_bytes`, which without further trees is 80 % of the cap) and prints what it freed. `wipe`: evicts every block that may go, also from RAM, or only those of files at or below the path. Pinned and protected blocks stay (§6.2) |
 | `stats [--json] [--reset]` | Counters, gauges and latency histograms (§5.8) |
-| `reset --keep-login` | Rebuild local state (refused while the queue is non-empty, while mounted, and while the daemon is still shutting down) |
+| `reset --keep-login [--orphan-trees]` | Rebuild local state (refused while the queue is non-empty, while mounted, and while the daemon is still shutting down). `--orphan-trees`: further trees with changes not uploaded have their state moved to `orphaned/` instead of refusing (§13.1, D118) |
 | `trash empty --yes` | Delete everything in the account's trash for good (Proton only; refused while the profile is mounted or its daemon is still shutting down, since the daemon holds the session). Real-account test runs use it when storage runs low (D036) |
-| `doctor` | Check `/dev/fuse`, fusermount3, `/etc/fuse.conf`, keyring (reachable, default collection locked or not, read without prompting; the effective secret storage mode), config, login, clock skew, disk space, pdmount and app version; says whether autostart is enabled for the profile |
-| `autostart [enable\|disable]` | XDG autostart entry `$XDG_CONFIG_HOME/autostart/pdmount-<profile>.desktop` that runs `pdmount --profile <p> [<secret-storage flag>] mount` at desktop login; without an argument, shows whether it is enabled (D059). The `Exec` line names the running binary, quoted by the Desktop Entry spec |
-| `service [install\|uninstall] [--manager openrc\|systemd]` | M5: user service for the profile, OpenRC or systemd; without an argument, shows its state (D074, `docs/plans/m5.md`). Refused while `autostart` is enabled for the profile, and the other way round |
+| `doctor` | Check `/dev/fuse`, fusermount3, `/etc/fuse.conf`, keyring (reachable, default collection locked or not, read without prompting; the effective secret storage mode), config, login, clock skew, disk space, pdmount and app version; says whether autostart is enabled for the profile and whether a user service is installed, and warns when both are (M5.3, D093); for an installed service it warns when the stop timeout in its settings (or, on systemd, its mountpoint) differs from the config and when logind (elogind's `InhibitDelayMaxSec`) or `user@.service` would cut the flush short (M5.4, M5.5, D091, D094). M5.16 (D100, D101): for an installed service and a terminal with a session bus, the `desktop bus` line compares the terminal's bus with the service's (`unix:path=$XDG_RUNTIME_DIR/bus`) by bus ID (`GetId`): `ok` "same as the service's"; `ok` "attached" when the daemon (`status` reply field `attached_bus`) has this terminal's bus; `WARN` "not attached" (with the hint to log in again or run `pdmount session attach`) when it has none, has another one, has one that no longer answers, or no daemon runs; `WARN` when either bus cannot be asked. While a daemon runs and the buses differ, the line adds whether the Secret Service and the notification server are owned, activatable only or absent on the service's bus. No line without a service or without `DBUS_SESSION_BUS_ADDRESS` in the terminal. The keyring line names the bus it used when there was a choice ("on the service's session bus (…)" or "on this terminal's session bus", D102 amended 2026-11-14: the bus of §14.4 for a process without an attached bus, which the probe uses too) and tells a Secret Service that runs from one that D-Bus started for the probe (`NameHasOwner` first, so that it is known) and from none ("no Secret Service on the session bus", FAIL without a flag) or one that did not start ("the Secret Service did not start"), and a locked collection from an unlocked one, without a prompt. D127: a `mountpoint` line, `WARN` when another profile's config puts My Files or a root at one of this profile's mountpoints (§14.4, *Profiles and mountpoints*). M5.8: one `root` line per `[[roots]]` entry (none without roots), "<kind> at <mountpoint>: …": `ok` for an empty directory, this profile's live PdMount mount, or a missing folder whose nearest existing parent is writable (the mount creates it); `WARN` for a non-empty directory (its files are hidden while mounted) and a dead PdMount mount (cleared at the next start); `FAIL` for a file, a folder that cannot be read or created, another mount, another profile's live mount, or a mountpoint that overlaps My Files' or another root's. For a `photos` root with `photos.thumbnail_cache` on, the same line checks the thumbnail folder (`$XDG_CACHE_HOME/thumbnails`, else `~/.cache/thumbnails`; D115): `ok` when it is a writable directory or can be made, `WARN` when it is not writable or not a directory, or when it or a size folder (`normal`, `large`, `x-large`) has any group or other permission bit (thumbnails are decrypted pictures); a thumbnail problem is never worse than `WARN`, since the mount works without them |
+| `autostart [enable\|disable]` | XDG autostart entry `$XDG_CONFIG_HOME/autostart/pdmount-<profile>.desktop` that runs `pdmount --profile <p> [<secret-storage flag>] mount` at desktop login; without an argument, shows whether it is enabled (D059). The `Exec` line names the running binary, quoted by the Desktop Entry spec. Refused while a user service is installed for the profile (§14.4) |
+| `service [install\|uninstall] [--manager openrc\|systemd]` | M5: user service for the profile, OpenRC (M5.4) or systemd (M5.5), with the profile's secret-storage flag as `autostart` does; without an argument, shows its state (D074, D094). The manager is the one found running (`/run/systemd/system`, then `/run/openrc`) unless `--manager` names it. `install` writes the unit files, enables the service and starts it; `uninstall` stops it, disables it and removes the files. Refused while `autostart` is enabled for the profile or a service of the other manager is installed (§14.4) |
+| `session attach` | M5.17 (D102): run at login by the service's attach entry; sends `DBUS_SESSION_BUS_ADDRESS` (only `unix:path=` or `unix:abstract=`, checked here and in the daemon) to the profile's daemon for notifications and keyring calls. It also sends `DISPLAY`, `XAUTHORITY` and `WAYLAND_DISPLAY` when set, for the daemon's own bus (D102 amended). It prints one line: kept (with the bus the keyring and notifications now use, D102 amended, and a second line when the daemon set the display on its own bus), already the daemon's own bus (compared by bus ID; an address kept before is cleared), or no daemon running (exit 0). Without a daemon it saves the attach for the daemon's next start and says so ("its next start takes this session's bus"), unless the desktop's bus is the service's or there is no runtime directory (D102 amended 2026-11-14). An unreachable bus is refused (exit 1). Every attach makes a daemon that waits for the keyring try it again (D106). A kept bus is saved, so a restarted daemon uses it without a new attach (D102 amended) (§14.4, "`pdmount service`") |
 
 ### 14.3 Control socket
 
 JSON-lines request/response over a Unix socket at `$XDG_RUNTIME_DIR/pdmount/<profile>.sock` (0600, peer uid checked). `access`, `conflicts`, `pin`, `unpin`,
-`queue`, `sync`, `cache`, `stats` and `unmount` work through it; `login` and `status` use it when a daemon answers, and `mount` to see
+`queue`, `sync`, `cache`, `stats`, `session attach` (`AttachBus`) and `unmount` work through it; `login` and `status` use it when a daemon answers, and `mount` to see
 that one is ready or already runs. `logout`, `doctor`, `autostart`, `reset` and `trash empty` do their work without it; the last two use it only to refuse while a daemon runs.
 
 ### 14.4 Unmount and hang safety
@@ -1504,24 +1767,319 @@ that one is ready or already runs. `logout`, `doctor`, `autostart`, `reset` and 
 - **Autostart (D059):** no service manager supervises the daemon. A crashed daemon is not restarted; its stale mount is
   cleared with `unmount --force` (below). At logout the daemon ends with the session's SIGTERM if the session manager
   sends one, and otherwise keeps running until `unmount`.
-- **User service (M5, D074):** an OpenRC user service or a systemd user unit supervises `mount --foreground`, restarts it after a
+- **User service (M5, D074):** an OpenRC user service or a systemd user unit supervises `-v mount --foreground --service <manager> --clear-stale` (M5.4: with `--notify-fd 3` on OpenRC; `-v` logs at INFO as a background `mount` does, so the flush at logout and shutdown is in the log), restarts it after a
   crash, clears a stale mount at start, and stops it with SIGTERM at session end or shutdown, with a stop timeout of
-  `shutdown_grace` + 30 s.
-- **Flush (M5, D075; replaces step 2 below from M5.1):** SIGTERM, SIGINT or SIGHUP uploads what is queued at that moment, without
-  the debounce, for up to `timeouts.shutdown_grace` (90 s from M5.1). No wait while offline or in `needs_login`, none for parked
-  entries; rate limits and backoff apply. The next mount warns if entries were left. With D076, a flush that runs
-  out of time leaves `.pdmount/<device.id>.pending` in the root of each tree (§14.5) that has entries left and has the marker turned
-  on, and other devices and members with that tree mounted show it.
-- Shutdown on SIGTERM, SIGINT or `unmount` (D062):
+  `shutdown_grace` + 30 s. The systemd unit is ordered `After=dbus.service`, so the session bus outlives the daemon (D091).
+  What the systems allow (M5.0): OpenRC gives the full time at logout, but a shutdown kills user services about 16 s after
+  their SIGTERM; systemd caps user units at the stop timeout of `user@.service` (120 s), and on the Debian machine a logout
+  did not stop the user manager.
+- **`pdmount service` (M5.4, M5.5, D094):** the files are written under `$XDG_CONFIG_HOME`.
+  - *OpenRC:* `rc/init.d/pdmount` (shared: `supervise-daemon`, `notify="fd:3"`, `need dbus`,
+    `DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus`, `respawn_delay=5 respawn_max=3 respawn_period=60`, the command line
+    of M5.3, with `$pdmount_mount_args` after `mount`), the link `rc/init.d/pdmount.<profile>` to it, and `rc/conf.d/pdmount.<profile>` with `pdmount_secrets`,
+    `pdmount_mount_args` (empty, see below),
+    `retry="TERM/<grace+30>/KILL/5"` and `output_log`/`error_log` set to the profile's log file (created 0600). Then
+    `rc-update --user add pdmount.<profile> default` and `rc-service --user pdmount.<profile> start`. The script refuses to start
+    under a name that is not `pdmount.<profile>`, or without the profile's settings, and defines `start()` for failed starts
+    (below, D109).
+  - *systemd (M5.5):* the template `systemd/user/pdmount@.service` (shared: `Type=notify`, `Restart=on-failure`, `RestartSec=5`,
+    `RestartPreventExitStatus=78` (D109, below), `After=dbus.socket dbus.service`, `WantedBy=default.target`, `ExecStart=<binary> --profile %i $PDMOUNT_SECRETS mount $PDMOUNT_MOUNT_ARGS --foreground
+    --service systemd --clear-stale`; `%i`, not `%I`, which would turn a `-` in the profile into `/`) and the drop-in
+    `pdmount@<profile>.service.d/pdmount.conf` with `Environment=PDMOUNT_SECRETS=<flag>` (when the profile uses one),
+    `TimeoutStopSec=<grace+30>` and `ExecStopPost=-<binary> --profile %i unmount --if-stale <mountpoint>` (the configured mountpoint;
+    it detaches the mount only by M5.3's stale rule, see below). Then
+    `systemctl --user enable --now pdmount@<profile>`; when a daemon that no service runs is running, `enable` without `--now` (OpenRC: no
+    `start`), with a note, because the unit's start would fail over that daemon's mount. `uninstall` runs `disable --now`, removes the enable links, the drop-in and, when no
+    other profile is enabled, the template, then `daemon-reload`. A running daemon keeps its old unit until `systemctl --user restart`.
+    `doctor` warns when the drop-in's stop timeout or mountpoint differs from the config, and when `shutdown_grace` + 30 s exceeds
+    `user@.service`'s `TimeoutStopSec` (read from the unit and its drop-ins in `/lib`, `/usr/lib`, `/usr/local/lib`, `/run` and `/etc`;
+    120 s, said to be assumed, when none sets it; `DefaultTimeoutStopSec` is not read).
+  - *Test builds (feature `fake-backend`, D094 amended for M5.6):* `service install --backend fake:<dir>` (hidden; `<dir>` must exist, no
+    quote or backslash in it) runs the unit's daemon on a fake drive, for M5.6's manual runs: `pdmount_mount_args=--backend=fake:<dir>`
+    in `conf.d` or `Environment=PDMOUNT_MOUNT_ARGS=…` in the drop-in, both quoted for the target; `pdmount service` shows it. Release builds do not have the option.
+  - *Desktop bus (M5.17, D102):* `install` also writes `$XDG_CONFIG_HOME/autostart/pdmount-<profile>-attach.desktop`
+    (`<binary> --profile <p> session attach`, no secret flag; written by `autostart.rs`'s entry writer), `uninstall` removes it,
+    and `service` shows it. It is not an autostart entry for D059/D093: `autostart`'s state, `autostart enable`'s refusal and
+    `doctor`'s "both" check count only a `pdmount-<profile>.desktop` whose `Exec` does not end in `session attach` (the
+    profile `p-attach`'s autostart entry has the name of `p`'s attach entry; neither replaces nor counts as the other). At
+    each login it sends the desktop's `DBUS_SESSION_BUS_ADDRESS` to the daemon (control request `AttachBus`). The daemon
+    accepts only `unix:path=` and `unix:abstract=` addresses, connects (zbus, 2 s), checks that the bus is its own user's
+    (the socket's peer uid, `SO_PEERCRED`; D102 amended) and compares the bus ID
+    (`org.freedesktop.DBus.GetId`) with its own bus's: equal, it keeps nothing (and clears an address kept before); different,
+    it keeps the address (process-wide, `bus.rs`) and logs it at INFO; unreachable or another user's, it refuses with the
+    error.
+    *Per service (D102 amended after the Gentoo check):* the keyring and the notification server need not share a bus
+    (on a Gentoo system with i3, PAM's gnome-keyring runs on the service's bus and the notification server on the
+    desktop's; M5.6 had the opposite). With an address kept, `bus::route` picks the bus for each service, by its name
+    (`org.freedesktop.secrets`, `org.freedesktop.Notifications`): (1) the attached bus if the name is owned there,
+    (2) else the own bus if owned there, (3) else the attached bus if activatable there, (4) else the own bus if
+    activatable, (5) else none (keyring unavailable at once, no notification sent). Owned beats activatable, since an
+    activatable service on the wrong bus may never answer (D101). The checks are `NameHasOwner`, then
+    `ListActivatableNames` only for a name without owner (zbus, 2 s, on connections that pass the user check; the own
+    bus is asked only when the attached one does not own the name), cached per bus and name for 30 s; an attach, a
+    dropped address, a failed keyring call and a failed `notify-send` clear the cache. A change is logged at INFO
+    (`the keyring: using the daemon's own session bus`, `notifications: using the desktop's session bus`); the attach
+    reply and `session attach` name each service's bus, and `status` shows them as `Bus: desktop's bus attached;
+    keyring: …, notifications: …` while an address is kept (from the last choice, no D-Bus call). Without an address
+    kept, notifications use the process's own bus; the keyring's bus is chosen between the own bus and the service's
+    (next paragraph); on the own bus its calls are gated by the same owned/activatable check (D101, §12.4).
+    *Without an attached bus (D102 amended 2026-11-14, after the M5.16 check):* a command run in the desktop's
+    terminal without a daemon (`doctor`, `status`, `login`, `trash`), or one that reads the keyring itself, has the
+    desktop's bus as its own, where on the Gentoo system with i3 gnome-keyring is only activatable and never answers,
+    while PAM's keyring runs on the service's bus. Such a process (the daemon too, without an attach) chooses the
+    keyring's bus with `bus::keyring_buses`: its own bus (`session_address`) and, unless the own bus owns
+    `org.freedesktop.secrets`, the service's bus `unix:path=$XDG_RUNTIME_DIR/bus` when its socket exists and its bus ID
+    (cached 30 s with the name states) differs from the own bus's or the own bus cannot be asked. Order
+    (`bus::choose_without_attach`): (1) own bus owned, (2) service's bus owned, (3) own bus activatable, (4) service's
+    bus activatable, (5) none, unavailable at once with both buses named. The service's bus is used like an attached
+    one: its keyring calls run in the keyring helper with that address, the bus checked (`GetId`, the peer's uid) just
+    before each; a failure clears the cache, nothing is dropped. For a daemon run by the service the two buses are one,
+    so nothing changes there. The choice is logged at INFO when it changes (`the keyring: using the service's session
+    bus`).
+    On the attached bus, `notify-send` gets the address through `Command::env` and the keyring calls run in the helper
+    child of §12.4; a chosen attached bus is checked again just before (a bus that fails it is dropped: once the
+    desktop's bus has exited, another local user could listen at its address). On the own bus, `notify-send` and the
+    keyring calls run as without an attach. A failed call on the kept bus drops the address when the bus no longer
+    answers `GetId` (logout). Every attach resets the keyring's unavailable flag (`retry_keyring`) and asks a waiting
+    daemon to try the keyring (D106). The desktop must not be moved onto the service's bus: on Gentoo with SDDM that
+    broke udisks mounting (polkit "not permitted", M5.6).
+    *The desktop's display (D102 amended after the second Gentoo check):* a service on the daemon's own bus may start
+    programs by D-Bus activation that need the display, above all gnome-keyring's unlock dialog (`gcr-prompter`), and
+    the OpenRC user bus's activation environment has no `DISPLAY`. `session attach` therefore also sends those of
+    `DISPLAY`, `XAUTHORITY` and `WAYLAND_DISPLAY` that are set and non-empty (field `display`, absent from older
+    clients). The daemon keeps only these names with a value of at most 4096 bytes without control characters, and
+    logs the others at WARN without failing the attach (`bus::checked_display`). When the attach kept the address and
+    the keyring or notifications go to the own bus (its choice is the own bus; a route that fell back to the own bus
+    because the attached one was dropped meanwhile counts too), it calls `org.freedesktop.DBus.UpdateActivationEnvironment`
+    on its own bus with them (zbus, 2 s, the user check above), before the keyring retry, so that the prompter and an
+    activatable notification server open on the desktop. Its own environment is not changed, and variables missing at
+    the attach are not removed from the bus; the last attach wins. Success is logged at INFO with the values, a
+    failure at WARN; neither changes the attach's result. The reply lists the names set (`display`, absent from older
+    daemons), and `session attach` adds a line when there are any.
+    *Across restarts (D102 amended after the third Gentoo check):* an attach that keeps an address also saves it, with
+    the checked display variables, as `{"address": …, "display": {…}}` in `$XDG_RUNTIME_DIR/pdmount/<profile>.attach`
+    (`ProfilePaths::attach_file`; mode 0600, a temporary file renamed over it, written under the lock of the kept
+    address, `bus::keep`); without a runtime directory nothing is saved. Every place that clears the kept address
+    removes the file: an attach of the daemon's own bus, and a drop of an address whose bus is gone or fails the user
+    check (`bus::forget`). A daemon's start (`keywait::restore_saved_attach`, in `run_foreground` before the start's
+    keyring guard and first keyring call) reads it: opened with `O_NOFOLLOW | O_NONBLOCK`, then on the open file a
+    regular file of the daemon's uid of at most 16 KiB holding that JSON. The address then passes the attach's checks
+    (`bus::validate`; connect with the peer uid check; a bus ID different from the own bus's), and the display the
+    same check and the same rule for the own bus; the address is kept without a keyring retry (nothing has tried the
+    keyring yet), logged at INFO ("using the desktop's session bus saved by the last attach"). A file that fails any
+    check is removed (a symlink itself, never its target) and logged at INFO with the reason. The file stays while it
+    is used, so a later restart uses it too; the runtime directory ends with the user's last session.
+    *An attach before the daemon is up (D102 amended 2026-11-14):* at a login the OpenRC service and the window
+    manager's `session attach` start together, and the attach may find no daemon. `session attach` then saves the
+    attach itself (`keywait::save_for_next_start`: the same file, writer and display check), unless there is no
+    runtime directory or the desktop's bus is the service's (`$XDG_RUNTIME_DIR/bus` with the same bus ID; a service's
+    bus that does not answer counts as another, the daemon checks at its start); a desktop's bus that does not answer
+    is refused (exit 1). It then asks the daemon once more and, if one answers now, sends the attach as usual. A daemon
+    that starts meanwhile reads the file at its start as above, and once more just after its control socket listens
+    (`keywait::restore_late_attach`: an address not yet kept is taken, with the same checks, logged at INFO, and the
+    keyring is tried again), so an attach saved after the start's read and before the socket listens is not lost.
+    *Desktops without XDG autostart (D102 amended):* i3, sway and other plain window managers do not run the attach
+    entry. When `XDG_CURRENT_DESKTOP` names `i3` or `sway` (`service.rs` `NO_XDG_AUTOSTART`), or is unset, `install` and
+    `service` print a note with the line for its configuration: `exec --no-startup-id <binary> --profile <p> session
+    attach` (i3, `~/.config/i3/config`) or `exec <binary> --profile <p> session attach` (sway), the binary and profile
+    quoted for `sh -c`; unset, both lines as examples. The entry is still written (for `dex -a`); the window manager's
+    configuration is never edited.
+  - *Start without the keyring (D106):* a service daemon of a profile mounted before mounts at once when the keyring does
+    not answer, signals readiness and finishes its start when the keyring answers (§12.3). Waiting before the mount was
+    rejected: OpenRC's `supervise-daemon --notify` waits for readiness without a limit, so the service's start and the user
+    runlevel would block, systemd fails a `Type=notify` start after 90 s and restarts it, and the empty mountpoint would take
+    applications' writes. For the same reason the start under `--service` probes the collection first and reads nothing
+    from a locked one, and spends 30 s at most on the keyring (§12.3), so the units keep systemd's default start timeout.
+  - *Failed starts (D109):* a start that fails before the daemon reports ready is final for both managers; a daemon that
+    exits after readiness (a crash) is restarted. Causes left after D106: a broken config, a profile never signed in or
+    never mounted, preflight refusals, a FUSE mount failure, offline on a profile never mounted. The user starts the
+    service again once the cause is fixed; the error is in the log and in `rc-service`'s output or the journal.
+    - *Exit code:* under `--service`, a failure before readiness (from the command line that does not parse, through
+      the config, to the mount) exits 78 (`EX_CONFIG`) instead of 1 and says so on stderr (`supervise::failure_exit`);
+      after readiness a failure exits 1. The systemd unit's `RestartPreventExitStatus=78` keeps `Restart=on-failure` from
+      retrying a failed start every 5 s without end. OpenRC ignores the code.
+    - *OpenRC:* `supervise-daemon --start` waits for the readiness newline; when the daemon exits first, the start fails,
+      but the supervisor it forked keeps respawning the daemon (exit codes are ignored; `respawn_max` only bounds a
+      burst), and a respawn that succeeds runs while the service reads "stopped" (M5.6 finding 5). The script's
+      `start()` runs `default_start`; when that fails, it waits up to 2 s for the supervisor's pid file
+      (`$XDG_RUNTIME_DIR/supervise-<service>.pid` for a user service, `/var/run/` otherwise, as `supervise-daemon` picks
+      it) and stops that supervisor with `supervise-daemon <service> --stop`, then returns 1. A failed start takes
+      about 5 s (the supervisor's `respawn_delay` sleep). A supervisor whose pid file names a live process before the
+      start (a stray of a failure before D109) is not stopped: the start fails with "already running" as before.
+    - *A stray:* `status` (on stderr, also when the daemon does not answer) and `doctor` (the `service` check) warn when
+      the profile's daemon runs under `--service openrc` (its pid file) while OpenRC holds `pdmount.<profile>` as stopped:
+      no entry for it in `started`, `starting`, `stopping` or `inactive` of `$XDG_RUNTIME_DIR/openrc` (file lookups, not
+      `rc-service … status`, which runs the script and may rebuild the dependency cache). The warning names the recovery:
+      `RC_USER_SERVICES=yes RC_SVCNAME=pdmount.<profile> supervise-daemon pdmount.<profile> -U --stop` (the daemon
+      flushes and unmounts as at any stop), then `rc-service --user pdmount.<profile> start`. `-U` selects user mode:
+      OpenRC 0.64 no longer takes it from `RC_USER_SERVICES` in `supervise-daemon`; 0.62 takes either.
+    - *Tests:* the goldens and the `the_template_uses_…` unit test; `supervise.rs` unit tests for the exit code, the
+      stray check and the descriptor; `openrc_a_failed_start_leaves_no_supervisor` in `crates/pdmount/tests/service.rs`
+      runs the generated script on the installed OpenRC in a sandbox (temporary `XDG_CONFIG_HOME` and `XDG_RUNTIME_DIR`, a
+      stand-in daemon and `dbus` service; skipped without OpenRC): a failed start leaves no supervisor and reads stopped,
+      the next start and a stop work, a stray (made with `zap`) survives a start and draws `status`'s warning, and the
+      named command stops it. `svc.sh` checks exit 78 and a descriptor that is not a pipe.
+  - *elogind (D091):* `install` prints the root file `/etc/elogind/logind.conf.d/pdmount.conf` (`[Login]`,
+    `InhibitDelayMaxSec=<grace>`) unless the effective limit already reaches the grace; nothing under `/etc` is written. `doctor`
+    reads elogind's configuration (the main file and the `logind.conf.d` directories, layered by file name) and warns when the
+    limit is below the grace.
+  - `doctor` also warns when the stop timeout in the profile's settings differs from `timeouts.shutdown_grace` + 30 s; `service install`
+    rewrites it.
+  - Profile names are validated (§13.1); the binary, the mountpoint and the log path are quoted for the target syntax (`%` and `$`
+    doubled for systemd) and refused with a control character. The tools (`rc-update`, `rc-service`, `systemctl`) run without a shell,
+    found on `$PATH`.
+- **Under a supervisor (M5.3, D093):** the options of `mount --foreground` that unit files pass.
+  - *Readiness:* once the mount answers (the control socket serves), the daemon sends `READY=1` as one datagram to
+    `$NOTIFY_SOCKET` (a path, or `@name` for an abstract socket; systemd's `Type=notify`, OpenRC's `notify="socket:ready"`),
+    and with `--notify-fd <n>` writes a newline to descriptor `n` and closes it (OpenRC's `notify="fd:3"`). Only a pipe
+    is written and closed (D109): a daemon that `supervise-daemon` respawns has no pipe, and descriptor 3 may then be its
+    log, which is left as it is. A failure is logged and never stops the daemon. A background `mount` removes `NOTIFY_SOCKET` from its daemon's environment.
+  - *Stale mount:* `--clear-stale` runs the stale-mount check and the lazy unmount of `unmount --force` before anything else,
+    only for a pdmount mount, only when no daemon of the profile answers on its control socket and none runs (pid
+    file), and only when the mount is dead (D127): `statfs` of the mountpoint answers ENOTCONN (or ECONNABORTED after an
+    abort), because no process holds its FUSE connection any more. `statfs` always reaches the daemon (`stat` may answer from
+    the kernel's attribute cache); a mount that answers, fails otherwise or does not answer within 2 s (a hung daemon) is
+    live. A mount held by a live daemon, slow or shutting down, is never touched; the start then fails as without the option.
+    Another profile's live mount there fails the start: see *Profiles and mountpoints* below.
+    The further roots' mountpoints (§14.5) get the same rule, since a crashed daemon leaves them mounted too (D118).
+  - *`unmount`:* `--service <openrc|systemd>` says that a service manager runs the daemon; the daemon records it as a third
+    line of its pid file (`service openrc`). `supervise-daemon` restarts a daemon after exit 0 as well as after a crash,
+    and systemd's `Restart=on-failure` does not, so exit codes cannot keep it stopped on OpenRC. A plain `unmount` therefore
+    refuses (exit 1) and names `rc-service --user pdmount.<profile> stop` or `systemctl --user stop pdmount@<profile>`.
+    `unmount --force` is the recovery path: it detaches and stops the daemon. What follows differs by manager, and so do the
+    refusal and the note: OpenRC restarts the daemon (`stop` keeps it stopped); the systemd unit stays stopped, since a daemon
+    that exits 0 is not restarted by `Restart=on-failure` (one that had to be killed is), until `systemctl --user start
+    pdmount@<profile>`, and stays enabled. The refusal of a plain `unmount` stays for both: it is uniform, it keeps the
+    unit's state and the daemon's in step, and it holds when a user's drop-in sets another `Restart=`.
+    A dead daemon's stale pid file names no service, so a plain `unmount` removes a stale mount as before.
+  - *`unmount --if-stale`:* applies the stale rule above and nothing else: a dead pdmount mount that no daemon of the
+    profile answers for and none runs behind is detached with `fusermount3 -uz`; a live daemon's mount, a mount of another
+    kind and no mount are left alone, exit 0. Another profile's live mount is left alone with an error, exit 1 (D127; the
+    unit's `ExecStopPost=-` ignores the code). The systemd drop-in runs it as `ExecStopPost=`, which systemd also runs
+    after a failed start (a hand-started daemon holds the profile; the unit's daemon fails in `preflight`), so a bare
+    `fusermount3 -uz` there would detach that live daemon's mount. At `ExecStopPost=` the unit's own daemon is gone, so a mount
+    left by its crash is still cleared. The further roots' mountpoints get the same rule (D118). Excludes `--force` and `--wait`.
+  - *Double start:* an autostart entry and a user service for one profile would both start the daemon. `autostart enable`
+    refuses while a service is installed (OpenRC: `$XDG_CONFIG_HOME/rc/init.d/pdmount.<profile>`; systemd:
+    `pdmount@.service` in `$XDG_CONFIG_HOME/systemd/user` enabled for the profile, a link in any `*.wants` directory
+    there); `service install` refuses while the autostart entry exists; `doctor` warns when both are set.
+- **Profiles and mountpoints (D127):** every profile defaults to `~/ProtonDrive`, so two profiles can name one mountpoint.
+  - *Whose a mount is:* the daemon mounts My Files and its further roots with `fsname=pdmount:<profile>` and, as before,
+    `subtype=pdmount`: the type in `/proc/self/mountinfo` stays `fuse.pdmount`, and its source field (and the first column
+    of `df`, the first field of `/proc/mounts`) is `pdmount:<profile>` instead of `pdmount`. A mount of an earlier version
+    has the plain source and names nobody.
+  - *Never another profile's live mount:* a live pdmount mount at the mountpoint is this profile's when its source names the
+    profile (a plain source: when a daemon of the profile answers or runs). Any other live one is another profile's and is
+    never detached: `--clear-stale` fails the start (`preflight` too; under a service before readiness, exit 78, D109),
+    `mount`, `unmount --if-stale` and a plain `unmount` without a daemon refuse with "another PdMount mount (profile
+    <owner>) is at <path>; give profile <p> its own `mountpoint` in its config (D127)", exit 1; `unmount --force` refuses
+    one whose source names another profile and names `pdmount --profile <owner> unmount --force` (a plain source stays the
+    recovery path). A further root's mountpoint (§14.5) and `unmount <root mountpoint>` follow the same rule. `status`
+    without a daemon shows "Mount: not mounted; another PdMount mount (profile <owner>) is at the mountpoint". A dead mount
+    of any profile is stale for every profile and is cleared as above.
+  - *Before it happens:* `service install` refuses while another profile's config puts My Files or a root at one of this
+    profile's mountpoints (a service would fail every start), and `doctor`'s `mountpoint` line warns about it. Profiles
+    counted are those with a config file (`$XDG_CONFIG_HOME/pdmount/<p>.toml`) or a data directory
+    (`$XDG_DATA_HOME/pdmount/<p>/`); a config that does not load is skipped.
+- **Flush (M5.1, D075, D092):** SIGTERM, SIGINT or SIGHUP uploads what is queued at that moment before the stop below
+  (`crates/pdmount/src/flush.rs`):
+  1. `syncfs` on the mount, on a thread of its own with a 5 s limit: pages dirtied through a shared writable mmap reach the
+     daemon (`write()` already has, D083).
+  2. A barrier: the journal entries that are not parked. They are forced without the debounce (`Engine::flush_barrier`,
+     `flush_to`), but an entry in its back-off after a failure, HTTP 429 included, waits for its end. What they wait for (a
+     parent folder, a name holder) is forced too, as in `sync`.
+  3. Wait until none of them can finish any more (uploaded, or parked or held up by a parked entry), the drive cannot be
+     reached (offline or `needs_login`: no wait at all), or `timeouts.shutdown_grace` (90 s) has passed. New writes are
+     accepted and uploaded as usual, but the wait does not include them.
+  4. The log says "flushed N entries in T s", or that the grace ran out ("1 entry" for one); a signal that comes after the
+     grace ran out at PrepareForShutdown starts a flush with no grace and says "no grace left: it was used at
+     PrepareForShutdown; stopping with N entries left", not "ran out" a second time. The last line of the stop says
+     "N entries left for the next mount" when the queue is not empty.
+
+  The grace counts from the first trigger and covers the flush and the wait for running steps below, so a stop takes at most
+  the grace, the session's 10 s and the commit. A second signal ends the wait at once, and the stop below waits for nothing:
+  the logind lock is released, the session gets at most 0.3 s, running steps are cut off (retried at the next mount), and the
+  store is committed, well inside the second that OpenRC's shutdown leaves between its second TERM and KILL. A signal that comes
+  during the stop itself (after the flush, an `unmount` request or an external unmount) ends its waits the same way.
+  `unmount` and an external unmount do not flush (`unmount` drains first, for up to 10 minutes). The next mount warns if entries were left (M5.2, D095). With D076, a flush
+  that runs out of time leaves `.pdmount/<device.id>.pending` in the root of each tree (§14.5) that has entries left and has the
+  marker turned on, and other devices and members with that tree mounted show it.
+- **Shutdown through logind (M5.1, D091, D092):** while mounted, the daemon holds a logind delay lock for `shutdown`
+  (`Inhibit("shutdown", …, "delay")` on the system bus, through `zbus`; the lock is the returned descriptor, close-on-exec) and
+  watches PrepareForShutdown, counting only signals from the owner of `org.freedesktop.login1` (`crates/pdmount/src/logind.rs`).
+  PrepareForShutdown(true) starts the flush above, and the lock is released when the flush ends, at the end of the grace, at
+  a second signal, or at once with an empty queue, offline or in `needs_login`. After an `unmount` request or an external
+  unmount during the flush it is held until the stop's wait for running steps ends, within the same grace. The daemon stays mounted after it, until the SIGTERM of the
+  shutdown; a SIGTERM during the flush continues it and the daemon stops at its end. PrepareForShutdown(false) forgets the
+  shutdown, ends a running flush's wait and takes a new lock. logind sends it whenever a delayed shutdown does not go ahead
+  (cancelled, or its job failed); without it the start of the shutdown would stay set, and a later stop would find its grace
+  used up. The grace counts from the first of PrepareForShutdown and
+  SIGTERM. A non-empty barrier gets the notification "PdMount: uploading N changes before shutdown" (`notify-send`, never
+  waited for). logind holds a shutdown for at most `InhibitDelayMaxSec` (5 s by default; root can raise it): `pdmount service
+  install` prints the drop-in that raises it to the grace, and `doctor` warns when it is lower, or on systemd when
+  `shutdown_grace` + 30 s exceeds the stop timeout of `user@.service`. Without a system bus or logind, with the lock refused, or
+  for root's `poweroff` on OpenRC, SIGTERM alone starts the flush; the daemon logs which once.
+- **Warning at the next mount (M5.2, D095; `crates/pdmount/src/resume.rs`):** the journal is read when the engine opens, before
+  any step runs, so a clean stop and a crash look the same. A non-empty queue gets a WARN, "N changes from the last session were
+  not uploaded", and, for the entries that are not parked, the notification "PdMount: N changes from the last session are still
+  uploading" (`notify-send`, as above). When none of those entries is left to upload, the log says so and a second
+  notification, "the N changes from the last session are uploaded", goes out, but only if `notify-send` exited successfully for
+  the first one within 10 s (it is killed after that; none without a session bus or tool). Entries that were parked meanwhile are counted out: "K of N … uploaded",
+  with the rest named for `queue list`. Parked entries do not upload by themselves, so they are in the WARN's count and in
+  `status`, but make no "still uploading" notification; a queue with only parked entries sends none. An empty queue gives no
+  line and no notification. The watch looks at the queue every 2 s and changes nothing about what uploads or when.
+- **Pending marker (M5.7, D076, D096):** per tree, in the engine (`crates/pdmount-core/src/engine/marker.rs`); `<root>` is the
+  tree's root and the counts are that engine's.
+  - *Writing* (opt-in, `sync.pending_marker`, default off): a flush whose barrier is still moving 10 s before the end of the
+    grace writes `<root>/.pdmount/<device id>.pending` then, straight through the backend, not the journal, bounded by the
+    deadline, and goes on flushing until the deadline. When the barrier is then reached and the queue is empty, the flush
+    trashes the marker before it ends, within the grace, since the drain watcher below stops with the daemon. The folder is created when missing; an existing marker gets a new
+    revision. The content is JSON, `{"version":1,"device":"<device name>","time":<unix s>,"entries":<n>,"bytes":<n>}`: the
+    queue's entries (pending and parked) and the content bytes still to upload when it is written, no file names (mode 0444,
+    `application/json`). Nothing is written when the barrier is reached or parked before that point, offline, in
+    `needs_login`, or after a second signal. The marker's link is kept in the store (`meta.pending_marker`).
+  - *Trash:* once the engine's queue is empty, in the same run (the rest of the grace, or after a PrepareForShutdown flush)
+    or the next, the marker is trashed (`Backend::trash`; a marker that is gone counts as trashed). Parked entries keep it.
+    A store that lost the link (`reset`) finds the marker in the listing of `.pdmount`. Before the trash the link is
+    checked to be still a file named `<device id>.pending` whose parent is the root's `.pdmount`; a link adopted from a
+    listing that was renamed or moved since is forgotten, not trashed (D126).
+  - *Reading* (on in every tree whose write gate is open, D126): after each event pass, and at least every 2 min, once
+    the root is listed (it never lists the root itself), the engine lists `.pdmount` once (events keep it
+    current after that, in background turns, D027) and reads each `<id>.pending` of another device that is new or changed,
+    at most 16 per pass (`MAX_MARKERS_READ`): devices already shown first, then by id; the rest are counted (`+N more` in
+    `status`, a WARN when their number changes) and not fetched. A tree whose gate is closed (a viewer's share, a tree
+    whose write was refused, a retired one) reads none and shows none; what was announced stays remembered.
+    The marker is untrusted (D070): its size in the listing must be at most 4 KiB, it must be one block, fetched into a 4 KiB
+    buffer; the JSON must be version 1 with typed fields (others are ignored) and a `time` a clock can hold (at most
+    `i64::MAX` seconds; ages are computed with checked arithmetic, V-8); the device name loses control and formatting
+    characters (bidirectional overrides, zero-width marks; each becomes `?`) and is cut to 64 characters. A marker that fails
+    is logged with its device id and ignored until it changes; one whose fetch fails is read again at the next pass, and
+    is not announced again if this revision was. Only canonical `<uuid>.pending` names count, and this
+    device's own marker is not shown. A pass that panics is logged and the next pass runs.
+  - *Shown:* `status` prints `Incoming:   <device>: N changes (<size>), since <time> (<age> ago)`, one line per device,
+    `, stale` after 7 days, at most 5 lines per tree and then `+N more` (the rest and the markers not read). Each marker
+    revision is announced once (remembered in `meta.incoming_notified`, so a remount does not repeat it; none for a stale
+    one), and a pass sends one notification per tree for all it announces (D126): for one marker "PdMount: changes on
+    their way from <device>", for several "… from <n> devices: <a>, <b>, <c>, <k> more" (at most three names); a further
+    tree adds " in <tree>". The body holds only numbers and a time: the summed changes and size, the oldest marker's
+    time, and how many markers were not read.
+  - *Read-only in the mount:* `.pdmount` in the root, and everything below it, answer EROFS (D019) whatever the access rules
+    say: creating, removing or renaming the name in the root (even before the folder exists), and any create, unlink, rmdir,
+    rename into or out of it, setattr, open for writing or `access(W_OK)` inside it. Its attributes show no write bits and
+    `user.pdmount.access` says `ro`. So `rsync --delete` on the root cannot remove it and the journal never holds a local change
+    there; remote changes there apply as anywhere.
+- Shutdown after the flush, on `unmount` or an external unmount (D062):
   1. The journal stops starting steps. New opens are not refused.
   2. Unmount.
-  3. Wait up to `shutdown_grace` (30 s) for running uploads and inline steps.
+  3. Wait for running uploads and inline steps until the grace ends (from the flush's start, or from now for `unmount`), or
+     until a second signal.
   4. Commit the store.
 
   Pending work persists and resumes at the next mount, also an upload the grace cut off.
 - **Starting:** `pdmount mount` re-executes itself as `pdmount mount --foreground` in its own process group, with stdout and
   stderr appended to the log file (D026), and returns once the control socket answers `ping` (90 s limit). It refuses to
-  start while the profile's daemon answers or while the mountpoint is a mount (a dead pdmount mount is reported as stale).
+  start while the profile's daemon answers or while the mountpoint is a mount (a dead pdmount mount is reported as stale,
+  another profile's live one as a conflict, D127).
 - **Unmounting:** `pdmount unmount` asks the daemon, which runs `fusermount3 -u`. A busy mount stays mounted and the error is
   reported. On SIGTERM/SIGINT the daemon unmounts lazily if needed. Refreshed session tokens are saved every 60 s and at
   exit, even when the store commit at exit fails.
@@ -1548,15 +2106,314 @@ behaviour unchanged, and `shared`, `computers` and `photos` are each configured 
 
 - **Trees:** a device and a share are each a tree (volume, root link, write gate) with its own engine, store, journal and staging,
   the same code as My Files. A mount with several trees has a virtual read-only top level, with one folder per tree. All trees share
-  the session, the transfer and rate limits, and one event poller per volume (60 s on other users' volumes, as the official client).
-- **Writes (M5.14):** Computers, and shares where the node's role is `Editor` or `Admin`, go through the My Files write path. `Viewer`
+  the session, the transfer and rate limits, and one event poller per volume: other users' volumes every 10 min, the one volume whose share was used last through the mount every 30 s (D107, as the current official client's `EventScheduler`); share membership, roles and revocations come from the 30 s core event stream.
+- **As built (M5.10a, D110):**
+  - *Tree:* a backend value for (volume, root): `ProtonBackend::tree` over the session (§3.2). Its engine keeps its state
+    under `trees/<key>/` (§13.1), shares My Files' connectivity (§9.6) and gets the profile's config without `[access]`
+    rules, `fsync.remote_paths` and `sync.pending_marker`; the engine does not know the tree's kind. Each tree has a
+    16 MiB RAM pool; `cache.max_bytes` is one disk cap for the profile, My Files and every further tree together
+    (D110 amended): a tree that takes the shared total over the cap evicts its own least recently used blocks, and My
+    Files keeps at least half of the cap. The trees share the session's download and upload permits and background
+    turns (`EngineOptions::limits`, §6.4 "Per session").
+  - *Shared disk cap* (`pdmount_core::cache::DiskBudget`): every open tree's cache reports its unpinned bytes to the
+    daemon's one budget and evicts only its own blocks. Shares: My Files half the cap, the further trees the other half
+    evenly; they only decide who evicts, and free room is anyone's. When a cache's bytes grow (a block stored, a pin
+    let go, the open) and the total is above 90 % of the cap, it makes room down to 80 %: over its share, it evicts its
+    own blocks first; then each other tree over its share, the furthest over first, evicts down to its share at most;
+    last its own blocks. No other tree takes My Files below half. Pinned blocks stay outside the cap (§6.2). One
+    enforcement runs at a time; its lock comes before every cache's index lock and is never taken while one is held.
+    A tree's cache counts from its mount to its unmount; an unmounted tree's blocks stay on disk, uncounted, until it
+    mounts again. `status` adds `Cache cap:` (the profile's total against the cap) and each tree's own bytes on its
+    line; `cache stats` shows My Files' figures and the same total; `cache gc` evicts My Files' blocks (§14.2).
+    Without `[[roots]]` My Files' cache is alone on the budget, as before.
+  - *Write gate:* §11.2; closed for every further tree (the `test` kind's `writable` opens it).
+  - *Router* (`pdmount-fuse`, `Router`): only for a mount with several trees, and always for a Shared mount (below). The top level is inode 1, mode 0555, its
+    changes EROFS; inode `n` of tree `i` is `(i + 1) << 48 | n`, so a tree's root is its folder in the top level and the
+    `..` of that root is 1. A rename between trees is EXDEV (each tree counts as a file system of its own). A lookup,
+    open or opendir in a tree marks its volume as the one in use for the pollers (§9.2). A mount with one tree maps
+    nothing.
+  - *Pollers:* §9.2. With `[[roots]]`, My Files joins its volume's poller; without, the daemon runs as before.
+  - *Daemon* (`crates/pdmount/src/roots.rs`): the further roots mount in the background once the daemon has reported
+    ready with My Files, so a slow or failing root never delays or fails the start (D109). A tree that does not open is
+    left out of its mount (and named in `status`); a mount whose trees all fail, or that cannot mount, is reported
+    failed in `status` and the log; My Files and the other mounts go on. A pdmount mount left at a root's mountpoint by
+    a daemon that crashed or was killed (its connection answers ENOTCONN to `statfs`, D127) is detached when the root
+    mounts; anything else mounted there fails the root (D118), a live PdMount mount with "a live PdMount mount (profile
+    <owner>) is already at <path>".
+  - *Stop* (D118): after My Files' flush, the further mounts upload all at once until the flush's deadline, then each is
+    unmounted (`fusermount3 -u`, `-uz` when busy) and its trees stopped, all at once: sessions get 5 s, running steps
+    the flush's deadline, then the stores are committed. A command still running on a mount ends its step: an
+    `unmount`'s drain ends and its mount is stopped the same way, never put back as mounted; a mount still opening
+    stops opening further trees and is unmounted and stopped likewise. The stop waits for them until 5 s after the
+    deadline, and takes any mount a command left mounted. A gone share's cleanup (below) is waited for within the
+    deadline. A second stop signal (D092) ends the drains at once, and the sessions, commands and cleanups get 0.3 s
+    and running steps none, so My Files' commit and the tokens' save come well before the supervisor's kill (D092's
+    margin of 30 s past the grace). While the start waits for the keyring (D106) the roots
+    show as `waits for the keyring` and `mount <mountpoint>` is refused; when the wait ends they mount by themselves in
+    the background, as after the readiness report (D110 amended). After such a wait My Files keeps its own event task
+    and the further trees get their volumes' pollers. Mountpoints may not overlap My Files' or each other.
+  - *Per mount:* `status` adds a `Root:` line per further mount, with its state (`waits for the keyring`, `mounting`,
+    `mounted`, `unmounting: uploading first`, `stopping`, `not mounted`, `not mounted (unmounted from outside)`,
+    `failed: <why>`) and `read-only`, and a line per tree (gate, queue, last poll, or why it did not open). `pdmount unmount <mountpoint>` of
+    a further root uploads its pending work (up to 10 min; the command says how many changes first and waits for it),
+    unmounts it and stops its trees (running steps get 10 s, then the stores are committed); the daemon and My Files
+    go on, also under a service. A busy mount stays mounted; `--force` detaches it (`fusermount3 -uz`) and the daemon
+    stops its trees: a mount no longer in the mount table counts as ended, although open files keep its FUSE session,
+    whose trees are then retired (closed gate, a change committed later answered EIO; D118). `pdmount mount [-o ro] <mountpoint>` mounts it again through the running daemon; `-o ro` holds
+    until the next plain `mount`, and `read_only` in `[[roots]]` and the daemon's `-o ro` always hold (`UnmountRoot`,
+    `MountRoot` on the control socket). The long steps (opening the trees, the drain, the stop) run without the lock
+    over the mounts, so `status` always answers; a second command on a mount while one runs is refused (`is being
+    mounted`, `is being unmounted`). A mount whose FUSE session ends from outside (`fusermount3 -u`) is noticed within
+    a second, or by the next `mount` or `unmount` of it: its trees are stopped as above and a new `mount` works.
+    Path commands (`access`, `pin`, `queue`, `conflicts`, `sync`, `cache wipe`) reach My Files only. Scenario X14; the
+    mount after a keyring wait in X13.
+  - *Kinds:* `shared` (M5.12, below; at most one per profile), `photos` (M5.13, below; at most one per profile) and
+    `test` (test builds with a fake drive): trees named in the config. `computers` is refused (Computers are out of M5's scope, D122).
+- **Shared, as built (M5.12, D112):** `[[roots]] kind = "shared"` mounts the shared-with-me listing.
+  - *Listing* (`SharedWithMe` in `pdmount-backend`): the shared-with-me pages (at most 64), each share's creator and
+    creation time once (`get_share`, kept), and the roots fresh, one batch per volume, for their names, kinds and the
+    user's role (`direct_role`). Read at the mount, on each `DriveShareRefresh` (or `refresh`) of the core event stream,
+    and at the next core poll after a listing that failed. The core stream is polled by one task of the daemon
+    (`Pollers::watch_core`) every `sync.poll_interval` (30 s, the official client's) while a Shared mount is mounted,
+    with the volume pollers' back-off; it starts from the position read before the first listing.
+  - *One tree per share*, each with its engine and state as any further tree (`trees/<key>/`, key from volume and root),
+    its write gate open while the role allows writing (below, M5.14a), its volume's poller shared with the other shares on that volume (other
+    users' volumes every 10 min, the one in use every `sync.poll_interval`, D107). At most 32 shares are opened, oldest
+    first (each tree has a 16 MiB RAM pool); the rest show in `status` as not opened.
+  - *Names* (D107, D125): a share keeps its name. Folders are named in the top level, files in the files folder, each on
+    its own. A shown name stays with its share for as long as the share is in the listing and its own name is the one
+    the shown name was given for: a share that arrives later, or that its owner renames, never takes a name another
+    share is shown under (a suffixed one such as `Team (alice@…)` included); it gets the suffix instead. Shares new to
+    the mount or renamed are named in the order they were created: a share keeps its own name when no other share has
+    it (shown, or among them); when two or more of them have the same name, or one has a name already shown or the
+    taken one, each of them becomes `<name> (<owner>)`, and where that is taken too `<name> (<owner>, 2)`, `(…, 3)`.
+    The top level's `Shared files` counts as taken. The shown names are kept in
+    `~/.local/share/pdmount/<profile>/shared-names.json` (per share key: its own name and the shown name; written
+    after each listing that changes them, a file that cannot be read names the shares anew), so a remount or a
+    restart shows the same names whatever the listing's order. A name that could not be a file name (empty, `.`, `..`, `/`, NUL,
+    over 255 bytes) is left out, except that a name over 255 bytes is cut to fit and a share already shown keeps its
+    last name when its new one cannot be a file name (D118); the owner (the share's creator, untrusted) has control characters and `/` replaced and is
+    cut to 64 bytes, and a suffixed name is cut to fit 255 bytes. A name changes in place only when its owner renames
+    the share; a suffix that comes stays while the share is listed, also after the share it was added for has gone.
+  - *Shared single files* sit in the virtual folder `Shared files` of the top level (inode 2, mode 0555, shown while one
+    exists). A file's tree has a virtual root folder holding only the file under a fixed name (`ShareTree`), so the
+    engine is the same; only the file's own events pass, and a rename by its owner shows at the next listing.
+  - *Trees that change while mounted* (`pdmount_fuse::mount_dynamic`, `TreeSet`): a tree's number is its slot,
+    `(slot + 1) << 48 | n`, kept for the mount's life and never reused (65 534 slots), so the inodes of a tree that stays
+    never change and an inode of a removed tree never leads into another. Adding, removing or renaming a tree
+    invalidates the kernel's entry of its name, and the folder's pages and attributes (a cached absence included);
+    removing one also drops the kernel's cached pages of its inodes, after its name's entry, so paths through it end at
+    once however many inodes the kernel holds (D118). A tree's notify thread starts before it is added, so a tree whose
+    thread cannot start never shows. The virtual folders' times are those of the last change.
+  - *Revocation:* a share goes when the listing no longer has it, or at the first "not found" of its root (a listing of
+    the root, its `get_nodes`, or a refused event stream that finds the root gone), whichever comes first; one gone by
+    "not found" is not opened again while the listing still has it. Its tree leaves the mount at once (D118): a request
+    on a name in it answers ENOENT, as for a deleted folder (`lookup`, `stat` and `fstat`, which the kernel sends
+    without the handle, `open`, `opendir`, `access`, xattrs, the changes), and one on a handle opened before EIO
+    (`read`, `write`, `fsync`, `readdir`, the `close` of any handle); releasing a handle succeeds. Its engine is retired
+    first: its write gate closes, and a change whose store commit ends after that is answered EIO, so nothing is
+    acknowledged and then left out of the export. Its poller stops (its volume's poller with its last tree); a poll
+    pass that took the tree before is waited for, and later passes skip it. Then changes still queued and local-only
+    files are exported to `orphaned/` (below, D124), its store is committed, and its state and cached blocks are deleted. This cleanup runs in the
+    background, kept by the tree's key: a share that comes back while it runs waits for it up to 20 s (two engines on
+    one store would lose changes) or is left for a later listing, and the unmount and the daemon's stop wait for it
+    within their deadline. A tree that would fail every event page is so dropped instead of listing itself again at
+    each poll. A root the server returns but cannot decrypt is not "not found" (D119): the backend tells it apart
+    (`Backend::get_nodes_checked` answers `NodeLookup::Degraded`; `ShareTree` never reports it gone, and a shared file's
+    tree answers `Transient` for it), and the listing names such shares apart (`SharedWithMe::shared_listing`:
+    `SharedListing::degraded`, not in `entries`), so that the mount keeps them as they were.
+  - *Not covered yet:* a listing that cannot be read at the mount (offline) leaves the mount empty until it can; the RAM
+    pool per tree bounds the number of shares; path commands (`access`, `conflicts`, `queue`, `pin`, `sync`) reach My
+    Files only (D110).
+  - `status` shows each share's line with its role and its volume's interval, e.g.
+    `Team (alice): read-only (viewer), 0 pending, 0 parked, last poll 3 s ago, every 600 s, cache 0 B`. Control
+    characters in the `Root:`, tree and `Orphaned:` lines (share names, errors quoting them) print as `?` (D118).
+    Scenario X15.
+- **Writes (M5.14):** shares where the node's role is `Editor` or `Admin`, go through the My Files write path. `Viewer`
   shares and shared single files return EROFS (D019). Losing the right with changes pending parks them and closes the gate; staged
   data is kept, under `orphaned/<tree>/` once the share is gone. Rename between trees returns EXDEV.
+- **Writes in shares, as built (M5.14a, D114).** Computers (M5.11, M5.14b) are out of M5's scope (D122).
+  - *Gate:* a folder share's write gate is open while the listing's role is `Editor` or `Admin` (`may_write`), at the
+    open and at each listing (a `DriveShareRefresh`, §14.5 above); `Viewer` and shared single files keep it closed
+    (EROFS). No second write path: journal, staging, conflicts, fsync modes, `.pdignore` and the flush are My Files',
+    except that only the profile's own `.pdignore` applies in a share, never the share's `/.pdignore` (§7.7, D124).
+    `read_only` and `-o ro` still hold over an open gate.
+  - *Losing the right* (`pdmount_core::engine::rights`): a role that does not allow writing, read from the listing, or
+    a change the server refuses (`PermissionDenied`: code 2011 or HTTP 403) on a tree that follows the server (every
+    share's; My Files' never, where a refusal parks only its entry as before) closes the gate and holds every queued
+    entry, and every entry queued while the hold lasts, with the reason `no write access …`, the way `queue park` holds
+    one: nothing staged is deleted (RQ3), the files stay readable in the mount, and a local change (closing a file
+    still open) does not lift the hold. An entry parked for another reason keeps it, and an entry whose step runs is
+    parked only if it needs another step (D121). A refusal
+    also reads the listing again, logs, and sends one notification (`PdMount: N changes to <share> wait`); `status`
+    shows the share `read-only (<role>)` with its parked entries and, after a refusal, a line `the server refused a
+    change; …`. A later listing with a role that allows writing opens the gate and forces the held entries; a refusal
+    whose listing still says `Editor` keeps the gate closed until the role changes or the next mount, so a server that
+    refuses while the listing allows is not retried in a loop. Parked state lives in RAM (§8.2): at the next mount the
+    entries are tried again, held at once when the role still does not allow writing.
+  - *Revocation with changes queued* (`pdmount_core::engine::orphan`): before a gone share's engine stops, its queue is
+    held and every queued change exported to `~/.local/share/pdmount/<profile>/orphaned/<share name> (<YYYYMMDD-HHMMSS>)/`:
+    each queued file's whole content, read as an upload reads it (staging, then the base blocks from the cache or the
+    server), at `files/<path in the share>` with its mode and mtime; folders queued for creation as folders; and
+    `pdmount-orphaned.json` (version 1: tree, reason, time, and per entry its path, change, `file` or `error`), with
+    renames and deletions listed only. Local-only files (§7.7) are exported the same way with the change `local-only`
+    (D124): they are never in the journal, so the count that decides on an export adds the tree's staged local-only
+    files (`Engine::local_only_staged`, attached and never uploaded) to the queued and parked entries, as `reset`'s
+    count adds the staged inodes. A file whose content cannot be written (its base can no longer be read because the
+    share is gone and the blocks were not cached, or it has no plain path) is listed with the error, and the tree's raw
+    state (`state.db`, `staging/`) moves to `state/` beside it; otherwise the state is deleted as for any gone share. If the export cannot be written, the state stays under
+    `trees/<key>/`. One notification (`PdMount: N changes to <share> kept`), a log line, and `status` prints an
+    `Orphaned:` line per directory with a manifest (read by the client, so also without a daemon) until the user
+    deletes it. PdMount never uploads from `orphaned/`.
+  - *Across trees:* a rename between two shares, or between a share and the top level, is EXDEV (the router, D110), so
+    `mv`, `rsync` and `git` copy; between a share and My Files the kernel answers EXDEV (two mounts).
+  - *Quota:* an upload to a share counts against its owner's storage; the server's quota error maps to ENOSPC as in My
+    Files (§7.8, deferred to the next `flush`/`fsync` of the file). `df` (statfs) on the Shared mount shows the user's
+    own quota, so a full share shows only as that error.
+  - *Conflicts:* conflict copies made in a share are visible to all its members and its owner. A further tree's new
+    conflicts are logged (`conflict recorded in a further tree`, with tree, kind and path) and notified (`PdMount:
+    conflict in <tree>`); while its gate is open, its other devices' markers are notified as My Files' are (one
+    notification per pass, naming the tree) and shown under the tree's line in `status` (`Incoming: …`); a viewer's
+    share reads none (D126).
+  - *Marker (D076):* `pending_marker = true` under `[[roots]]` turns it on for that mount's trees (the profile's
+    `sync.pending_marker` stays My Files' own). At the daemon's stop the further trees drain all at once, after My
+    Files' flush, to the same deadline; a tree with the marker on, an open gate and entries still pending
+    `MARKER_WINDOW` (10 s) before the deadline writes `.pdmount/<device id>.pending` in its root, counting only its own
+    entries, and trashes it again if the rest uploads before the deadline (D096); the next drain trashes it otherwise.
+    A tree on another user's volume (every share) writes it without the device name. Trees share the last 10 s of the
+    grace, and My Files' flush comes first, so some may get no marker. An owner's PdMount reads `.pdmount` only in its
+    My Files root (D114, option (a)), so it does not see a member's marker; the reading side does not filter by device,
+    so every member with write access whose PdMount mounts the share reads every member's markers, at most 16 (D126).
+    The file name carries the device id in shares too (V-4, Info).
+  - Scenario X16; the R, G and N scenarios and M1, M3 run in a share's tree with `TARGET=share` (§15.3).
 - **Photos:** a read-only virtual tree over the timeline and albums, not an engine tree: it has no folder operations (D080). Year and
   month folders come from timeline pages; names and sizes are fetched when a month is opened. Proton's stored thumbnails go to
   `~/.cache/thumbnails` in the background, so a file manager need not open the originals (D081; `photos.thumbnail_cache` turns it off).
-- **Bulk-read guard (all trees, D081):** many different files opened in quick succession become a scan: below interactive priority,
-  paced, no readahead, a limited share of the block cache. Opening a single file stays interactive.
+- **Photos, as built (M5.13a, D113):** `[[roots]] kind = "photos"` mounts `<mountpoint>/<year>/<month>/<name>`.
+  - *A read-only tree that is not an engine* (`pdmount_core::photos::PhotosTree`): it implements
+    `pdmount_core::readonly::ReadOnlyTree` (lookup, getattr, opendir and the listing's snapshot, open, read, and
+    `resolve`, the slow path of a folder whose entries are still arriving), and `pdmount_fuse::mount_read_only` serves it
+    with an adapter of its own (`RoFs`), alone in its mount: no router, a kernel `ro` mount, and every change answered
+    EROFS without asking the tree. Folders are mode 0555, photos 0444; a photo's times are its capture time.
+  - *Volume:* the Photos share's volume and root (`photos_volume`: on Proton the SDK's Photos client finds the share, which
+    gives its drive client the share's key). The tree's backend is a tree backend of that volume and root
+    (`ProtonBackend::photos_tree`, through the Photos client's drive client and its link endpoints, as the official Photos
+    client reads photos). An account without Photos fails the mount with that reason.
+  - *Stage 1, years and months:* the timeline (`drive/volumes/{id}/photos`, 500 per page, newest first,
+    `PreviousPageLastLinkID`), read once from the mount on, a page per background turn (the session's gate, D027, D110);
+    each item's link, capture time, tags and related photos. The volume's event cursor is taken before the first page. A
+    photo's month is that of its capture time in the local time zone. Until the read has its first page, the top
+    folder's listing waits for it; a lookup of a year or month not read yet waits until it appears or the read ends.
+    While the tree shows nothing yet, a page waits for the gate at most 2 s, so a load in another tree slows the first
+    `ls` of Photos, never fails it (D119). The pages are read into PdMount's own types (a tag any number, a capture
+    time any number of seconds, one beyond a four-digit year placed at the epoch's month), never the SDK's, which
+    refuse a whole page for one tag above 9 or a time chrono cannot hold. An empty page after a link means that link
+    went since its page (the server answers so), not the end: the read asks for the page after the link before it
+    (the last 8 of the page), then from the first page again (at most 3 times per attempt). A read that fails goes on
+    from its last page at the next attempt, with the cursor it took; photos it did not list go only after a read that
+    finished (D119).
+  - *Stage 2, names and sizes:* when a month is opened (`opendir`, or a lookup of a name it does not have yet), its photos'
+    nodes in batches of 50 (`get_nodes_checked`, one request each), one background turn per batch, the month opened last
+    first. The first `opendir` of a month without names waits for the first batch; later ones show what has arrived. A
+    request a user waits on fetches the batch itself (D119): the first batch of a month without names as the user's
+    work, outside the gate, as the engine lists a folder; a later batch (a lookup of a name not there yet) with a turn
+    of the gate waited for at most 2 s; a lock keeps it and the names task from fetching the same batch. A node the
+    server returns but cannot decrypt (`NodeLookup::Degraded`) is not gone: a photo with a name keeps it, one without
+    is not waited for (its month counts as named, `status` counts it) until an event of it reads it again. The
+    kernel keeps a folder's pages only while its entries hash the same as at its last open, no other handle of it being
+    open (D072's rule), so a month whose names arrive in stages is listed again at each open until they are all there; each
+    batch also drops the kernel's view of the month and any absence it cached of the new names. A lookup of a name not
+    there yet waits for the rest of the month, except a hidden name (`.hidden`, `.directory`), answered at once. A month
+    opened once also gets the names of its new photos. Names the server gives that cannot be file names are left out;
+    two equal names in a month (only a related photo or a bad name can clash: the server keeps names unique in the
+    Photos root) become `name (2).ext`, in link order.
+  - *Stage 3, events:* the Photos volume's event stream, polled by the tree itself every `sync.poll_interval` (the user's
+    own volume, D107), with the pollers' back-off and the session's connectivity. Photos is the only tree on its
+    volume, and the `Poller`s of §9.2 serve engines, whose cursors live in engine stores; a poll of its own reads the
+    stream once all the same. A link the tree does not know is read with its node (a file in the Photos root, not
+    trashed, is a candidate) and found in the timeline for its capture time: the first page at every poll, further
+    pages only when the last search beyond the first page is 5 min old (a photo with an old capture time waits that
+    long under a sustained upload); it shows at once with the name its node gave. A candidate the whole timeline does
+    not list (a draft still uploading), or anything else (an album, a node that cannot be decrypted), is set aside
+    until its next event, which looks at it again (its commit). A trashed or deleted photo goes, with its related
+    photos; a changed one whose name is shown has its node read again. The cursor always moves past a page: a link
+    whose node or timeline place cannot be read now goes to `pending` (stored in `meta` before the cursor moves,
+    counted in `status`) and is tried again at each poll (D119). A `refresh` reads the whole timeline again, keeping
+    the names; photos it no longer lists go.
+  - *Background tasks:* the timeline and events task, the names task and the thumbnails task run again 5 s after a
+    panic, logged and counted in `status` (`PhotosStatus::restarts`, D119).
+  - *Sessions:* a new login replaces My Files' drive client, its credential and the Photos clients in one write
+    (`ProtonBackend::replace_session`); a Photos call uses the drive client and credential of the Photos clients it
+    found ready for the whole call, its token refresh included, and fails without them instead of using My Files'
+    client (D119).
+  - *Store* (`trees/<key>/state.db`, key from the Photos volume and root): a `photos` table of its own (link, capture
+    time, tags, main photo, name, size, revision) beside the store's usual tables, and in `meta` the volume and root, a
+    marker that a whole timeline read finished, the event cursor, written after the rows of its page, and the links
+    whose events wait (`photos.pending`). A remount loads
+    it and reads neither the timeline nor the names again (the log says `timeline and names loaded from the store`); a
+    store for another volume or root is emptied.
+  - *Reads:* the tree's own `BlockCache` (16 MiB RAM pool, blocks under `trees/<key>/blocks/`, on the profile's disk cap
+    with the share of a further tree, D110), the backend's block map and manifest verification, as an engine's reads;
+    no readahead.
+  - *The session's limits and guard:* the daemon passes the tree My Files' `SessionLimits` and `ScanGuard`
+    (`PhotosOptions::limits`, `PhotosOptions::scan`, as `EngineOptions`'), so it takes part as an engine tree does
+    (§6.4): its download permits are the session's; its stages, event polls and thumbnails take turns of the session's
+    background gate, held back by a request a user waits on in any tree; a read that downloads holds back every tree's
+    background work and scan reads. Every open counts for the guard (the mount refuses any other than read-only), so
+    a thumbnailer or `grep -r` over the mount begins a scan, alone or with opens in other trees; a photo opened during
+    one reads its first `scan.first_bytes` as scan reads (a turn of the guard, scan priority, the scan share of the
+    cache), and an interactive read of a scan block takes it out of the scan blocks.
+  - *Live Photos and Motion Photos* (tags 3 and 4): the timeline item's related photos (a Live Photo's video) show
+    beside their main photo, in its month, under their own names, and go with it. A related photo the timeline also
+    lists as a main photo stays one.
+  - *Thumbnail hook:* `ThumbnailHook::month_opened` gets a month's named photos (link, revision, path, size, mtime)
+    when a month whose names are all there is opened, and when its names are complete. It runs on the FUSE thread and
+    only queues; the tree's own hook is its `Thumbnailer` (`PhotosTree::set_thumbnail_hook` replaces it in tests).
+  - *Stored thumbnails (M5.13b, D115):* when a month is opened, Proton's thumbnails of its photos go to the freedesktop
+    thumbnail cache, `$XDG_CACHE_HOME/thumbnails/{normal,large,x-large}/<md5 of the URI>.png`, so a file manager shows
+    them without opening the originals (D081). `photos.thumbnail_cache = false` turns this off.
+    - *Order and pacing:* a task of the tree takes the queued months, the one opened last first, in batches of at most
+      30 photos, on the session's gate (D027, D110): one background turn per photo's reference, one more per batch for the
+      request of the thumbnails' URLs (`get_thumbnail_blocks`) and the downloads, 8 at a time. Only Proton's 512 px
+      thumbnail (type 1), never the 1920 px preview (D107). A failed batch is tried again with the pollers' back-off.
+      The task asks for one turn at a time and holds it for one request; turns are granted in the order asked, so the
+      thumbnails and the other trees' background work take turns, and none of them waits for more than the turns queued
+      before it; like all background work, they wait while a user's request is in flight in any tree.
+    - *Verification:* a photo's reference comes from its revision's block listing, whose manifest signature (the
+      SHA-256 of each encrypted thumbnail, then of each block) is verified with the keys a block map uses; the
+      download's SHA-256 must be the listed digest before it is decrypted. The SDK's `enumerate_thumbnails`, like the
+      official SDKs, checks nothing but decryption, so PdMount does this itself (`Photos::thumbnail_ref`,
+      `Photos::fetch_thumbnails`), at one listing request per photo.
+    - *Untrusted bytes:* at most 1 MiB encrypted (the listed size before the download, then the stream) and decrypted.
+      Before the decoder sees the WebP, PdMount walks its RIFF chunks (`thumbnails/frames.rs`; at most 1024 chunks,
+      each length checked against what is left, nothing after the RIFF's end, no nesting below an `ANMF`) and reads
+      every image frame's size from the frame's own header: the `VP8 ` key frame header (start code `9d 01 2a`,
+      14-bit width and height) and the `VP8L` header (14-bit width − 1 and height − 1); an `ALPH` chunk takes its
+      frame's size. The layout must be one of WebP's: a simple `VP8 ` or `VP8L` file, a `VP8X` still with one image
+      (an `ALPH` only before a `VP8 `) the size of the canvas, or a `VP8X` animation (`ANIM`, `ANMF` frames inside
+      the canvas, each with one image the size of its rectangle); other chunks (ICCP, EXIF, XMP, unknown) are
+      skipped. The canvas and every frame are at most 1024 px a side and all frames together at most 1024 × 1024
+      pixels; the decoder's own size must then be the canvas. This is needed because `image-webp` decodes a `VP8X`
+      file's inner frame at the size that frame declares (up to 16383 × 16383) before comparing it with the canvas,
+      and its memory limit covers only the metadata chunks (V-5). Decoding and scaling run in a blocking task under
+      `catch_unwind`. A photo that fails any of this, or has no thumbnail, is noted for the session with a warning
+      and gets none.
+    - *The PNGs:* `normal` 128 px, `large` 256 px, `x-large` 512 px on the long side, scaled down from the WebP, never
+      up, aspect ratio kept; RGB, or RGBA when the WebP has alpha. Text chunks before the pixels: `Thumb::URI`, the
+      `file://` URI of the photo's path in the mount (the mountpoint as configured, absolute, symlinks not resolved),
+      escaped as GLib's `g_filename_to_uri` (every byte but ASCII letters, digits and `-._~!$&'()*+,:=@/` as upper-case
+      `%XX`); `Thumb::MTime`, the capture time in seconds the mount reports; `Thumb::Size`; `Software`;
+      `X-PdMount::Revision`. Each is written as a temporary file of mode 0600 in its folder, then renamed; folders are
+      made 0700.
+    - *Done work:* a size whose file has the same URI and mtime (and size and revision where it has them) is kept,
+      whoever wrote it, and only missing sizes are written. The session notes the photos done and those without a
+      usable thumbnail, per revision, and does not look at them again; a new session reads the files' text chunks.
+  - `status` shows the mount read-only and the tree's line with its stages, e.g.
+    `Photos: read-only, 0 pending, 0 parked, last poll 3 s ago, every 30 s, cache 1.2 MiB, 302 photos, 7 named, timeline read`.
+    Scenario X17 (§15.3); on the fake, `pdmount fake photo add|seed|delete` (§15.1), each photo with a thumbnail.
+- **Bulk-read guard (all trees, D081, D111):** many different files opened in quick succession become a scan: below interactive priority,
+  paced, no readahead, a limited share of the block cache. Opening a single file stays interactive. One guard per session, shared by
+  every tree's engine (`EngineOptions::scan`) and the Photos tree (`PhotosOptions::scan`); detection, classes and defaults in §6.4.
 
 What the API allows in practice is settled by M5.9 (`docs/plans/m5.md`).
 
@@ -1569,9 +2426,9 @@ What the API allows in practice is settled by M5.9 (`docs/plans/m5.md`).
 | Layer | Content |
 |---|---|
 | Unit | Name validation, conflict naming, ignore matcher, errno mapping, block offset math (with and without `BlockSizes`), access resolution |
-| Fake backend | Proton model: name uniqueness (2500), `CurrentRevisionID` and `OriginalHash` preconditions, trash, quota, an event log with `more`/`refresh`, several client handles on one drive (`with_client`; a client has a UID and may leave out the SHA-1 and the mode like the official apps, `pdmount fake write\|create --app`). Revisions record the client UID, claimed SHA-1 and creation order (`revisions()`). Pause points (`pause_at`) stop the next upload, folder creation, rename or trash of a client just before its commit, so a test can let another client commit first; uploads are two-phase (draft, then commit), `set_commit_checks(false)` models the server as M3.1 found it (the base revision is checked only at draft creation, D043), and `set_name_hash_enforced(false)` a server that ignored `OriginalHash` (it does enforce it, §10.4; the test documents the alternative). `all_revision_sha1s()` lists the content still reachable. Fault injection: latency, one-shot failures per operation, and `faults.json` in the fake's directory for running daemons (`{"rules":[{"kind":"offline"|"unauthorized","until_ms":…,"client":"pdmount-<device id>"}]}`; every call checks it, re-read when the file changes; `pdmount fake fault offline\|unauthorized [--for <s>] [--client <uid>] <dir>` and `fault clear`; the daemon's client UID is `pdmount-<id>` from `pdmount status`'s "Device" line; the fake has no sign-in, so a daemon in `needs_login` probes every 2 s and goes online when the rule is gone, D047). **Network profile** (M4.2): `profile.json` in the fake's directory (`{"rtt_ms":80,"up_bytes_per_sec":20000000,"down_bytes_per_sec":20000000}`; `pdmount fake profile [--rtt <ms>] [--up <B/s>] [--down <B/s>] <dir>`, `fake profile clear <dir>`; in memory `set_profile`), re-read when it changes in the same per-call pass as `faults.json`. Every call costs one RTT; `list_children` one per 150 children and `get_nodes` one per 150 ids (at least one); uploads three (draft, blocks, commit) plus `size / up`; block fetches one plus `len / down`. Each direction is one pipe per process, shared by its concurrent transfers (a transfer starts when the one before it ends), so two daemons on one fake each have their own pipes. The cost is slept after the fault checks and before the call reads or changes the drive, outside the state lock. The fake keeps a child index per folder and a running quota total, and reads blobs after releasing its lock, so it stays cheap under load. Planned: partial batch failures, crash points. Persistable to a directory, so two daemons can share one fake (`--backend fake:<dir>`, test builds only): `snapshot.json` plus an append-only `journal.jsonl` (one line per change, written before the call returns, so a `kill -9` of the daemon loses nothing), compacted into the snapshot at 8 MiB; an `epoch` file tells other handles to reload. Growth is bounded: the last 16 revisions per file (`PDMOUNT_FAKE_KEEP_REVISIONS`), 1024 trashed nodes, 10 000 events and 50 000 changes are kept; dropped revisions delete their blobs. Changes and events keep absolute sequence numbers across trimming (`pdmount fake changes --after <n>`) |
+| Fake backend | Proton model: name uniqueness (2500), `CurrentRevisionID` and `OriginalHash` preconditions, trash, quota, an event log with `more`/`refresh`, several client handles on one drive (`with_client`; a client has a UID and may leave out the SHA-1 and the mode like the official apps, `pdmount fake write\|create --app`). Revisions record the client UID, claimed SHA-1 and creation order (`revisions()`). Pause points (`pause_at`) stop the next upload, folder creation, rename or trash of a client just before its commit, so a test can let another client commit first; uploads are two-phase (draft, then commit), `set_commit_checks(false)` models the server as M3.1 found it (the base revision is checked only at draft creation, D043), and `set_name_hash_enforced(false)` a server that ignored `OriginalHash` (it does enforce it, §10.4; the test documents the alternative). `all_revision_sha1s()` lists the content still reachable. Fault injection: latency, one-shot failures per operation, and `faults.json` in the fake's directory for running daemons (`{"rules":[{"kind":"offline"|"unauthorized","until_ms":…,"client":"pdmount-<device id>"}]}`; every call checks it, re-read when the file changes; a daemon starts while the rule is active when the profile mounted online before (§9.6); `pdmount fake fault offline\|unauthorized [--for <s>] [--client <uid>] <dir>` and `fault clear`; the daemon's client UID is `pdmount-<id>` from `pdmount status`'s "Device" line; the fake has no sign-in, so a daemon in `needs_login` probes every 2 s and goes online when the rule is gone, D047). **Network profile** (M4.2): `profile.json` in the fake's directory (`{"rtt_ms":80,"up_bytes_per_sec":20000000,"down_bytes_per_sec":20000000}`; `pdmount fake profile [--rtt <ms>] [--up <B/s>] [--down <B/s>] <dir>`, `fake profile clear <dir>`; in memory `set_profile`), re-read when it changes in the same per-call pass as `faults.json`. Every call costs one RTT; `list_children` one per 150 children and `get_nodes` one per 150 ids (at least one); uploads three (draft, blocks, commit) plus `size / up`; block fetches one plus `len / down`. Each direction is one pipe per process, shared by its concurrent transfers (a transfer starts when the one before it ends), so two daemons on one fake each have their own pipes. The cost is slept after the fault checks and before the call reads or changes the drive, outside the state lock. The fake keeps a child index per folder and a running quota total, and reads blobs after releasing its lock, so it stays cheap under load. Planned: partial batch failures, crash points. Persistable to a directory, so two daemons can share one fake (`--backend fake:<dir>`, test builds only): `snapshot.json` plus an append-only `journal.jsonl` (one line per change, written before the call returns, so a `kill -9` of the daemon loses nothing), compacted into the snapshot at 8 MiB; an `epoch` file tells other handles to reload. Growth is bounded: the last 16 revisions per file (`PDMOUNT_FAKE_KEEP_REVISIONS`), 1024 trashed nodes, 10 000 events and 50 000 changes are kept; dropped revisions delete their blobs. Changes and events keep absolute sequence numbers across trimming (`pdmount fake changes --after <n>`). **Volumes and shares** (M5.10, D110): roots without a parent on the drive's own volume (`fake`) or on another user's (`vol-N`), shared with the drive's user as `viewer`, `editor` or `admin` (`add_root`, `set_member_role`, `pdmount fake root [--owner <user>] [--role <role>] [--from <local dir>] --name <n> <dir>`); a handle from `tree(volume, root)` serves one tree and polls only its volume's events (ids stay absolute); reads need ownership or membership, changes ownership, `editor` or `admin`, and a move between volumes is `InvalidMove`. **Shared-with-me** (M5.12, D112): the listing of other users' shares with the drive's user as a member, oldest first, folders and single files (`add_shared_file`, `pdmount fake share-file`); a role change or revocation (`set_own_role`, `pdmount fake share-role --role <role>\|none`) changes only the listing; the core event stream signals a `DriveShareRefresh` only when told to (`core_signal`, `pdmount fake core-signal`), so a test chooses between the core event and the first "not found". **Photos** (M5.13, D113): the drive user's Photos volume (`photos`) with a root named "root", photos as files in it with a capture time, tags and a main photo (`add_photo`, `pdmount fake photo add\|seed\|delete`), the timeline newest first in pages of 500 (`Photos`), and Create events on that volume; each photo has a thumbnail (M5.13b, D115), a 512 × 384 WebP of one colour made when asked for, checked against its digest as on Proton (`set_photo_thumbnail`, `fake photo add --thumbnail <w>x<h>\|none\|tampered\|not-webp`); `commit_photo` makes a file of the Photos root a timeline photo with an `UpdateMetadata` event (a draft's commit), and `set_degraded` makes a node's metadata unreadable in this process, as one the SDK cannot decrypt (`get_nodes_checked` answers `Degraded`, the shared-with-me listing names its share as degraded; D119) |
 | Property (proptest) | Two tests in `engine/proptests.rs`. `random_changes_converge_to_the_model`: one device against a POSIX model, with restarts, crashes and another device's changes at clean points. `two_devices_and_an_app_converge` (M3.17): two engines (`dev-a`, `dev-b`) and an app on one fake, operations interleaved with pending local changes (no drain before a remote change), restarts and crashes of either device, explicit event syncs. Invariants listed below. Regression cases of both are replayed in `regression_cases` and `concurrent_regression_cases` (the latter with a debounce long enough that steps meet in the written order, one sequence per M1, M3–M7 interleaving; M2 needs a pause at the commit and is `m2_edit_edit_interleaved_at_commit`) |
-| Mounted, CI | Local CI script (`scripts/ci.sh`) on the dev machine with fuse3, over the fake backend; no hosted CI (D089). `--full` runs every scenario below, the default a subset, `--quick` none (D084). pjdfstest and fsx run separately. **pjdfstest subset** (`tests/pjdfstest.sh`; pjdfstest built from source at the commit named in `tests/pjdfstest.list`): open (incl. O_EXCL), rename, unlink, mkdir, rmdir, truncate, ftruncate, chmod, utimensat, with the file-type loops cut to regular files and directories; link, symlink, mknod and mkfifo give EPERM by design (§8.7, scenario N1) and are left out. The failures of each test file must equal the list's: cases that need other users (the agent is not root, and without `user_allow_other` only the mounting user reaches the mount, D020), unsupported file types, directory `nlink` 1, and ENOSPC from the quota check (§7.8) for a huge truncate. **fsx** (`tests/fsx.sh`; xfstests' `ltp/fsx.c` built standalone): two instances at once with mapped reads and writes, 256 KiB and 8 MiB files; 6 h for the M2 exit check; without `-c`, which needs root for `drop_caches`. fsx, pjdfstest and soak never run against the real account (D030) |
+| Mounted, CI | Local CI script (`scripts/ci.sh`) on the dev machine with fuse3, over the fake backend; it must pass before every push (D084). It runs every step and ends with a summary of all results (`--fail-fast` stops early), and uses one scenario root per checkout, `/dev/shm/pdmount-ci-<checksum of the path>`, locked, so runs in several worktrees can go on at once (D098). On GitHub (D097, M5.15): `ci.yml` runs `--quick` on pushes and pull requests and the full run on demand and weekly, on the fake only; dist's `release.yml` builds the release archive on a `v*` tag. `--full` runs every scenario below, the default a subset, `--quick` none (D084). pjdfstest and fsx run separately. **pjdfstest subset** (`tests/pjdfstest.sh`; pjdfstest built from source at the commit named in `tests/pjdfstest.list`): open (incl. O_EXCL), rename, unlink, mkdir, rmdir, truncate, ftruncate, chmod, utimensat, with the file-type loops cut to regular files and directories; link, symlink, mknod and mkfifo give EPERM by design (§8.7, scenario N1) and are left out. The failures of each test file must equal the list's: cases that need other users (the agent is not root, and without `user_allow_other` only the mounting user reaches the mount, D020), unsupported file types, directory `nlink` 1, and ENOSPC from the quota check (§7.8) for a huge truncate. **fsx** (`tests/fsx.sh`; xfstests' `ltp/fsx.c` built standalone): two instances at once with mapped reads and writes, 256 KiB and 8 MiB files; 6 h for the M2 exit check; without `-c`, which needs root for `drop_caches`. fsx, pjdfstest and soak never run against the real account (D030) |
 | Benchmarks | `scripts/bench/m4.sh [git\|untar\|read\|slo\|gc\|all]` (D057): the M4 exit rows over the fake backend with the 80 ms / 20 MB/s network profile, profile state on the disk, the drive in tmpfs, local comparisons on the same filesystem; report in `target/bench/m4-<date>/report.md`. The `slo` row checks the daemon's own p99 latencies (`pdmount stats --json \| scripts/bench/slo.py`, §5.8) against §5.7, as the median of 5 rounds; a round with a bare `fdatasync` p99 above 10 ms before or after it does not count (`scripts/bench/fdatasync.py`, D086); the "first byte" and "first listing" rows of §5.7 are backend-call counts checked by engine tests. Client-side tools: `scripts/bench/latency.sh`, `scripts/bench/read.sh`. Not part of `scripts/ci.sh` |
 | Real account | Two profiles of one account on one machine (two devices), each with its own login. Scenario scripts only, under `pdmount-test/` (D028), one run at a time, stopping at the first HTTP 429; datasets kept modest (D030). Manual; long runs only with the user's approval |
 | Soak | `tests/soak.sh`, over the fake backend with two devices on one drive (D030). 3 h (D048; `SOAK_DURATION`). Loops: rsync of a mutated tree every 10 min (about 5 % of the files added, changed or deleted), a git commit every 30 s on A (`gc` every 50 commits), edits on B every 60 s and of A's rsync target every 10 min (conflicts expected), an official-app write (`fake write --app`) every 5 min, a sampler every 60 s (VmRSS, queue, counters). Faults go through the fake's fault file, not `ip link`: the drive unreachable for all clients for 5 min every 40 ± 10 min (`fake fault offline`), A's session rejected for 5 min every 60 min from minute 30 (`fake fault unauthorized`, then `clear`). Pass: (a) no EIO outside the fault windows plus 70 s (loop failures and `answered EIO` warnings of both daemon logs), (b) zero parked jobs, (c) the largest RSS of the last third of the run at most 1.25 × that of the window from 1/6 to 1/3 of the run, per daemon, (d) `rsync -ani --checksum` between the two mounts prints nothing and `git fsck --full --strict` is clean on both, (e) `handler_panics` and `hot_path_network_calls` are 0 |
@@ -1617,7 +2474,7 @@ What the API allows in practice is settled by M5.9 (`docs/plans/m5.md`).
 
 ### 15.3 Scenarios
 
-The R, G, N and A scripts, `sha` and `g6_read` take `VERIFY_MODE`; `m*` and `e2` run live or skip other modes, and `queue` (§8.2, §5.6), `ops` (§14.4) and `kill9` (M1 exit, §16) are live only:
+The R, G, N and A scripts, `sha` and `g6_read` take `VERIFY_MODE`; `m*` and `e2` run live or skip other modes, and `queue` (§8.2, §5.6), `ops` (§14.4), `svc` (§14.4, supervisor options) and `kill9` (M1 exit, §16) are live only:
 
 | Mode | Meaning |
 |---|---|
@@ -1683,7 +2540,7 @@ keeps 4 revisions per file. Real-account runs keep the local dataset copy in `~/
 | ID | Steps | Pass condition |
 |---|---|---|
 | E1 | While mounted, another client renames a directory, trashes a file and writes a new revision of a file read before | All three visible without a remount within 40 s (`poll_interval` + 10 s, D037), measured after the daemon has caught up with the earlier scenarios' events (a file made by the other client shows first: `event_barrier`); the old names are gone from the kernel's caches
-| E2 | (`live`) The drive is unreachable for A for 90 s while `rsync` writes into the mount; then the session is rejected (`fault unauthorized`) and a file and a folder are made; then `fault clear` | `status` shows `Connection: offline`, then `online`, then `needs login`, then `online` again (the fake daemon probes while `needs_login` lasts, standing in for a sign-in). Cached data reads offline; a file never fetched fails within 3 s (`timeouts.offline_read`). Local writes are accepted in both states. After `fresh`, everything is on the drive, nothing parked and the file reads its new content; the state survives the verify mode |
+| E2 | (`live`) The drive is unreachable for A for 90 s while `rsync` writes into the mount; then the session is rejected (`fault unauthorized`) and a file and a folder are made; then `fault clear`; `login` in each state and `login --force` online; then a restart under each fault (the daemon starts from the stored account, §9.6) | `status` shows `Connection: offline`, then `online`, then `needs login`, then `online` again, and the same after each restart (the fake daemon probes while `needs_login` lasts, standing in for a sign-in). Cached data reads offline; a file never fetched fails within 3 s (`timeouts.offline_read`). Local writes are accepted in both states. `login` says the profile is already signed in while offline and online (exit 0), and asks the daemon for a sign-in, which the fake does not have (exit 1), in `needs login` and with `--force` (D108). After `fresh`, everything is on the drive, nothing parked and the file reads its new content; the state survives the verify mode |
 
 **Multi-device** (`live` mode, two profiles A and B on one fake or, for the cases marked, on two real profiles; other modes skip them). A file held open for writing on one device keeps its change local while the other device's change arrives; the scenario keeps it open until a marker written after the change, in the same directory, shows on that device (the listing that shows the marker shows the change), then closes it (`reach_b_while_held`). After both queues drain, a marker goes each way (`sync_devices`) before `ls`, `cat` and `pdmount conflicts list <dir>` are checked on both mounts.
 
@@ -1698,19 +2555,40 @@ keeps 4 revisions per file. Real-account runs keep the local dataset copy in `~/
 | M7 | `m7.sh` (file part: fake, real; folder and app parts: fake) | File: B holds a new `c.txt` open while A creates one. Folder: A (offline) and B both make `dd` with different children. App: an official client (`fake write --app`) writes a new revision of a clean file | File: A's `c.txt`, one conflict copy with B's content, B lists `create_create`. Folder: one `dd` with both children. App: the content is adopted on both, no conflict listed |
 
 **Session end and notifications** (M5, M6; fake with the network profile unless marked; plans in `docs/plans/m5.md`, `m6.md`).
+Scripts: `x1.sh` to `x4.sh` and `x11.sh` (live only; `x11` skips without `dbus-daemon` and runs `pdmount fake logind` as
+the stub, with `tests/scenarios/stubs/notify-send`, which `x4` uses too). The fake scenarios' daemons see no system bus otherwise
+(`DBUS_SYSTEM_BUS_ADDRESS` in `lib.sh`), so they never take a lock from the machine's logind.
 
 | ID | Interleaving | Pass condition |
 |---|---|---|
 | X1 | Write files, SIGTERM at once, within the debounce | All on the fake drive before the daemon exits; exit well under the grace |
-| X2 | Queue larger than the grace can upload, SIGTERM | The daemon exits within the grace; the rest uploads at the next mount; no loss |
+| X2 | Queue larger than the grace can upload, SIGTERM; then again with a second SIGTERM 2 s after the first | The daemon exits within the grace; after a second SIGTERM within 2 s, with the store committed; the rest uploads at the next mount; no loss |
 | X3 | SIGTERM while offline; empty queue | Exit with no flush wait |
-| X4 | Remount after X2 | One warning notification and log line; none after X1 |
+| X4 | Remount after a SIGTERM with a queue larger than the grace, and after `kill -9` with a queue; remount with an empty queue; a notifier that fails | One log warning and one "still uploading" notification, then one "uploaded" when the queue is empty; nothing for an empty queue; no "uploaded" when the first notification failed |
 | X5 | By hand, Gentoo and Debian: logout and reboot with a queue that fits, crash, locked keyring | Changes visible on the other device, or a documented limit from M5.0; restart after a crash; `needs_login` without a hang |
 | X6 | Private bus with a stub notification service: conflicts of each state; bus absent, then present | `open` ones named and shown once, escaped; `notice` ones not shown; missed ones shown when the bus appears |
 | X7 | Fake: several roots with My Files; a remote change in each; a write to a read-only root; a share revoked. Real, read-only: the user's own shared item, device and photo | Every root lists and reads with the right sha256; remote changes appear without recursive listing; writes return EROFS; a revoked share disappears without an error on the others; the My Files scenarios are unchanged |
-| X8 | Fake: the R, G, N and A scenarios and M1, M3, M6, M7 on a share with `Editor` and on a device, in `live`, `remount`, `crash`, `fresh`; a `Viewer` share; the role lowered and the share revoked with changes pending; `mv` between trees | Same pass conditions as in My Files; `Viewer` writes return EROFS; nothing staged is lost, and it is listed and kept; `mv` copies after EXDEV |
-| X9 | Real, with the user's exception to D028: a small rsync and git run in a test share from another account and in a test device | Content is right on the owner's side and in the official client; the owner's account sees the commits' author as this account |
+| X8 | Fake: the R, G, N and A scenarios and M1, M3, M6, M7 on a share with `Editor`, in `live`, `remount`, `crash`, `fresh`; a `Viewer` share; the role lowered and the share revoked with changes pending; `mv` between trees | Same pass conditions as in My Files; `Viewer` writes return EROFS; nothing staged is lost, and it is listed and kept; `mv` copies after EXDEV |
+| X9 | Real, with the user's exception to D028: a small rsync and git run in a test share from another account | Content is right on the owner's side and in the official client; the owner's account sees the commits' author as this account |
+| X16 | Fake, a drive and two profiles of its own (M5.14a, D114): shares `Edit` (alice) and `Other` (bob) as an editor, `View` (alice) as a viewer, `Gone` (carol) as an editor; A mounts them in a Shared root with `pending_marker`, a 1 s debounce. `Other` and `View` each hold 40 markers of other members (D126). Writes, a delete, a rename inside `Edit`; writes in `View`; `os.rename` and `mv` from `Edit` to `Other`. `Gone` holds a `/.pdignore` of `*` from its owner, and A's profile `.pdignore` has `*.local` (D124); A writes `a.txt` in `Gone`. A file written while held open, the role lowered to viewer without a core event, the file closed; editor and a core event. A file held open, viewer and a core event, the file closed; editor and a core event. Then a 120 s debounce: changes in `Gone` (new files, a folder, an edit of a read file, a delete, a file `keep.local`), then `Gone` revoked and a core event. B mounts the shares. A writes 24 MiB in `Edit` at 1 MB/s up and gets SIGTERM with a 16 s grace; A mounts again | `Gone/a.txt` reaches the drive (the share's `*` keeps nothing local-only); `Edit` is `writable (editor)` and its changes reach the drive (B reads them), `View` answers EROFS; `Other` shows 5 `Incoming:` lines and `+35 more` and gets one notification, which counts the 24 markers not read, `View` neither; the rename is EXDEV and `mv` copies; the refusal closes the gate (`read-only`, 1 parked, the note in `status`, log line, a notification), the file stays readable and new files get EROFS; editor again uploads it; the role change holds the open file's change, the close does not lift it, editor again uploads it; `Gone` leaves the mount and `orphaned/Gone (<time>)/` holds the files with their content, `keep.local` among them as `local-only` while the new files are `upload`, and a manifest listing the delete, `status` shows `Orphaned:`, a notification and a log line, no `state/`, its tree state is deleted; the stop takes at most the grace plus 5 s and leaves one marker, in `Edit`'s `.pdmount/`, whose JSON has no `device`, none in My Files; B shows `Incoming: device <id>` under `Edit` and gets a notification; A's next mount uploads the rest, B's `Incoming:` goes and B reads the files |
+| X15 | Fake, a drive and profile of its own (M5.12, D112): a `shared` root; shares `Team` from alice and from bob, `Docs` and `Quiet` from carol, and a shared file `plan.txt` from bob. Reads and writes; `ls` in bob's share, then in alice's; a file of `Docs` held open; a new share from dave, `Docs` revoked and one core event; `Quiet` (never browsed) revoked without a core event, then `ls` in it; bob's `Team` revoked and a core event; a share `Team (alice)` from mallory and a core event (D125); a remount; the daemon's stop | The top level holds `Docs`, `Quiet`, `Shared files`, `Team (alice)`, `Team (bob)` (mode 555) and `Shared files` holds `plan.txt`; reads match, every write gets EROFS; `status` shows the share in use `every 30 s` and the others `every 600 s`; after the core event (within 45 s) `Late` shows and `Docs` is gone, and a read of its open file gives EIO; `Quiet` goes within 10 s of its "not found" (log line); the gone shares' state is deleted; alice's share stays `Team (alice)`, mallory's shows as `Team (alice) (mallory)`, and the remount shows the same names; the stop leaves no mount |
+| X17 | Fake, a drive and profile of its own (M5.13, D113): a `photos` root; 300 photos over four years (`fake photo seed`), a Live Photo (still and video) and a photo from a local file in the newest month. `ls` of the top level and each year; `ls` of the newest and the oldest month; a read; writes; a new photo and the Live Photo's still deleted on the fake; `status`; `unmount` and `mount` of the Photos root; the daemon's stop. `XDG_CACHE_HOME` is under `$SCENARIO_ROOT` | The years and months match the capture times (local time; mode 555); each month lists its photos once opened, the video beside its still; the opened month's thumbnails are in `$XDG_CACHE_HOME/thumbnails/{normal,large,x-large}` (M5.13b) under the MD5 of the URI, with that `Thumb::URI`, the photo's mtime as `Thumb::MTime`, 128/256/512 px, mode 600 in folders of mode 700, and a second open rewrites none; the read's SHA-256 matches, mode 444, mtime the capture time; every write gets EROFS; within 45 s the new photo shows and the still and its video are gone; `status` shows `302 photos, … named, timeline read`; after the remount the log says the timeline and names were loaded from the store, with no timeline read or names fetch, the new photo gets its thumbnails and the others are not written again; the stop leaves no mount |
 | X10 | Fake with the network profile: open a folder of 2,000 images in a file manager with thumbnails on, then open one image; the same with the thumbnail cache off; the same folder in My Files | With the cache on, no originals are downloaded for thumbnails; in every case, no HTTP 429 from the fake's rate rule, the opened image's first byte stays within the §5.7 read SLO, and reads on another mount stay responsive |
+| X11 | Fake, private system bus with a stub logind: PrepareForShutdown with a queue, with an empty queue, then cancelled; SIGTERM after PrepareForShutdown; no logind; the lock refused | The lock is taken at mount; with a queue the flush starts at PrepareForShutdown, one notification, the lock released when the flush ends; empty queue: released at once, no notification; cancelled: taken again; the grace not restarted by SIGTERM; without a lock SIGTERM alone flushes, as X1 |
+| X12 | Fake, two daemons on one drive: A, with `sync.pending_marker`, runs out of grace with entries left (1 MB/s up); B has a `notify-send` stub; then A mounts again; last, A stops with a 5 s grace and a small queue | A leaves `.pdmount/<A>.pending` (JSON as §14.4, no file names); B shows `Incoming:` and gets one notification; on B, `.pdmount` answers EROFS; A's next mount drains and trashes the marker, B's `Incoming:` goes; nothing is lost; with the 5 s grace the marker is written at the start of the flush and trashed in the same stop |
+| X13 | Fake, private session buses (M5.17, D102, D106): a profile mounted before starts in keyring mode on bus A, which has no Secret Service and no notification server; `login`; `session attach` from A, from an unreachable bus, with a `tcp:` address, then from B (a `notify-send` stub records its bus; B can start a notification server, an activation file); gnome-keyring starts on B without the profile's cache key, which then comes back with an attach; a daemon started with `--service` on B with B's collection locked (a stub prompter that never answers), a `login` whose dialog stays open, a stop, a second such start and gnome-keyring restarted unlocked; then the opposite layout (D102 amended): a daemon on A, attached from bus C, which has the notification server and an activatable Secret Service that never answers, while gnome-keyring starts on A; twice, the second time with the cache key only in A's keyring; an attach from C with `DISPLAY` and `XAUTHORITY` set while the keyring is on A, a restart, and one without them. The restart (D102 amended): after B's attach the daemon on A is stopped and started again without an attach; then again with the saved attach pointing at a socket nobody listens on, followed by an attach from B; the locked service start on B finds B's attach saved. An attach before the start (D102 amended 2026-11-14): with no daemon, an attach from A under a runtime directory whose `bus` is A, then one from B; then a daemon on A starts | The daemon mounts, stays up and waits (`status`: needs login, "waits for the keyring"); the stored tree lists, a clean read fails, a write queues; `login` says the keyring is still unavailable; A is "already the daemon's bus", the others are refused; after B's attach one notification, sent on B; without the cache key the daemon waits ("no cache key"), the timer does not retry, no key is made and the disk cache's blocks stay; with it the attach brings the mount online, the cache key moves into B's keyring, the queue drains, clean content and the disk cache work again; the locked service start is ready and waiting within 15 s with no unlock dialog, the stop during the login's dialog takes under 15 s, and the timer brings the second start online once the collection is unlocked, without a dialog; in the opposite layout the attach reports the keyring and notifications on C until gnome-keyring owns its name on A, then the keyring on the daemon's own bus (log line, `status` `Bus:` line), the cache key moves into A's keyring and is read from it on the second run, and each wait's one notification lands on C; the attach with a display says it was set on the daemon's own bus (log line too), and a probe that A starts by D-Bus activation gets C's `DISPLAY` and `XAUTHORITY`; the attach without them passes none. Restart: the attach file exists with mode 0600 and B's address; the restarted daemon logs "using the desktop's session bus saved by the last attach", `status` shows `Bus: desktop's bus attached; keyring: none found, notifications: the desktop's bus`, its notifications go to B and the file stays; the file of the gone bus is removed and logged, no `Bus:` line, and the attach from B saves it again; the service start on B removes the file of its own bus; the restart after C's attach with a display goes online and passes the display to A again. Attach before the start: A's prints "nothing to attach" and saves nothing; B's prints "its next start takes this session's bus" and saves the file (0600); the daemon started on A logs the saved bus, shows the `Bus:` line and sends its notification to B. From that start the profile has a further root (D110 amended): it shows as `waits for the keyring`, its `mount` is refused, and once the keyring answers it mounts by itself (log line) and answers |
+| X14 | Fake, a drive and profile of its own (M5.10a, D110): one `test` root with three trees, `work` on the own volume with its gate open, `shared` on another user's volume with the viewer role, and `missing` with a root that does not exist; a second root whose only tree does not exist. Writes in each tree and the top level; `unmount <root>` with 64 KiB pending over a 4 KiB/s upload, with `status`, a second `unmount` and a `mount` meanwhile; `mount -o ro <root>`, then a plain `mount`; `fusermount3 -u <root>`, a later `mount`, then again with the `mount` at once; the daemon's stop; a daemon started with `--service openrc --notify-fd 3` with a 1.5 s round trip per call, then `unmount <root>` and `mount <root>` under it, then SIGTERM | `status` shows the root `mounted` with `work: writable`, `shared: read-only`, `missing: not opened: ...`, and the second root `failed: no tree opened` (also in the log); the top level has `shared` and `work`; writes in `work` upload, the others get EROFS (a move into `shared` too); during the drain `status` answers within 3 s with the root `unmounting: uploading first` and the pending upload, the second `unmount` and the `mount` are refused (`is being unmounted`), My Files works, and the unmount prints the pending count, then `Unmounted`, with the file on the drive; after it the root is `not mounted`, the daemon (same pid) and My Files go on; under `-o ro` reads work and writes get EROFS (`mounted, read-only`), a second `mount` says `is already mounted`, the plain `mount` is writable; the outside unmount shows as `not mounted (unmounted from outside)` within 15 s (log line) and both later mounts work with the content; the stop leaves no mount; the service daemon's readiness comes while the root is still `mounting` or `not mounted`, the root mounts after it, and `unmount <root>` leaves the daemon and My Files running |
+
+X12 is `x12.sh` (live, fake only: the marker is outside `pdmount-test/`, D028). X13 is `x13.sh` (live, fake only, a profile of
+its own; without gnome-keyring the unlock part is skipped). X14 is `x14.sh`, X15 `x15.sh`, X16 `x16.sh` and X17 `x17.sh` (live, fake only, a
+drive and profiles of their own).
+
+**X8 in a share's tree (M5.14a, D114):** `TARGET=share` in `tests/scenarios/lib.sh` (fake only) runs a scenario in a share
+instead of My Files: a fake drive of its own with the share `pdmount-share` of another user, the drive's user an editor;
+the profiles `fake-share` and `fake-share-2` mount it in a Shared root, and `TEST_ROOT`, `ROOT_A` and `ROOT_B` point to
+`<share>/pdmount-test`. `remount`, `crash` and `fresh` drain the share's queue first or unmount its mount too. The A
+scenarios skip there (path commands reach My Files only, D110), and the M scenarios read their conflict kinds from the
+daemon's log. `tests/pjdfstest.sh` and `tests/fsx.sh` take it too.
 
 ---
 
@@ -1721,13 +2599,13 @@ Exit criteria are functional tests. A milestone is done when its listed tests pa
 | Milestone | Scope | Exit criteria |
 |---|---|---|
 | **M0 Foundations** | Workspace; SDK fork with P1, P2, P4, P8; `Backend` trait and fake; local CI script that builds `gopenpgp-sys` (Go ≥ 1.22, clang, protoc); `login`/`logout`/`status`/`doctor` | `pdmount login` opens the browser **and** `login --no-browser` prints the link; both complete sign-in. `status` shows the account and quota. Fake-backend unit tests pass. `doctor` passes on the Gentoo machine |
-| **M1 Read-only mount** | Inode table, store, listing, block cache (P3), readahead and prefetch, notify queue, `catch_unwind`, deadlines, unmount tooling; writes return EROFS | **R6** and **G6 read side** (clone, fsck) on data uploaded by the official client, in `live` and `fresh` modes. This confirms API size, mtime, and content. sha256 of 5 MB / 41 MB / 2 GB files equals the web download. `hot_path_network_calls == 0`. `kill -9` → `unmount --force` → remount without a reboot |
+| **M1 Read-only mount** | Inode table, store, listing, block cache (P3), readahead and prefetch, kernel invalidation, `catch_unwind`, deadlines, unmount tooling; writes return EROFS | **R6** and **G6 read side** (clone, fsck) on data uploaded by the official client, in `live` and `fresh` modes. This confirms API size, mtime, and content. sha256 of 5 MB / 41 MB / 2 GB files equals the web download. `hot_path_network_calls == 0`. `kill -9` → `unmount --force` → remount without a reboot |
 | **M2 Writes, single device, access control** | Staging, journal, §7–§8, `fsync=local`, `.pdignore`, quota errors, metadata revisions, P5, P6, P10; access rules (§11); event engine for clean inodes with refresh and echo suppression (§9.1–§9.5, §7.5; D033) | **R1–R7, G1–G7, N1, A1–A6, E1** pass in `live`, `remount`, `crash`, `fresh` on the fake (CI), and all but A5 and E1 (which need a second client) in `live`, `remount`, `fresh` on the real account. pjdfstest subset green and fsx 6 h clean, both on the fake (D030); journal property tests at 10k cases |
 | **M3 Multi-device and sync robustness** | Remote changes to dirty inodes, the full conflict engine, offline mode, auth refresh and `needs_login`, P9, P11, P12; verify server precondition behaviour (§10.4) | **M1–M7** on the fake, and the cases marked "real" in §15.3 (M1, M3, M6, the file part of M7) on two real profiles: M2, M4, M5 and the folder and app parts of M7 need fault injection or a pause at the commit (D051). Every R/G/A scenario in `second` mode on two real profiles. Zero data loss. Remote changes visible within `sync.poll_interval` + 10 s of the writer's commit, 40 s at the default (D037, D050). 3 h soak on the fake passes (D030, D048) |
 | **M4 Performance and operations** | SLO instrumentation, benchmarks, P7 parallel uploads, pins, writeback-cache experiment, `cache gc`, queue tooling, autostart entry (D059), documentation | §5.7 SLOs met (median of 5 rounds on a quiet disk, D086). Over the fake backend with an 80 ms RTT / 20 MB/s profile: `git status` on warm git.git ≤ 2× local btrfs; untar of 5k small files ≤ 15× local (time to acknowledgement; D065); cached sequential read ≥ 500 MB/s; `cache gc` keeps the cache ≤ 1.05 × the cap, and ≤ the cap after gc (definitions: D057) |
-| **M5 User services, flush and further roots** | OpenRC and systemd user services (D074); flush on SIGTERM, warning at the next start (D075); pending marker (D076); Shared-with-me, Computers and Photos (D078); read-write for Computers and writable shares, Photos read-only (D080); bulk-read guard and Photos thumbnails (D081) | **X1–X4**, **X7**, **X8** and **X10** on the fake; **X5** by hand on Gentoo (OpenRC) and Debian (systemd); **X7** read-only on the real account; **X9** if the user grants the D028 exception; pjdfstest subset and a short fsx on a share tree on the fake; no regression in the §16 M2 scenarios on the fake |
+| **M5 User services, flush and further roots** | OpenRC and systemd user services (D074); flush on SIGTERM and at logind's PrepareForShutdown, warning at the next start (D075, D091); pending marker (D076); Shared-with-me and Photos (D078; Computers out of scope, D122); read-write for writable shares, Photos read-only (D080); bulk-read guard and Photos thumbnails (D081); release archive with cargo-dist and GitHub CI (D097) | **X1–X4**, **X7**, **X8** and **X11** on the fake; **X10** through the existing tests (x17's thumbnails, the bulk-read guard's mounted and unit tests; D123); **X5** by hand on Gentoo (OpenRC) and Debian (systemd); **X7** read-only on the real account; **X9** if the user grants the D028 exception; pjdfstest subset and a short fsx on a share tree on the fake; no regression in the §16 M2 scenarios on the fake |
 | **M6 Conflict notifications** | Named, actionable D-Bus notifications; missed ones shown later (D077). A resolution UI is not decided | **X6**; by hand on the user's desktops: **Show** opens the folder; a conflict on the other device while logged out appears at the next login |
-| **M7 Upstream and crypto migration** | Upstream patches; track Proton's new crypto model; rebase the fork | Fork diff reduced to unmerged patches; migration plan documented; full matrix re-run |
+| **M7 Upstream and crypto migration** | Upstream patches; track Proton's new crypto model; later fork rebases (the first one, onto 0.5.1, is M6.0.1, D099) | Fork diff reduced to unmerged patches; migration plan documented; full matrix re-run |
 
 ---
 
@@ -1803,10 +2681,18 @@ default = "rw"                  # rw | ro
 # [[access.rule]] path = "/Archive"  mode = "ro"
 
 [cache]
-max_bytes = "10GiB"
+max_bytes = "10GiB"             # the profile's disk cap: My Files and every further tree together; My Files
+                                # keeps at least half (D110 amended, §14.5)
 ram_bytes = "32MiB"             # at least 16MiB; the block pool, reserved at startup (§6.2)
 prefetch_small_files = "256KiB"
 prefetch_dir_budget = "16MiB"
+
+[scan]                          # the bulk-read guard, all trees together (§6.4, D081, D111)
+opens = 10                      # different files opened within `window` that begin a scan; 0 = off, else at least 2
+window = "5s"                   # more than 0s, at most 60s
+first_bytes = "8MiB"            # read through a handle opened during a scan before its reads are interactive
+interval = "100ms"              # spacing of the starts of scan downloads, one at a time; at most 10s
+cache_share = 10                # percent of cache.max_bytes that blocks of scan reads may fill (0-100)
 
 [upload]
 concurrency = 4                 # 1-4: files uploaded at once (D033, D058)
@@ -1826,13 +2712,35 @@ negative_ttl = "10s"
 [sync]
 poll_interval = "30s"           # event polling; at least 30s, the official clients' interval (D033)
 probe_interval = "30s"          # connectivity probe while offline or signed out; at least 10s (D041)
+pending_marker = false          # leave .pdmount/<device id>.pending when a stop's grace runs out with changes left (D076)
 
 [timeouts]
 metadata = "20s"
 block = "60s"
 offline_read = "2s"
-shutdown_grace = "30s"          # how long a stopping daemon waits for running uploads (D062)
+shutdown_grace = "90s"          # flush at a stop and wait for running uploads (D062, D075, D091)
 
 [stats]
 prometheus_textfile = ""        # e.g. "~/node-exporter/pdmount.prom"; empty = off (§5.8)
+
+[photos]
+thumbnail_cache = true          # a photos root writes Proton's thumbnails of the months opened to
+                                # $XDG_CACHE_HOME/thumbnails (§14.5, D081, D115)
+
+# Further roots (§14.5, D079, D110), each on its own mountpoint; none by default. Mountpoints may not overlap
+# My Files' or each other.
+# [[roots]]
+# kind = "shared"               # shared: one tree per share (M5.12, D112), at most one; photos: the Photos timeline
+#                               # by year and month, read-only (M5.13, D113), at most one; computers: refused
+#                               # (D122); test: test builds only
+# mountpoint = "~/ProtonDrive-Shared"
+# read_only = false             # like `mount -o ro`, for this mount (a photos root is read-only anyway)
+# pending_marker = false        # leave .pdmount/<device id>.pending in each writable tree's root when a stop's grace
+#                               # runs out with its changes left (D076, D114); in a share it names no device
+# Only kind = "test", with a fake drive (`pdmount fake root` prints volume and root):
+# [[roots.tree]]
+# name = "Team"                 # the tree's folder in a mount with several trees
+# volume = "vol-1"
+# root = "link-2"
+# writable = false              # opens the tree's write gate
 ```

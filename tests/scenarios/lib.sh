@@ -40,6 +40,16 @@
 #   DATASET      local copy of the M1 dataset, regenerated if missing (default:
 #                ~/.cache/pdmount-scenarios/m1; with BACKEND=fake: $SCENARIO_ROOT/m1-nobig, without the
 #                2 GiB file; see scripts/testdata/make-m1-dataset.sh)
+#   SCENARIO_SYSTEM_BUS  with BACKEND=fake: DBUS_SYSTEM_BUS_ADDRESS for the daemons (default: a
+#                socket that does not exist, so they take no delay lock from the machine's logind)
+#   TARGET       my-files (default) or share (BACKEND=fake only, M5.14a, D114): the scenario
+#                writes into a share's tree instead of My Files. A fake drive of its own
+#                ($SCENARIO_ROOT/fake-drive-share) holds the share `pdmount-share` of another
+#                user with the drive's user as an editor; the profiles fake-share and
+#                fake-share-2 mount it in a Shared root at $SCENARIO_ROOT/fake-shared(-2), and
+#                TEST_ROOT, ROOT_A and ROOT_B point into it (<share>/pdmount-test). Path commands
+#                (`access`, `conflicts`, ...) reach My Files only (D110), so the A scenarios
+#                skip, and the M scenarios read their conflicts from the daemon's log
 set -euo pipefail
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -86,6 +96,21 @@ if [[ -z "${SCENARIO_ROOT:-}" ]]; then
     fi
 fi
 private_root "$SCENARIO_ROOT"
+# TARGET=share (fake only) runs a scenario in a share's tree instead of My
+# Files: profiles, mountpoints and a fake drive of its own (see the end).
+TARGET=${TARGET:-my-files}
+case $TARGET in
+    my-files) ;;
+    share)
+        [[ $BACKEND == fake ]] || { echo "TARGET=share needs BACKEND=fake" >&2; exit 2; }
+        PROFILE=${PROFILE:-fake-share}
+        PROFILE2=${PROFILE2:-fake-share-2}
+        MNT=${MNT:-$SCENARIO_ROOT/fake-mnt-share}
+        MNT2=${MNT2:-$SCENARIO_ROOT/fake-mnt-share-2}
+        FAKE_DIR=${FAKE_DIR:-$SCENARIO_ROOT/fake-drive-share}
+        ;;
+    *) echo "TARGET must be my-files or share" >&2; exit 2 ;;
+esac
 case $BACKEND in
     proton)
         PROFILE=${PROFILE:-default}
@@ -112,19 +137,35 @@ case $BACKEND in
             XDG_RUNTIME_DIR=$SCENARIO_ROOT/xdg/run
         PROFILE2=${PROFILE2:-fake-scenarios-2}
         MNT2=${MNT2:-$SCENARIO_ROOT/fake-mnt-2}
-        # One config per profile; an older one gets the device name added.
-        fake_config() { # <profile> <device name>
+        # One config per profile; an older one gets the device name added. The mountpoint is set
+        # so that commands without one (`reset`, `status`) look at the test's, not at
+        # ~/ProtonDrive, where a real drive may be mounted.
+        fake_config() { # <profile> <device name> <mountpoint>
             local config=$XDG_CONFIG_HOME/pdmount/$1.toml
             if [[ ! -f "$config" ]]; then
                 mkdir -p "${config%/*}"
                 printf '[cache]\nmax_bytes = "%s"\nram_bytes = "32MiB"\n' "${CACHE_MAX:-1GiB}" >"$config"
             fi
             grep -q '^\[device\]' "$config" || printf '\n[device]\nname = "%s"\n' "$2" >>"$config"
+            # The bulk-read guard spaces scan downloads 100 ms apart (D111); on the fake, which
+            # has no network latency, that spacing alone would make cold reads of many files
+            # several times slower. The guard stays on, with a short spacing (SCAN_INTERVAL).
+            grep -q '^\[scan\]' "$config" ||
+                printf '\n[scan]\ninterval = "%s"\n' "${SCAN_INTERVAL:-10ms}" >>"$config"
+            # The first one is My Files'; those of [[roots]] (TARGET=share) stay.
+            if grep -q '^mountpoint *=' "$config"; then
+                sed -i "0,/^mountpoint *=/{s|^mountpoint *=.*|mountpoint = \"$3\"|}" "$config"
+            else
+                sed -i "1i mountpoint = \"$3\"" "$config"
+            fi
         }
-        fake_config "$PROFILE" dev-a
-        fake_config "$PROFILE2" dev-b
+        fake_config "$PROFILE" dev-a "$MNT"
+        fake_config "$PROFILE2" dev-b "$MNT2"
         # The fake keeps a few revisions per file (it lives in the daemon).
         export PDMOUNT_FAKE_KEEP_REVISIONS=${PDMOUNT_FAKE_KEEP_REVISIONS:-4}
+        # Test daemons take no delay lock from the machine's logind (D091): the
+        # system bus is one that does not exist, unless a scenario starts its own (x11).
+        export DBUS_SYSTEM_BUS_ADDRESS=${SCENARIO_SYSTEM_BUS:-unix:path=$SCENARIO_ROOT/no-system-bus}
         ;;
     *) echo "BACKEND must be proton or fake" >&2; exit 2 ;;
 esac
@@ -266,12 +307,17 @@ require_m1() {
 }
 
 # Waits until no upload or namespace change is pending (`pdmount status`
-# reports `Queue: 0 pending`). Daemons without a queue line pass at once.
+# reports `Queue: 0 pending`, and `0 pending` on each tree line of a further
+# root). Daemons without a queue line pass at once.
 wait_queue_of() { # <status function>
-    local deadline=$((SECONDS + ${QUEUE_TIMEOUT:-600})) line
+    local deadline=$((SECONDS + ${QUEUE_TIMEOUT:-600})) line text trees
     while :; do
-        line=$("$1" | grep '^Queue:' || true)
-        [[ -z "$line" || "$line" =~ ^Queue:\ +0\ pending ]] && return 0
+        text=$("$1")
+        line=$(grep '^Queue:' <<<"$text" || true)
+        trees=$(sed -nE 's/^  .*: (writable|read-only)[^,]*, ([0-9]+) pending, .*/\2/p' <<<"$text" |
+            awk '{ sum += $1 } END { print sum + 0 }')
+        [[ $trees == 0 ]] || line="$line; further trees: $trees pending"
+        [[ -z "$line" || "$line" =~ ^Queue:\ +0\ pending[^\;]*$ ]] && return 0
         ((SECONDS < deadline)) || fail "the queue did not drain within ${QUEUE_TIMEOUT:-600} s: $line"
         sleep 1
     done
@@ -612,3 +658,176 @@ a_back() {
     wait_queue_empty
     sync_devices
 }
+
+# ---- X scenarios: the flush at a stop (M5, DESIGN.md §15.3, D075, D091) ----
+
+# They stop the daemon themselves, so other verify modes add nothing.
+x_live_only() {
+    [[ $VERIFY_MODE == live ]] || { echo "$(basename "$0" .sh): live mode only; skipped in $VERIFY_MODE mode"; exit 0; }
+}
+
+# The test profile's config: x_config_save keeps it, x_config sets it to the
+# kept one plus the given TOML lines, x_restore puts it back and clears the
+# network profile (from an EXIT trap).
+x_config_file() { echo "$XDG_CONFIG_HOME/pdmount/$PROFILE.toml"; }
+x_config_save() { x_saved_config=$(cat "$(x_config_file)"); }
+x_config() { # <toml line...>
+    { printf '%s\n' "$x_saved_config"; printf '%s\n' "$@"; } >"$(x_config_file)"
+}
+x_restore() {
+    "$PDMOUNT" fake profile clear "$FAKE_DIR" >/dev/null 2>&1 || true
+    if [[ -n ${x_saved_config:-} ]]; then printf '%s\n' "$x_saved_config" >"$(x_config_file)"; fi
+}
+
+now_ms() { date +%s%3N; }
+
+# The daemon's log, from the last log_mark on.
+daemon_log() { echo "$XDG_STATE_HOME/pdmount/$PROFILE.log"; }
+log_mark() { x_log_offset=$(stat -c %s "$(daemon_log)" 2>/dev/null || echo 0); }
+log_since_mark() { tail -c +"$((${x_log_offset:-0} + 1))" "$(daemon_log)"; }
+expect_log() { # <extended regex> <what>
+    log_since_mark | grep -Eq "$1" || fail "$2: no log line matching '$1'; log: $(log_since_mark | tail -20)"
+}
+
+# Writes <n> files of <KiB> KiB to <dir> and keeps copies in $work/<name>.
+write_files() { # <dir> <name> <n> <KiB>
+    mkdir -p "$1" "$work/$2"
+    local i
+    for ((i = 0; i < $3; i++)); do
+        head -c "$(($4 * 1024))" /dev/urandom >"$work/$2/f-$i"
+        cp "$work/$2/f-$i" "$1/f-$i"
+    done
+}
+
+# SIGTERM to the daemon; waits for it to exit and sets stop_ms to how long
+# that took.
+term_daemon() {
+    local pid start
+    pid=$(daemon_pid)
+    [[ -n "$pid" ]] || fail "no daemon pid in pdmount status"
+    start=$(now_ms)
+    kill -TERM "$pid"
+    while kill -0 "$pid" 2>/dev/null; do sleep 0.05; done
+    stop_ms=$(($(now_ms) - start))
+    echo "the daemon stopped $stop_ms ms after SIGTERM"
+}
+
+# Fails unless the fake drive holds what was written to <dir> (copies in
+# $work/<name>): `reset --keep-login` refuses while anything is left to
+# upload, and the fresh mount reads everything from the drive.
+expect_on_drive() { # <dir> <name>
+    pd reset --keep-login >/dev/null || fail "changes were left for the next mount"
+    mount_now
+    diff -r "$work/$2" "$1" >/dev/null || fail "$1 differs from what was written"
+}
+
+# ---- TARGET=share: the scenarios in a share's tree (M5.14a, D114) ----
+
+if [[ $TARGET == share ]]; then
+    SHARE_NAME=pdmount-share
+    SHARE_MNT=${SHARE_MNT:-$SCENARIO_ROOT/fake-shared}
+    SHARE_MNT2=${SHARE_MNT2:-$SCENARIO_ROOT/fake-shared-2}
+    # Each profile mounts the Shared root beside My Files.
+    share_root_config() { # <profile> <mountpoint>
+        local config=$XDG_CONFIG_HOME/pdmount/$1.toml
+        grep -q '^kind = "shared"' "$config" ||
+            printf '\n[[roots]]\nkind = "shared"\nmountpoint = "%s"\n' "$2" >>"$config"
+    }
+    share_root_config "$PROFILE" "$SHARE_MNT"
+    share_root_config "$PROFILE2" "$SHARE_MNT2"
+    TEST_ROOT=$SHARE_MNT/$SHARE_NAME/pdmount-test
+    ROOT_A=$TEST_ROOT
+    ROOT_B=$SHARE_MNT2/$SHARE_NAME/pdmount-test
+    REMOTE=$SHARE_MNT/$SHARE_NAME/pdmount-m1
+
+    # A drive of its own: an empty My Files with pdmount-test/, and the
+    # share of another user with the drive's user as an editor.
+    ensure_fake_drive() {
+        "$PDMOUNT" fake --help >/dev/null 2>&1 ||
+            fail "$PDMOUNT has no fake backend; build it with \`cargo build --features fake-backend\`"
+        [[ -f "$FAKE_DIR/.seeded-share" ]] && return 0
+        step "seeding the fake drive $FAKE_DIR with the editor share $SHARE_NAME"
+        if is_mounted; then pd unmount "$MNT"; fi
+        if is_mounted_second; then pd2 unmount "$MNT2"; fi
+        remove_fake_dir "$FAKE_DIR"
+        local seed
+        seed=$(mktemp -d "$SCENARIO_ROOT/share-seed.XXXXXX")
+        mkdir -p "$seed/my-files/pdmount-test" "$seed/share/pdmount-test"
+        "$PDMOUNT" fake seed --from "$seed/my-files" "$FAKE_DIR"
+        "$PDMOUNT" fake root --name "$SHARE_NAME" --owner owner@example.test --role editor \
+            --from "$seed/share" "$FAKE_DIR" >/dev/null
+        rm -rf "$seed"
+        touch "$FAKE_DIR/.seeded-share"
+        pd reset --keep-login >/dev/null
+        pd2 reset --keep-login >/dev/null
+    }
+
+    # The Shared root mounts in the background after the daemon is ready.
+    wait_share() { # <Shared mountpoint>
+        local start=$SECONDS
+        until [[ -d $1/$SHARE_NAME/pdmount-test ]]; do
+            ((SECONDS - start < 60)) || fail "the share did not show in $1 within 60 s"
+            sleep 0.2
+        done
+    }
+    mount_now() { pd mount "${backend_flag[@]}" "$MNT" && wait_share "$SHARE_MNT"; }
+    mount_second() { pd2 mount "${backend_flag[@]}" "$MNT2" && wait_share "$SHARE_MNT2"; }
+
+    # The daemon's stop drains a further tree only until its grace ends, so
+    # the queue is drained first, as `unmount --wait` does for My Files. A
+    # crash leaves the Shared root's mount behind as well.
+    verify_cycle() {
+        case "$VERIFY_MODE" in
+            live) ;;
+            remount)
+                step "remount: drain, unmount and mount"
+                wait_queue_empty
+                pd unmount --wait "$MNT"
+                mount_now
+                ;;
+            crash)
+                step "crash: kill -9 the daemon, unmount --force both mounts, mount, drain"
+                kill_daemon
+                pd unmount --force "$MNT"
+                pd unmount --force "$SHARE_MNT"
+                mount_now
+                wait_queue_empty
+                ;;
+            fresh)
+                step "fresh: drain, unmount, reset local state, mount"
+                wait_queue_empty
+                pd unmount --wait "$MNT"
+                pd reset --keep-login
+                mount_now
+                ;;
+            second) fail "TARGET=share has no second mode" ;;
+        esac
+    }
+
+    prepare_two() {
+        [[ $VERIFY_MODE == live ]] || { echo "$(basename "$0" .sh): two devices, live mode only; skipped in $VERIFY_MODE mode"; exit 0; }
+        ensure_fake_drive
+        is_mounted || mount_now
+        is_mounted_second || mount_second
+        share_log_a=$(stat -c %s "$XDG_STATE_HOME/pdmount/$PROFILE.log" 2>/dev/null || echo 0)
+        share_log_b=$(stat -c %s "$XDG_STATE_HOME/pdmount/$PROFILE2.log" 2>/dev/null || echo 0)
+    }
+
+    # `conflicts list` reaches My Files only (D110): the kinds of conflict a
+    # further tree recorded since prepare_two, from the daemon's log, at or
+    # below a path of the share, each once (the log has every record, the
+    # registry's later updates of one conflict too, not only open ones).
+    conflict_kinds() { # <1|2> <path>
+        local log offset rel
+        if [[ $1 == 2 ]]; then
+            log=$XDG_STATE_HOME/pdmount/$PROFILE2.log offset=${share_log_b:-0}
+            rel=${2#"$SHARE_MNT2/$SHARE_NAME"}
+        else
+            log=$XDG_STATE_HOME/pdmount/$PROFILE.log offset=${share_log_a:-0}
+            rel=${2#"$SHARE_MNT/$SHARE_NAME"}
+        fi
+        tail -c +"$((offset + 1))" "$log" | grep 'conflict recorded in a further tree' |
+            sed -nE 's/.*kind="?([a-z_]+)"? path="?([^" ]*)"?.*/\1 \2/p' |
+            awk -v rel="$rel" '$2 == rel || index($2, rel "/") == 1 { print $1 }' | sort -u
+    }
+fi

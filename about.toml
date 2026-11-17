@@ -1,0 +1,20 @@
+# cargo-about configuration (D097): THIRD-PARTY-LICENSES.html is generated with
+#   cargo about generate --locked --workspace -c about.toml about.hbs -o THIRD-PARTY-LICENSES.html
+# and shipped in the release archive. A crate under any other licence fails the generation.
+# Native code that build scripts compile from vendored sources (Go runtime, SQLCipher,
+# OpenSSL) is covered by a section of about.hbs.
+accepted = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+    "bzip2-1.0.6",
+]
+# The release target only; tests and build tools are not shipped.
+targets = ["x86_64-unknown-linux-gnu"]
+ignore-dev-dependencies = true
+ignore-build-dependencies = true

@@ -6,14 +6,44 @@ use pdmount_core::ProfilePaths;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-/// `$XDG_CONFIG_HOME/autostart/pdmount-<profile>.desktop`.
-pub fn entry_path(paths: &ProfilePaths) -> PathBuf {
+fn autostart_dir(paths: &ProfilePaths) -> PathBuf {
     paths
         .config_dir
         .parent()
         .unwrap_or(&paths.config_dir)
         .join("autostart")
-        .join(format!("pdmount-{}.desktop", paths.profile))
+}
+
+/// `$XDG_CONFIG_HOME/autostart/pdmount-<profile>.desktop`.
+pub fn entry_path(paths: &ProfilePaths) -> PathBuf {
+    autostart_dir(paths).join(format!("pdmount-{}.desktop", paths.profile))
+}
+
+/// `$XDG_CONFIG_HOME/autostart/pdmount-<profile>-attach.desktop`: the entry
+/// `service install` writes so that each desktop login hands its session bus
+/// to the service's daemon (D102). It mounts nothing, so it is not autostart.
+pub fn attach_entry_path(paths: &ProfilePaths) -> PathBuf {
+    autostart_dir(paths).join(format!("pdmount-{}-attach.desktop", paths.profile))
+}
+
+/// The `Exec` arguments after the binary and profile that mark an attach entry.
+const ATTACH_ARGS: [&str; 2] = ["session", "attach"];
+
+/// Whether the file is an attach entry. The profile `p-attach`'s autostart
+/// entry and profile `p`'s attach entry have the same name; the content
+/// tells them apart.
+fn is_attach_entry(path: &Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|text| {
+        text.lines()
+            .any(|line| line.starts_with("Exec=") && line.ends_with(" session attach"))
+    })
+}
+
+/// Whether the profile's autostart entry exists (an attach entry of another
+/// profile with the same file name does not count).
+pub fn enabled(paths: &ProfilePaths) -> bool {
+    let entry = entry_path(paths);
+    entry.exists() && !is_attach_entry(&entry)
 }
 
 /// One argument of an `Exec` key, by the Desktop Entry spec's quoting rules.
@@ -48,18 +78,58 @@ fn entry_text(profile: &str, binary: &str, secrets_flag: Option<&str>) -> String
     let mut args = vec![binary, "--profile", profile];
     args.extend(secrets_flag);
     args.push("mount");
-    let exec: Vec<String> = args.into_iter().map(quote_arg).collect();
+    desktop_entry(&format!("PdMount ({profile})"), &args)
+}
+
+/// The attach entry: no secret flag, since `session attach` reads no secret.
+fn attach_entry_text(profile: &str, binary: &str) -> String {
+    let mut args = vec![binary, "--profile", profile];
+    args.extend(ATTACH_ARGS);
+    desktop_entry(&format!("PdMount desktop bus ({profile})"), &args)
+}
+
+fn desktop_entry(name: &str, args: &[&str]) -> String {
+    let exec: Vec<String> = args.iter().map(|arg| quote_arg(arg)).collect();
     format!(
         "[Desktop Entry]\n\
          Type=Application\n\
-         Name=PdMount ({})\n\
+         Name={}\n\
          NoDisplay=true\n\
          Terminal=false\n\
          X-GNOME-Autostart-enabled=true\n\
          Exec={}\n",
-        escape_value(profile),
+        escape_value(name),
         escape_value(&exec.join(" "))
     )
+}
+
+/// `service install`: writes the attach entry for `binary`; refuses to
+/// replace another profile's autostart entry of the same name.
+pub fn write_attach_entry(paths: &ProfilePaths, binary: &str) -> anyhow::Result<PathBuf> {
+    let entry = attach_entry_path(paths);
+    if entry.exists() && !is_attach_entry(&entry) {
+        anyhow::bail!(
+            "{} exists and is not PdMount's attach entry (the autostart entry of profile {}-attach?); \
+             remove it first",
+            entry.display(),
+            paths.profile
+        );
+    }
+    enable_at(&entry, &attach_entry_text(paths.profile.as_str(), binary))
+        .with_context(|| format!("cannot write {}", entry.display()))?;
+    Ok(entry)
+}
+
+/// `service uninstall`: removes the attach entry, never another file of
+/// that name; whether there was one.
+pub fn remove_attach_entry(paths: &ProfilePaths) -> anyhow::Result<Option<PathBuf>> {
+    let entry = attach_entry_path(paths);
+    if !is_attach_entry(&entry) {
+        return Ok(None);
+    }
+    let removed =
+        disable_at(&entry).with_context(|| format!("cannot remove {}", entry.display()))?;
+    Ok(removed.then_some(entry))
 }
 
 fn enable_at(entry: &Path, text: &str) -> std::io::Result<()> {
@@ -84,6 +154,13 @@ pub fn enable(paths: &ProfilePaths) -> anyhow::Result<ExitCode> {
         .to_str()
         .context("the path of the pdmount executable is not UTF-8")?;
     let entry = entry_path(paths);
+    if entry.exists() && is_attach_entry(&entry) {
+        anyhow::bail!(
+            "{} is the attach entry of another profile's service; this profile's name ends in \
+             -attach, which cannot have an autostart entry next to it",
+            entry.display()
+        );
+    }
     let text = entry_text(
         paths.profile.as_str(),
         binary,
@@ -100,8 +177,8 @@ pub fn enable(paths: &ProfilePaths) -> anyhow::Result<ExitCode> {
 
 pub fn disable(paths: &ProfilePaths) -> anyhow::Result<ExitCode> {
     let entry = entry_path(paths);
-    let removed =
-        disable_at(&entry).with_context(|| format!("cannot remove {}", entry.display()))?;
+    let removed = enabled(paths)
+        && disable_at(&entry).with_context(|| format!("cannot remove {}", entry.display()))?;
     if removed {
         println!("Removed {}.", entry.display());
     } else {
@@ -118,7 +195,7 @@ pub fn show(paths: &ProfilePaths) -> ExitCode {
 /// One line for `autostart` and `doctor`.
 pub fn state_text(paths: &ProfilePaths) -> String {
     let entry = entry_path(paths);
-    if entry.exists() {
+    if enabled(paths) {
         format!(
             "enabled for profile {} ({})",
             paths.profile,
@@ -171,6 +248,59 @@ mod tests {
             text.contains("Exec=\"/a\\\\\"b\" --profile p mount\n"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn the_attach_entry_runs_session_attach_without_a_secret_flag() {
+        let text = attach_entry_text("work", "/opt/my tools/pdmount");
+        assert_eq!(
+            text,
+            "[Desktop Entry]\nType=Application\nName=PdMount desktop bus (work)\nNoDisplay=true\n\
+             Terminal=false\nX-GNOME-Autostart-enabled=true\n\
+             Exec=\"/opt/my tools/pdmount\" --profile work session attach\n"
+        );
+    }
+
+    fn paths_in(root: &Path, profile: &str) -> ProfilePaths {
+        ProfilePaths::new(
+            profile.parse().expect("profile"),
+            &pdmount_core::paths::BaseDirs {
+                config: root.join("config"),
+                data: root.join("data"),
+                cache: root.join("cache"),
+                state: root.join("state"),
+                runtime: None,
+            },
+        )
+    }
+
+    /// Profile `p`'s attach entry has the name of profile `p-attach`'s
+    /// autostart entry: neither is taken for the other.
+    #[test]
+    fn an_attach_entry_is_never_counted_as_autostart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = paths_in(dir.path(), "p");
+        let other = paths_in(dir.path(), "p-attach");
+        assert_eq!(attach_entry_path(&p), entry_path(&other));
+        let entry = write_attach_entry(&p, "/usr/bin/pdmount").expect("write");
+        assert!(entry.ends_with("autostart/pdmount-p-attach.desktop"));
+        assert!(!enabled(&p), "the attach entry is not p's autostart");
+        assert!(!enabled(&other), "nor p-attach's");
+        assert!(state_text(&other).starts_with("not enabled"));
+        // Profile p-attach's real autostart entry is not overwritten or removed.
+        std::fs::write(&entry, entry_text("p-attach", "/usr/bin/pdmount", None)).expect("write");
+        assert!(enabled(&other));
+        assert!(write_attach_entry(&p, "/usr/bin/pdmount").is_err());
+        assert_eq!(remove_attach_entry(&p).expect("remove"), None);
+        assert!(entry.exists());
+        std::fs::remove_file(&entry).expect("rm");
+        write_attach_entry(&p, "/usr/bin/pdmount").expect("write");
+        assert_eq!(
+            remove_attach_entry(&p).expect("remove"),
+            Some(entry.clone())
+        );
+        assert!(!entry.exists());
+        assert_eq!(remove_attach_entry(&p).expect("nothing"), None);
     }
 
     #[test]

@@ -176,6 +176,11 @@ pub struct Node {
     /// Memory only: after a restart every created, not yet uploaded node
     /// counts, since the listing that hid the remote node is forgotten.
     pub clashed: bool,
+    /// Detached because the remote removed it (a trash, a move this tree
+    /// cannot follow), not by a local change: a write through a handle
+    /// still open brings it back (§10.5, D128). Memory only, as are the
+    /// handles.
+    pub removed_remotely: bool,
     pub open_handles: u32,
     pub open_writers: u32,
     /// Bumped when remote content replaces what the kernel may have cached.
@@ -211,6 +216,7 @@ impl Node {
             deferred_error: None,
             remote_newer: false,
             clashed: false,
+            removed_remotely: false,
             open_handles: 0,
             open_writers: 0,
             content_epoch: 0,
@@ -728,6 +734,7 @@ impl Tree {
         if let Some(node) = self.nodes.get_mut(&ino) {
             node.parent = dir;
             node.name = name.to_owned();
+            node.removed_remotely = false;
         }
         fx.row(ino);
     }
@@ -1244,6 +1251,17 @@ impl Tree {
             {
                 continue;
             }
+            // At its own temporary name in its known folder: this device's
+            // move aside, whose reply was lost (D117 amended, V-7). Only the
+            // remote state follows; the journal goes on to the local name.
+            if child.name == crate::journal::swap_name(ino)
+                && node
+                    .remote
+                    .as_ref()
+                    .is_some_and(|remote| remote.parent_link == child.parent_link_id)
+            {
+                continue;
+            }
             if !self.placement_pending(ino) {
                 follows.insert(ino);
             } else if node.remote.as_ref().is_some_and(|remote| {
@@ -1546,7 +1564,8 @@ impl Tree {
             ino,
             kind: node.kind,
             parent: attached.then_some(node.parent),
-            name: attached.then(|| node.name.clone()),
+            // A tombstone keeps its name for `queue` (D121).
+            name: (attached || node.deleted).then(|| node.name.clone()),
             size: node.size,
             mtime: node.mtime,
             ctime: node.ctime,
@@ -1583,6 +1602,7 @@ impl Tree {
             node.children.clear();
             node.attached = false;
             node.listed = false;
+            node.removed_remotely = true;
             fx.changes.removed.push(current);
             self.set_remote(current, None);
             if self.is_droppable(current) {
@@ -1919,9 +1939,97 @@ impl Tree {
             if let Some(parent) = tree.nodes.get(&top).map(|node| node.parent) {
                 tree.name_freed(top, parent);
             }
+            let subtree: Vec<Ino> = tree.subtree(top).collect();
             tree.remove_subtree(fx, top);
+            // Removed on purpose: a write through an open handle does not
+            // bring it back.
+            for ino in subtree {
+                if let Some(node) = tree.nodes.get_mut(&ino) {
+                    node.removed_remotely = false;
+                }
+            }
         });
         changes
+    }
+
+    /// A file the remote removed (a clean node, so it was detached, not
+    /// kept: §10.5) was written through a handle opened before: it comes
+    /// back as a new local node at its old place, with the removed folders
+    /// above it that are still in memory, each with only the chain to it
+    /// (D128). The topmost goes into the nearest attached folder under its
+    /// old name, or its conflict name when that is taken; into the root if
+    /// that folder is no longer known. Returns the topmost node brought
+    /// back. `None` if `ino` is attached or was removed locally.
+    pub fn bring_back(&mut self, ino: Ino, now: SystemTime) -> Option<(Ino, Changes)> {
+        let node = self.nodes.get(&ino)?;
+        if ino == ROOT_INO || node.attached || !node.removed_remotely {
+            return None;
+        }
+        let mut chain = vec![ino];
+        let mut current = ino;
+        let home = loop {
+            let parent = self.nodes[&current].parent;
+            match self.nodes.get(&parent) {
+                Some(dir) if dir.attached && dir.kind == NodeKind::Folder => break parent,
+                Some(dir)
+                    if dir.removed_remotely
+                        && dir.kind == NodeKind::Folder
+                        && parent != ROOT_INO
+                        && !chain.contains(&parent) =>
+                {
+                    chain.push(parent);
+                    current = parent;
+                }
+                _ => break ROOT_INO,
+            }
+        };
+        let top = *chain.last().expect("not empty");
+        let ((), changes) = self.mutate(|tree, fx| {
+            let name = tree.nodes[&top].name.clone();
+            let taken = tree
+                .nodes
+                .get(&home)
+                .is_some_and(|dir| dir.children.contains_key(&name))
+                || tree
+                    .link_of(home)
+                    .is_some_and(|link| tree.remote_occupant(link, &name).is_some());
+            let top_name = if taken {
+                tree.pick_conflict_name(home, &name, &|_| false)
+            } else {
+                name
+            };
+            let mut dir = home;
+            for (depth, &current) in chain.iter().rev().enumerate() {
+                let name = if depth == 0 {
+                    top_name.clone()
+                } else {
+                    tree.nodes[&current].name.clone()
+                };
+                tree.set_remote(current, None);
+                let node = tree.nodes.get_mut(&current).expect("in the chain");
+                node.attached = true;
+                node.remote_newer = false;
+                node.ctime = now;
+                if node.kind == NodeKind::Folder {
+                    // A new local folder: its entries are the chain.
+                    node.listed = true;
+                    node.children.clear();
+                } else if matches!(node.content, Content::Remote { .. }) {
+                    // Still readable from the old revision; staged before
+                    // the upload.
+                    node.gens.content = node.gens.uploaded_content + 1;
+                }
+                tree.place(fx, current, dir, &name);
+                dir = current;
+            }
+            if let Some(dir) = tree.nodes.get_mut(&home) {
+                dir.mtime = now;
+                dir.ctime = now;
+            }
+            fx.row(home);
+            fx.attrs(home);
+        });
+        Some((top, changes))
     }
 
     /// `queue drop`: the file goes back to its known remote revision and

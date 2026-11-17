@@ -3,10 +3,11 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.5.0"
 edition = "2024"
 publish = false
 license = "MIT"
+repository = "https://github.com/colsen665/PdMount"
 
 [workspace.dependencies]
 pdmount-backend = { path = "crates/pdmount-backend" }
@@ -28,12 +29,20 @@ fuser = "0.18"
 globset = "0.4"
 hdrhistogram = { version = "7.6", default-features = false }
 hex = "0.4"
+# Photos' thumbnails (M5.13b, D115): Proton's WebP decoded and scaled down. The versions the SDK
+# already uses; no image format of `image`'s own, only its scaling.
+image = { version = "0.25", default-features = false }
+image-webp = "0.2"
 keyring = { version = "3.6", features = ["linux-native", "sync-secret-service"] }
 # Test only: the SDK logs through `log`, bridged into tracing.
 log = "0.4"
 lru = "0.16"
+# The file names of the freedesktop thumbnail cache (M5.13b).
+md-5 = "0.10"
 nix = { version = "0.30", features = ["fs", "mman", "resource", "signal", "user"] }
 parking_lot = "0.12"
+# A thumbnail's PNG with its text chunks (M5.13b); the version `image` uses.
+png = "0.18"
 proptest = "1"
 proton-drive-sdk = "0.4"
 rand = "0.10"
@@ -45,6 +54,7 @@ rusqlite = { version = "0.39", features = ["bundled-sqlcipher-vendored-openssl"]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha1 = "0.11"
+sha2 = "0.11"
 tempfile = "3"
 thiserror = "2.0"
 tokio = { version = "1.51", features = ["full"] }
@@ -53,6 +63,9 @@ tracing = "0.1"
 tracing-log = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+# The system bus only: the logind delay lock and PrepareForShutdown (D091; review in
+# docs/security/threat-model.md, "Dependencies"). No default features: tokio, no async-io.
+zbus = { version = "5.19", default-features = false, features = ["tokio"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -73,3 +86,10 @@ panic = "unwind"
 
 [profile.release]
 panic = "unwind"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+# Debug info is dropped from the archive binary; the symbol table stays, so that a panic backtrace has names.
+strip = "debuginfo"

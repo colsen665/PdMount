@@ -61,6 +61,11 @@ where
         flight
     }
 
+    /// Whether a flight for `key` runs.
+    pub fn running(&self, key: &K) -> bool {
+        self.flights.lock().contains_key(key)
+    }
+
     pub fn in_flight(&self) -> usize {
         self.flights.lock().len()
     }

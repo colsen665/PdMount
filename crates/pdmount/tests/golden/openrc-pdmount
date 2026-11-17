@@ -1,0 +1,62 @@
+#!/sbin/openrc-run
+# Written by `pdmount service install`; the next install rewrites it.
+# One service per profile: the link pdmount.<profile> next to this file points
+# here, and ../conf.d/pdmount.<profile> holds the profile's settings.
+
+profile=${RC_SVCNAME#pdmount.}
+description="PdMount ($profile)"
+supervisor=supervise-daemon
+notify="fd:3"
+command=/usr/bin/pdmount
+command_args="--profile $profile $pdmount_secrets -v mount $pdmount_mount_args --foreground --service openrc --clear-stale --notify-fd 3"
+respawn_delay=5
+respawn_max=3
+respawn_period=60
+export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+
+depend() {
+	need dbus
+}
+
+start_pre() {
+	case $RC_SVCNAME in
+	pdmount.?*) ;;
+	*)
+		eerror "start a link named pdmount.<profile>, not $RC_SVCNAME"
+		return 1
+		;;
+	esac
+	if [ -z "$retry" ]; then
+		eerror "no settings for $profile: run 'pdmount service install' for it"
+		return 1
+	fi
+}
+
+# A start that fails before the daemon is ready is final (D109). The
+# supervisor that default_start forked would respawn the daemon outside the
+# service's state, so it is stopped as well. A supervisor that ran before
+# this start (one left by an older script) is not: the start fails with
+# "already running", and `pdmount status` says how to stop it.
+start() {
+	local pidfile_ stray_ n_
+	if yesno "$RC_USER_SERVICES"; then
+		pidfile_="${XDG_RUNTIME_DIR}/supervise-${RC_SVCNAME}.pid"
+	else
+		pidfile_="/var/run/supervise-${RC_SVCNAME}.pid"
+	fi
+	stray_=
+	if [ -s "$pidfile_" ] && kill -0 "$(cat "$pidfile_")" 2>/dev/null; then
+		stray_=yes
+	fi
+	default_start && return 0
+	if [ -z "$stray_" ]; then
+		# The supervisor may write its pid file only after the start returned.
+		n_=0
+		while [ ! -s "$pidfile_" ] && [ "$n_" -lt 20 ]; do
+			sleep 0.1
+			n_=$((n_ + 1))
+		done
+		supervise-daemon "$RC_SVCNAME" --stop
+	fi
+	return 1
+}

@@ -30,9 +30,6 @@ const FULL_DISK_RECHECK: Duration = Duration::from_secs(60);
 /// Wakes within this time share one walk: a rename storm elsewhere in the
 /// tree must not keep it walking.
 const SETTLE: Duration = Duration::from_millis(500);
-/// A large file gives up its background turn this often, so that it does
-/// not hold up event polling until it is complete (D027).
-const BLOCKS_PER_TURN: usize = 16;
 
 /// A row of `pins`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -541,26 +538,24 @@ impl Engine {
         }
     }
 
-    /// Fetches one revision's missing blocks at prefetch priority, in the
-    /// background turns of D027.
+    /// Fetches one revision's missing blocks: its block list in a background
+    /// turn (D027), the blocks at prefetch priority without one (D120).
+    /// Block downloads go to storage with a known block map, as readahead
+    /// does: the download permits bound them (one prefetch slot of the
+    /// session's five, D033), and a turn held across them would hold up
+    /// every tree's event sync for the whole file.
     async fn fetch_pinned(&self, file: &PinnedFile) -> Result<()> {
-        let mut turn = self.gate.background().await;
-        let layout = self.cache.layout(&file.link, &file.rev, file.size).await?;
-        let mut fetched = 0;
+        let layout = {
+            let _turn = self.gate.background().await;
+            self.cache.layout(&file.link, &file.rev, file.size).await?
+        };
         for span in &layout.blocks {
             let key = BlockKey::new(&file.link, &file.rev, span.index);
             if self.cache.on_disk(&key) {
                 continue;
             }
-            if fetched == BLOCKS_PER_TURN {
-                drop(turn);
-                turn = self.gate.background().await;
-                fetched = 0;
-            }
             self.cache.get(&key, span.len, Priority::Prefetch).await?;
-            fetched += 1;
         }
-        drop(turn);
         // A block the disk cache could not take: without this the next round
         // would download the file again at once.
         if self.cache.bytes_on_disk(&file.link, &file.rev, &layout) < file.size {

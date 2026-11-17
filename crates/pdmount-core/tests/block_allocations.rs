@@ -116,9 +116,11 @@ async fn block_reads_after_warm_up_allocate_no_block_buffers() {
             Arc::clone(&metrics),
             CacheOptions {
                 dir: dir.path().join("blocks"),
-                master_key: [3; 32],
+                master_key: Some([3; 32]),
                 ram_bytes: 16 << 20,
                 disk_bytes: 64 << 20,
+                shared: None,
+                downloads: None,
             },
             pdmount_core::staging::Protections::default(),
         )

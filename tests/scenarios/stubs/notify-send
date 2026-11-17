@@ -1,0 +1,12 @@
+#!/bin/sh
+# notify-send for scenarios x4, x11 and x13: records its arguments in
+# $X11_NOTIFY_LOG, or fails without recording while the file
+# $X11_NOTIFY_FAIL exists. With $X13_NOTIFY_BUS_LOG set, it also records
+# the session bus it was given there.
+if [ -n "${X11_NOTIFY_FAIL:-}" ] && [ -e "$X11_NOTIFY_FAIL" ]; then
+    exit 1
+fi
+printf '%s\n' "$*" >>"${X11_NOTIFY_LOG:?}"
+if [ -n "${X13_NOTIFY_BUS_LOG:-}" ]; then
+    printf '%s\n' "${DBUS_SESSION_BUS_ADDRESS:-unset}" >>"$X13_NOTIFY_BUS_LOG"
+fi

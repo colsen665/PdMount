@@ -3,22 +3,37 @@
 mod access;
 mod auth;
 mod autostart;
+mod bus;
 mod cache;
 mod conflicts;
 mod control;
 mod credentials;
 mod daemon;
 mod doctor;
+mod flush;
+mod incoming;
+mod keywait;
+mod logind;
+#[cfg(feature = "fake-backend")]
+mod logind_stub;
 mod mounts;
 mod notify;
 mod pins;
 #[cfg(test)]
 mod probe;
+#[cfg(test)]
+mod probe_roots;
 mod queue;
+mod resume;
+mod roots;
 mod secret_cache;
+mod service;
 mod session;
 mod stats;
 mod status;
+mod supervise;
+#[cfg(test)]
+mod test_support;
 mod trash;
 
 use clap::{Args, Parser, Subcommand};
@@ -53,8 +68,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Sign in with Proton in the browser and store the session.
-    Login(BrowserArgs),
+    /// Sign in with Proton in the browser and store the session; a working session is kept.
+    Login(LoginArgs),
     /// End the session and remove stored secrets.
     Logout,
     /// Show session, storage, device, mount, connection, queue and conflicts.
@@ -87,6 +102,15 @@ enum Command {
         #[command(subcommand)]
         command: Option<AutostartCommand>,
     },
+    /// Run this profile as an OpenRC or systemd user service; without an argument, show the state.
+    Service(service::ServiceArgs),
+    /// The desktop session and the profile's daemon.
+    #[command(subcommand)]
+    Session(SessionCommand),
+    /// Internal: one keyring call on the bus of this process's environment,
+    /// request on stdin, reply on stdout (D102).
+    #[command(hide = true)]
+    KeyringHelper,
     /// Upload what is pending now and wait for it (while mounted).
     Sync {
         /// Give up after this many seconds.
@@ -166,6 +190,14 @@ enum FakeCommand {
         /// Act as an official app: no mode and no SHA-1 in the revision.
         #[arg(long)]
         app: bool,
+        /// The path is below this root folder (`fake root` prints it), on
+        /// `--volume`, as its owner `--owner` writes it; default: My Files.
+        #[arg(long, requires_all = ["volume", "owner"])]
+        root: Option<String>,
+        #[arg(long)]
+        volume: Option<String>,
+        #[arg(long)]
+        owner: Option<String>,
         dir: std::path::PathBuf,
     },
     /// Create a folder, as another client would.
@@ -181,6 +213,132 @@ enum FakeCommand {
     /// call, one shared pipe per direction. Options left out are 0 or
     /// unlimited; without options, print the profile.
     Profile(ProfileArgs),
+    /// A stand-in for logind on the bus that `DBUS_SYSTEM_BUS_ADDRESS`
+    /// names (scenario X11).
+    #[command(subcommand)]
+    Logind(LogindCommand),
+    /// Add a root folder without a parent (M5.10): on the drive's own
+    /// volume, or on another user's volume shared with the drive's user.
+    /// Prints `<volume> <root link> [<share>]` for a `[[roots.tree]]`.
+    Root {
+        /// The folder's name.
+        #[arg(long)]
+        name: String,
+        /// The owner of the volume; default: the drive's user.
+        #[arg(long)]
+        owner: Option<String>,
+        /// Share it with the drive's user: viewer, editor or admin.
+        #[arg(long)]
+        role: Option<String>,
+        /// Copy this local directory's contents into it.
+        #[arg(long)]
+        from: Option<std::path::PathBuf>,
+        dir: std::path::PathBuf,
+    },
+    /// Share a single file with the drive's user (M5.12): a local file's
+    /// copy on `--owner`'s volume, in a folder that is not shared. Prints
+    /// `<volume> <file link> <share>`.
+    ShareFile {
+        /// The file's name.
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        owner: String,
+        /// viewer, editor or admin.
+        #[arg(long, default_value = "viewer")]
+        role: String,
+        /// The local file to copy.
+        #[arg(long)]
+        from: std::path::PathBuf,
+        dir: std::path::PathBuf,
+    },
+    /// Change the drive user's role in a share, or with `none` revoke the
+    /// share. Sends nothing on the core event stream (`fake core-signal`).
+    ShareRole {
+        /// viewer, editor, admin or none.
+        #[arg(long)]
+        role: String,
+        /// The share's id (`fake root` prints it).
+        share: String,
+        dir: std::path::PathBuf,
+    },
+    /// Send one `DriveShareRefresh` on the core event stream: a Shared
+    /// mount reads the shared-with-me listing again at its next core poll.
+    CoreSignal { dir: std::path::PathBuf },
+    /// The drive user's Photos (M5.13): photos with capture times, tags and
+    /// related photos on a Photos volume of their own, with its events.
+    #[command(subcommand)]
+    Photo(PhotoCommand),
+}
+
+#[cfg(feature = "fake-backend")]
+#[derive(Debug, Subcommand)]
+enum PhotoCommand {
+    /// Add one photo from a local file. Prints its link.
+    Add {
+        /// The photo's name in the Photos root.
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        from: std::path::PathBuf,
+        /// Capture time, in seconds since the epoch.
+        #[arg(long)]
+        captured: i64,
+        /// A tag (0 favorite, 2 video, 3 Live Photo, 4 Motion Photo, ...);
+        /// repeatable.
+        #[arg(long = "tag")]
+        tags: Vec<u8>,
+        /// Add it as a related photo of this photo (a Live Photo's video).
+        #[arg(long)]
+        related_to: Option<String>,
+        /// Its thumbnail (M5.13b): `<width>x<height>` (a generated WebP of
+        /// one colour), `none`, `tampered` (other bytes than the manifest
+        /// signs) or `not-webp` (signed bytes that are no WebP).
+        #[arg(long, default_value = "512x384")]
+        thumbnail: String,
+        dir: std::path::PathBuf,
+    },
+    /// Add `--count` generated photos named `<prefix><n>.jpg` (1-16 KiB of
+    /// deterministic bytes each, a 512 x 384 thumbnail), their capture times
+    /// spread evenly over the `--years` years before `--until`.
+    Seed {
+        #[arg(long)]
+        count: u32,
+        #[arg(long, default_value_t = 3)]
+        years: u32,
+        /// Seconds since the epoch; default now.
+        #[arg(long)]
+        until: Option<i64>,
+        #[arg(long, default_value = "IMG_")]
+        prefix: String,
+        dir: std::path::PathBuf,
+    },
+    /// Move a photo to the trash, as another client would.
+    Delete {
+        #[arg(long)]
+        name: String,
+        dir: std::path::PathBuf,
+    },
+}
+
+#[cfg(feature = "fake-backend")]
+#[derive(Debug, Subcommand)]
+enum LogindCommand {
+    /// Own `org.freedesktop.login1` and hand out delay locks until killed.
+    Serve {
+        /// Where to log what happens, one line per event.
+        #[arg(long)]
+        log: std::path::PathBuf,
+        /// Refuse every `Inhibit`.
+        #[arg(long)]
+        refuse: bool,
+    },
+    /// Make the stub send `PrepareForShutdown`.
+    Prepare {
+        /// `true`: a shutdown starts; `false`: it was cancelled.
+        #[arg(action = clap::ArgAction::Set)]
+        active: bool,
+    },
 }
 
 #[cfg(feature = "fake-backend")]
@@ -246,10 +404,17 @@ fn fake_client(app: bool) -> pdmount_backend::fake::FakeClient {
             uid: Some("web".into()),
             claims_sha1: false,
             claims_mode: false,
+            ..Default::default()
         }
     } else {
         pdmount_backend::fake::FakeClient::default()
     }
+}
+
+#[cfg(feature = "fake-backend")]
+fn fake_role(role: &str) -> anyhow::Result<pdmount_backend::fake::FakeRole> {
+    pdmount_backend::fake::FakeRole::parse(role)
+        .ok_or_else(|| anyhow::anyhow!("--role must be viewer, editor or admin"))
 }
 
 /// The link of `/a/b` on a fake drive.
@@ -348,6 +513,13 @@ enum PinCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum SessionCommand {
+    /// Hand this session's D-Bus address to the running daemon, for the keyring and notifications
+    /// (run at desktop login by the entry `service install` writes).
+    Attach,
+}
+
+#[derive(Debug, Subcommand)]
 enum AutostartCommand {
     /// Write the XDG autostart entry for this profile.
     Enable,
@@ -441,6 +613,15 @@ struct BrowserArgs {
 }
 
 #[derive(Debug, Args)]
+struct LoginArgs {
+    #[command(flatten)]
+    browser: BrowserArgs,
+    /// Sign in anew even when the stored session still works (D108).
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Args)]
 struct MountArgs {
     /// Stay in the foreground (used by the background launcher and services).
     #[arg(long)]
@@ -457,6 +638,21 @@ struct MountArgs {
     /// Mount option: `ro` answers EROFS to every write; pending work still uploads.
     #[arg(short = 'o', value_name = "OPTION", value_parser = ["ro"])]
     option: Option<String>,
+    /// A service manager of this kind runs the daemon: `unmount` then refuses and names the
+    /// service's stop command (D093). Passed by the unit files of `pdmount service`.
+    #[arg(long, value_name = "MANAGER", requires = "foreground")]
+    service: Option<supervise::Manager>,
+    /// Tell the supervisor when the mount answers: write a newline to this descriptor and close
+    /// it (OpenRC's `notify="fd:3"`). `$NOTIFY_SOCKET` (systemd, OpenRC `socket:ready`) is
+    /// answered with `READY=1` without an option.
+    #[arg(long, value_name = "FD", requires = "foreground",
+          value_parser = clap::value_parser!(i32).range(3..))]
+    notify_fd: Option<i32>,
+    /// Detach a dead mount at the mountpoint first (as `unmount --force` does), but only when no
+    /// daemon of the profile answers or runs; another profile's live mount fails the start (D127).
+    /// For a supervisor's restart after a crash.
+    #[arg(long, requires = "foreground")]
+    clear_stale: bool,
     /// Mountpoint; default: `mountpoint` from the config (~/ProtonDrive).
     mountpoint: Option<std::path::PathBuf>,
 }
@@ -464,11 +660,16 @@ struct MountArgs {
 #[derive(Debug, Args)]
 struct UnmountArgs {
     /// Wait up to 10 minutes for pending uploads first (the default).
-    #[arg(long, conflicts_with = "force")]
+    #[arg(long, conflicts_with_all = ["force", "if_stale"])]
     wait: bool,
     /// Detach the mount even if it is busy or the daemon hangs, and stop the daemon.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "if_stale")]
     force: bool,
+    /// Detach the mountpoint only if it is a dead pdmount mount that no daemon of the profile answers
+    /// for or runs behind; touch nothing otherwise and exit 0, or 1 for another profile's live
+    /// mount (D127). For the systemd unit's `ExecStopPost=`.
+    #[arg(long)]
+    if_stale: bool,
     /// Mountpoint; default: `mountpoint` from the config.
     mountpoint: Option<std::path::PathBuf>,
 }
@@ -488,6 +689,11 @@ struct ResetArgs {
     /// Required: the login and device identity are kept.
     #[arg(long, required = true)]
     keep_login: bool,
+    /// Move the state of further trees with changes not uploaded (a share
+    /// that is gone cannot be mounted to upload them) to `orphaned/` instead
+    /// of refusing.
+    #[arg(long)]
+    orphan_trees: bool,
 }
 
 impl BrowserArgs {
@@ -612,9 +818,19 @@ async fn fake_command(command: FakeCommand) -> anyhow::Result<ExitCode> {
             path,
             from,
             app,
+            root,
+            volume,
+            owner,
             dir,
         } => {
-            let fake = FakeBackend::open(&dir)?.with_client(fake_client(app));
+            let mut fake = FakeBackend::open(&dir)?;
+            if let (Some(root), Some(volume)) = (&root, &volume) {
+                fake = fake.tree(volume, pdmount_backend::LinkId::new(root.as_str()));
+            }
+            let fake = fake.with_client(pdmount_backend::fake::FakeClient {
+                user: owner,
+                ..fake_client(app)
+            });
             let (parent, name) = path.rsplit_once('/').unwrap_or(("", path.as_str()));
             let parent = fake_resolve(&fake, parent).await?;
             let data = anyhow::Context::with_context(std::fs::read(&from), || {
@@ -636,8 +852,64 @@ async fn fake_command(command: FakeCommand) -> anyhow::Result<ExitCode> {
             fake.create_folder(&parent, name, std::time::SystemTime::now())
                 .await?;
         }
+        FakeCommand::Root {
+            name,
+            owner,
+            role,
+            from,
+            dir,
+        } => {
+            let role = role.map(|role| fake_role(&role)).transpose()?;
+            let fake = FakeBackend::open(&dir)?;
+            let added = fake.add_root(&name, owner.as_deref(), role)?;
+            if let Some(from) = from {
+                fake.tree(&added.volume, added.root.clone())
+                    .with_client(pdmount_backend::fake::FakeClient {
+                        user: owner.clone(),
+                        ..Default::default()
+                    })
+                    .import_dir(&from, &added.root)
+                    .await?;
+            }
+            match added.share {
+                Some(share) => println!("{} {} {share}", added.volume, added.root),
+                None => println!("{} {}", added.volume, added.root),
+            }
+        }
+        FakeCommand::ShareFile {
+            name,
+            owner,
+            role,
+            from,
+            dir,
+        } => {
+            let content = anyhow::Context::with_context(std::fs::read(&from), || {
+                format!("cannot read {}", from.display())
+            })?;
+            let added = FakeBackend::open(&dir)?
+                .add_shared_file(&name, &content, &owner, fake_role(&role)?)
+                .await?;
+            println!(
+                "{} {} {}",
+                added.volume,
+                added.root,
+                added.share.unwrap_or_default()
+            );
+        }
+        FakeCommand::ShareRole { role, share, dir } => {
+            let role = (role != "none").then(|| fake_role(&role)).transpose()?;
+            FakeBackend::open(&dir)?.set_own_role(&share, role)?;
+        }
+        FakeCommand::CoreSignal { dir } => FakeBackend::open(&dir)?.core_signal()?,
+        FakeCommand::Photo(command) => fake_photo(command).await?,
         FakeCommand::Fault(command) => fake_fault(command)?,
         FakeCommand::Profile(args) => fake_profile(args)?,
+        FakeCommand::Logind(LogindCommand::Serve { log, refuse }) => {
+            logind_stub::serve(log, refuse).await?
+        }
+        FakeCommand::Logind(LogindCommand::Prepare { active }) => {
+            logind_stub::prepare(active).await?
+        }
         FakeCommand::Changes { after, dir } => {
             for (seq, change) in FakeBackend::open(&dir)?.changes_since(after) {
                 match change {
@@ -657,6 +929,120 @@ async fn fake_command(command: FakeCommand) -> anyhow::Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `pdmount fake photo …`: the fake drive user's Photos (M5.13).
+#[cfg(feature = "fake-backend")]
+async fn fake_photo(command: PhotoCommand) -> anyhow::Result<()> {
+    use pdmount_backend::fake::FakeBackend;
+    use pdmount_backend::{Backend, UploadSource};
+    match command {
+        PhotoCommand::Add {
+            name,
+            from,
+            captured,
+            tags,
+            related_to,
+            thumbnail,
+            dir,
+        } => {
+            let thumbnail = fake_thumbnail(&thumbnail)?;
+            let fake = FakeBackend::open(&dir)?;
+            let main = related_to
+                .map(|main| {
+                    fake.photo_named(&main)
+                        .ok_or_else(|| anyhow::anyhow!("no photo named {main}"))
+                })
+                .transpose()?;
+            let link = fake
+                .add_photo(&name, UploadSource::File(from), captured, tags, main)
+                .await?;
+            if thumbnail != Some(pdmount_backend::fake::FakeThumbnail::DEFAULT) {
+                fake.set_photo_thumbnail(&link, thumbnail)?;
+            }
+            println!("{link}");
+        }
+        PhotoCommand::Seed {
+            count,
+            years,
+            until,
+            prefix,
+            dir,
+        } => {
+            let fake = FakeBackend::open(&dir)?;
+            let until = until.unwrap_or_else(|| chrono::Utc::now().timestamp());
+            let span = i64::from(years.max(1)) * 365 * 86_400;
+            let step = span / i64::from(count.max(1));
+            for index in 0..count {
+                let captured = until - i64::from(index) * step;
+                // A small xorshift stream: the same bytes for the same index.
+                let mut state = u64::from(index).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+                let len = 1024 + (state % (15 * 1024)) as usize;
+                let content: Vec<u8> = (0..len)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        state as u8
+                    })
+                    .collect();
+                fake.add_photo(
+                    &format!("{prefix}{index:05}.jpg"),
+                    UploadSource::Bytes(content.into()),
+                    captured,
+                    Vec::new(),
+                    None,
+                )
+                .await?;
+            }
+        }
+        PhotoCommand::Delete { name, dir } => {
+            let fake = FakeBackend::open(&dir)?;
+            let link = fake
+                .photo_named(&name)
+                .ok_or_else(|| anyhow::anyhow!("no photo named {name}"))?;
+            for result in fake.photos_tree()?.trash(&[link]).await? {
+                result?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `--thumbnail` of `pdmount fake photo add`.
+#[cfg(feature = "fake-backend")]
+fn fake_thumbnail(value: &str) -> anyhow::Result<Option<pdmount_backend::fake::FakeThumbnail>> {
+    use pdmount_backend::fake::FakeThumbnail;
+    let thumbnail = match value {
+        "none" => None,
+        "tampered" => Some(FakeThumbnail {
+            tampered: true,
+            ..FakeThumbnail::DEFAULT
+        }),
+        "not-webp" => Some(FakeThumbnail {
+            not_webp: true,
+            ..FakeThumbnail::DEFAULT
+        }),
+        size => {
+            let parsed = size
+                .split_once('x')
+                .and_then(|(width, height)| Some((width.parse().ok()?, height.parse().ok()?)))
+                .filter(|&(width, height): &(u32, u32)| {
+                    (1..=4096).contains(&width) && (1..=4096).contains(&height)
+                });
+            let Some((width, height)) = parsed else {
+                anyhow::bail!(
+                    "--thumbnail {size}: expected <width>x<height> (1-4096), none, tampered or not-webp"
+                );
+            };
+            Some(FakeThumbnail {
+                width,
+                height,
+                ..FakeThumbnail::DEFAULT
+            })
+        }
+    };
+    Ok(thumbnail)
 }
 
 #[cfg(feature = "fake-backend")]
@@ -721,12 +1107,18 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     });
     let paths = ProfilePaths::for_current_user(cli.profile.clone())?;
     match cli.command {
-        Command::Login(browser) => {
+        Command::Login(args) => {
             let config = Config::load(&paths.config_file())?;
-            if let Some(code) = daemon::login_via_daemon(&paths, browser.mode(&config)).await? {
+            let browser = args.browser.mode(&config);
+            if let Some(code) = daemon::login_via_daemon(&paths, browser, args.force).await? {
                 return Ok(code);
             }
-            let logged_in = session::login(&paths, browser.mode(&config)).await?;
+            if !args.force
+                && let Some(code) = status::login_check(&paths, &config).await?
+            {
+                return Ok(code);
+            }
+            let logged_in = session::login(&paths, browser).await?;
             println!(
                 "Logged in as {} (profile {}, session stored in {}).",
                 logged_in.session.username, paths.profile, logged_in.storage
@@ -752,8 +1144,15 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Status => {
             let config = Config::load(&paths.config_file())?;
-            let report = status::status(&paths, &config, &home_dir()?).await?;
-            println!("{report}");
+            let report = status::status(&paths, &config, &home_dir()?).await;
+            if let Ok(report) = &report {
+                println!("{report}");
+            }
+            // Also when the daemon does not answer (D109).
+            if let Some(stray) = supervise::openrc_stray(&paths) {
+                eprintln!("warning: {stray}");
+            }
+            let report = report?;
             Ok(if report.session.is_active() {
                 ExitCode::SUCCESS
             } else {
@@ -764,6 +1163,10 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let config = Config::load(&paths.config_file())?;
             let mountpoint = daemon::mountpoint(&config, &home_dir()?, args.mountpoint);
             let read_only = args.option.is_some();
+            // A further root's mountpoint: that mount alone, by the daemon.
+            if !args.foreground && roots::configured(&config, &home_dir()?, &mountpoint).is_some() {
+                return roots::mount_root(&paths, &mountpoint, read_only).await;
+            }
             if args.foreground {
                 let textfile = config.prometheus_textfile(&home_dir()?);
                 daemon::run_foreground(
@@ -773,6 +1176,12 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     &args.backend,
                     textfile,
                     read_only,
+                    &supervise::Supervision {
+                        service: args.service,
+                        notify_socket: std::env::var_os("NOTIFY_SOCKET"),
+                        notify_fd: args.notify_fd,
+                        clear_stale: args.clear_stale,
+                    },
                 )
                 .await
             } else {
@@ -792,13 +1201,26 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let config = Config::load(&paths.config_file())?;
             let mountpoint =
                 daemon::existing_mountpoint(&paths, &config, &home_dir()?, args.mountpoint);
-            daemon::unmount(&paths, &mountpoint, args.force).await
+            if args.if_stale {
+                daemon::unmount_if_stale(
+                    &paths,
+                    &mountpoint,
+                    &config.root_mountpoints(&home_dir()?),
+                )
+                .await
+            } else if roots::configured(&config, &home_dir()?, &mountpoint).is_some() {
+                // A further root's mountpoint: that mount alone; the daemon
+                // and My Files go on, also under a service.
+                roots::unmount_root(&paths, &mountpoint, args.force).await
+            } else {
+                daemon::unmount(&paths, &mountpoint, args.force).await
+            }
         }
         Command::Stats(args) => stats::run(&paths, args.json, args.reset).await,
-        Command::Reset(_) => {
+        Command::Reset(args) => {
             let config = Config::load(&paths.config_file())?;
             let mountpoint = daemon::existing_mountpoint(&paths, &config, &home_dir()?, None);
-            daemon::reset(&paths, &mountpoint).await
+            daemon::reset(&paths, &mountpoint, args.orphan_trees).await
         }
         #[cfg(feature = "fake-backend")]
         Command::Fake(command) => fake_command(command).await,
@@ -857,10 +1279,19 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             pins::unset(&paths, access::mount_relative(&path, &mountpoint)?).await
         }
         Command::Autostart { command } => match command {
-            Some(AutostartCommand::Enable) => autostart::enable(&paths),
+            Some(AutostartCommand::Enable) => {
+                supervise::refuse_autostart_over_service(&paths)?;
+                autostart::enable(&paths)
+            }
             Some(AutostartCommand::Disable) => autostart::disable(&paths),
             None => Ok(autostart::show(&paths)),
         },
+        Command::Service(args) => {
+            let config = Config::load(&paths.config_file())?;
+            service::run(&paths, args, &config, &home_dir()?)
+        }
+        Command::Session(SessionCommand::Attach) => keywait::attach(&paths).await,
+        Command::KeyringHelper => unreachable!("handled in main"),
         Command::Sync { timeout, path } => {
             let config = Config::load(&paths.config_file())?;
             let mountpoint = daemon::existing_mountpoint(&paths, &config, &home_dir()?, None);
@@ -928,13 +1359,49 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     }
 }
 
+/// Whether the command line has `--service`, as the unit files of `pdmount
+/// service` pass it, when it does not parse.
+fn under_service_flag(args: impl Iterator<Item = std::ffi::OsString>) -> bool {
+    args.skip(1).any(|arg| {
+        arg.to_str()
+            .is_some_and(|arg| arg == "--service" || arg.starts_with("--service="))
+    })
+}
+
 /// The SDK parses ML-DSA keys recursively; worker threads need a larger
 /// stack than tokio's default (pdcli uses the same size).
 pub(crate) const WORKER_STACK_SIZE: usize = 16 << 20;
 
+/// How long the exit waits for tasks of the runtime that are still running.
+const RUNTIME_SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(2);
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        // A unit file this binary cannot parse (one of another version): a
+        // failed start too, not retried (D109).
+        Err(error) if error.use_stderr() && under_service_flag(std::env::args_os()) => {
+            let _ = error.print();
+            return ExitCode::from(supervise::START_FAILED_EXIT);
+        }
+        Err(error) => error.exit(),
+    };
+    // No logging and no runtime: one keyring call, its answer on stdout.
+    if matches!(cli.command, Command::KeyringHelper) {
+        let ok = credentials::keyring_helper(std::io::stdin().lock(), std::io::stdout().lock());
+        return if ok {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
     init_logging(cli.verbose);
+    // A daemon under a service manager that fails before it is ready exits
+    // with its own code, which the systemd unit does not restart (D109).
+    let service = match &cli.command {
+        Command::Mount(args) => args.service,
+        _ => None,
+    };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(WORKER_STACK_SIZE)
@@ -943,20 +1410,26 @@ fn main() -> ExitCode {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("error: cannot start the async runtime: {error}");
-            return ExitCode::FAILURE;
+            return supervise::failure_exit(service);
         }
     };
     // Run on a worker thread so the large stack applies.
     let result = runtime.block_on(async { tokio::spawn(run(cli)).await });
+    // `run` has awaited everything that matters (the daemon commits its store
+    // and saves its tokens before it returns). Dropping the runtime would
+    // also wait for blocking tasks still running, such as a keyring call
+    // waiting for an unlock dialog, up to its 120 s timeout: they are left
+    // behind instead, and end with the process.
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN);
     match result {
         Ok(Ok(code)) => code,
         Ok(Err(error)) => {
             eprintln!("error: {error:#}");
-            ExitCode::FAILURE
+            supervise::failure_exit(service)
         }
         Err(join_error) => {
             eprintln!("error: {join_error}");
-            ExitCode::FAILURE
+            supervise::failure_exit(service)
         }
     }
 }
@@ -984,6 +1457,28 @@ pub(crate) mod tests {
         pub(crate) fn text(&self) -> String {
             String::from_utf8_lossy(&self.0.lock()).into_owned()
         }
+    }
+
+    #[test]
+    fn a_command_line_with_service_is_recognised_unparsed() {
+        let args = |list: &[&str]| {
+            list.iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+                .into_iter()
+        };
+        assert!(under_service_flag(args(&[
+            "pdmount",
+            "mount",
+            "--bogus",
+            "--service",
+            "systemd"
+        ])));
+        assert!(under_service_flag(args(&["pdmount", "--service=openrc"])));
+        assert!(!under_service_flag(args(&[
+            "pdmount", "service", "install"
+        ])));
+        assert!(!under_service_flag(args(&["--service"])));
     }
 
     #[test]
@@ -1094,7 +1589,7 @@ pub(crate) mod tests {
     #[test]
     fn login_browser_flags_override_the_config() {
         let parse = |args: &[&str]| match Cli::try_parse_from(args).expect("parse").command {
-            Command::Login(browser) => browser,
+            Command::Login(args) => args.browser,
             other => panic!("unexpected {other:?}"),
         };
         let config = Config::default();
@@ -1111,6 +1606,12 @@ pub(crate) mod tests {
             BrowserMode::Never
         );
         assert!(Cli::try_parse_from(["pdmount", "login", "--browser", "--no-browser"]).is_err());
+        let force = |args: &[&str]| match Cli::try_parse_from(args).expect("parse").command {
+            Command::Login(args) => args.force,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert!(!force(&["pdmount", "login"]));
+        assert!(force(&["pdmount", "login", "--force", "--no-browser"]));
         let mut never = Config::default();
         never.auth.browser = BrowserMode::Never;
         assert_eq!(

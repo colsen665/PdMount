@@ -6,7 +6,9 @@
 //! this boundary.
 
 pub mod fake;
+pub mod photos;
 pub mod proton;
+pub mod shared;
 
 use bytes::Bytes;
 use std::fmt;
@@ -79,6 +81,28 @@ pub struct RemoteNode {
     pub sha1: Option<[u8; 20]>,
     pub name_hash: Option<NameHash>,
     pub trashed: bool,
+}
+
+/// What [`Backend::get_nodes_checked`] found of one id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeLookup {
+    Found(RemoteNode),
+    /// The server does not return it: it does not exist, or not for this
+    /// user.
+    Absent,
+    /// The server returns it, but its metadata cannot be decrypted (or the
+    /// SDK refuses it): it exists, so what is known of it stays.
+    Degraded,
+}
+
+impl NodeLookup {
+    /// The node, if it was found and read.
+    pub fn found(self) -> Option<RemoteNode> {
+        match self {
+            Self::Found(node) => Some(node),
+            Self::Absent | Self::Degraded => None,
+        }
+    }
 }
 
 /// Layout of one block of a revision.
@@ -274,6 +298,22 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Nodes by id, in request order; `None` for ids that do not exist.
     async fn get_nodes(&self, ids: &[LinkId]) -> Result<Vec<Option<RemoteNode>>>;
+
+    /// [`Backend::get_nodes`] telling an id the server does not return
+    /// ([`NodeLookup::Absent`]) from one it returns but whose metadata
+    /// cannot be read ([`NodeLookup::Degraded`]), which `get_nodes` reports
+    /// as `None` alike. A caller that drops what it knows of a node on
+    /// "absent" uses this, so a decryption failure, or a name the owner
+    /// made unreadable, never removes anything (D119). Wrappers forward it;
+    /// the default knows no degraded nodes.
+    async fn get_nodes_checked(&self, ids: &[LinkId]) -> Result<Vec<NodeLookup>> {
+        Ok(self
+            .get_nodes(ids)
+            .await?
+            .into_iter()
+            .map(|node| node.map_or(NodeLookup::Absent, NodeLookup::Found))
+            .collect())
+    }
 
     /// Block layout of a revision.
     async fn blocks(&self, file: &LinkId, revision: &RevisionId) -> Result<Vec<BlockInfo>>;

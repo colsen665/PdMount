@@ -1,0 +1,6 @@
+# Written by `pdmount service install` for profile work.
+pdmount_secrets=--force-file-secrets
+pdmount_mount_args='--backend=fake:/tmp/fake\ drive'
+retry="TERM/120/KILL/5"
+output_log=/home/user/.local/state/pdmount/work.log
+error_log=/home/user/.local/state/pdmount/work.log

@@ -341,7 +341,10 @@ impl Engine {
             let access = self.access.read();
             let tree = self.tree.read();
             tree.get(ino).ok_or(CoreError::NotFound)?;
-            if self.is_read_only() {
+            if self.is_read_only()
+                || !self.write_gate_open()
+                || super::marker::in_marker_dir(&tree, ino)
+            {
                 return Ok(Some("ro".to_owned()));
             }
             return Ok(Some(

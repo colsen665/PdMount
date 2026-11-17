@@ -18,12 +18,23 @@ async fn ask<T: DeserializeOwned>(paths: &ProfilePaths, request: Request) -> any
 
 pub async fn stats(paths: &ProfilePaths) -> anyhow::Result<ExitCode> {
     let reply: CacheStatsReply = ask(paths, Request::CacheStats).await?;
-    println!(
-        "Disk:       {} of {}, {} blocks",
-        ByteSize(reply.bytes).human(),
-        ByteSize(reply.max_bytes).human(),
-        reply.blocks
-    );
+    match reply.profile.filter(|profile| profile.shared()) {
+        // Further trees on the cap (D110 amended): My Files' part, then all.
+        Some(profile) => {
+            println!(
+                "Disk:       {} in {} blocks (My Files)",
+                ByteSize(reply.bytes).human(),
+                reply.blocks
+            );
+            println!("{}", crate::status::cache_profile_line(&profile));
+        }
+        None => println!(
+            "Disk:       {} of {}, {} blocks",
+            ByteSize(reply.bytes).human(),
+            ByteSize(reply.max_bytes).human(),
+            reply.blocks
+        ),
+    }
     println!(
         "Pinned:     {} (not counted against the cap)",
         ByteSize(reply.pinned_bytes).human()
@@ -52,8 +63,18 @@ pub async fn wipe(paths: &ProfilePaths, path: Option<String>) -> anyhow::Result<
 }
 
 fn print_freed(reply: CacheFreedReply) {
+    // With further trees on the cap, the profile's total too (D110 amended).
+    let profile = match reply.profile.filter(|profile| profile.shared()) {
+        Some(profile) => format!(
+            " (My Files; all {} trees: {} of {})",
+            profile.trees,
+            ByteSize(profile.bytes).human(),
+            ByteSize(profile.max_bytes).human()
+        ),
+        None => String::new(),
+    };
     println!(
-        "Freed {} in {} blocks; {} left.",
+        "Freed {} in {} blocks; {} left{profile}.",
         ByteSize(reply.bytes).human(),
         reply.blocks,
         ByteSize(reply.left_bytes).human()

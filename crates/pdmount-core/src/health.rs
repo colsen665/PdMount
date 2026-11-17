@@ -203,6 +203,11 @@ impl Backend for Monitored {
         self.seen(self.inner.get_nodes(ids).await)
     }
 
+    async fn get_nodes_checked(&self, ids: &[LinkId]) -> Result<Vec<pdmount_backend::NodeLookup>> {
+        self.allowed()?;
+        self.seen(self.inner.get_nodes_checked(ids).await)
+    }
+
     async fn blocks(&self, file: &LinkId, revision: &RevisionId) -> Result<Vec<BlockInfo>> {
         self.allowed()?;
         self.seen(self.inner.blocks(file, revision).await)

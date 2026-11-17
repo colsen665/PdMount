@@ -1,7 +1,7 @@
 # Exemptions for the publishing scan: generic paths only, never private values (D090).
 [[allowlists]]
 description = "Made-up home directory in unit tests"
-regexes = ['''/home/u\b''']
+regexes = ['''/home/(?:u|user)\b''']
 
 [[allowlists]]
 description = "PdMount's files and default mountpoints on the target system"
@@ -21,6 +21,12 @@ regexes = [
   '''~/\.config/(?:autostart|systemd/user|rc/init\.d)\b''',
   '''~/\.cache/thumbnails\b''',
   '''~/\.local(?:/share)?(?:[^/\w.-]|$)''',
+  '''~/\.local/bin\b''',
+  '''~/\.cache(?:[^/\w.-]|$)''',
+  '''~/\.config/rc/conf\.d\b''',
+  '''~/\.xprofile\b''',
+  '''~/\.config/(?:i3|sway)/config\b''',
+  '''(?:~|\$HOME|\$\{CARGO_HOME:-\$HOME)/\.cargo\}?/bin\b''',
 ]
 
 [[allowlists]]
@@ -32,4 +38,15 @@ description = "Cargo's public source copies, and pdcli's default config, as cite
 regexes = [
   '''~/\.cargo/(?:registry/src|git/checkouts)\b''',
   '''~/\.config/pdcli\b''',
+]
+
+[[allowlists]]
+description = "GitHub's runner home"
+regexes = ['''/home/runner\b''']
+
+[[allowlists]]
+description = "Example mountpoints and placeholder directories in docs and tests, and the M5.6 script's own folder"
+regexes = [
+  '''(?:~|\$HOME)/(?:a|b|x|y|pd|Photos|ProtonPhotos|Shared(?:/Team)?|Other|Alone|Home)\b''',
+  '''(?:~|\$HOME)/PdMount-(?:m56\b|\$profile\b|%s)''',
 ]

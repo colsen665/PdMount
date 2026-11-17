@@ -11,7 +11,8 @@
 //! - **Dependencies** are by inode: a create or move waits for its parent's
 //!   link; a node waits for the remote occupant of its target name to move
 //!   away or be trashed first. Two nodes swapping names break the cycle
-//!   through a temporary `.pdmount-swap-<ino>` name.
+//!   through a temporary `.pdmount-swap-<ino>` name. A folder's trash
+//!   waits for the entries of children deleted or moved out (D116).
 //! - **Uploads** wait until the file has no writer and has been quiet for
 //!   `upload.debounce`, or has been dirty for `upload.max_dirty_age`. They run
 //!   concurrently (`upload.concurrency`); namespace steps run one at a time.
@@ -23,6 +24,8 @@
 //!   died is recognized by its SHA-1 and adopted instead of uploaded again.
 //!
 //! Parked state lives in RAM; parked entries are retried at the next mount.
+//! The time an entry was queued is the exception: it is kept in the store
+//! (`queued`, D105) so that `status` counts an entry's age across restarts.
 //! A local change retries an automatic park but not one made with
 //! `queue park` (D061).
 
@@ -34,10 +37,14 @@ use crate::errors::{CoreError, Result};
 use crate::lock_order::{self, Rank};
 use crate::metrics::{Metrics, check_not_hot};
 use crate::staging::Base;
-use crate::vfs::{Changes, Content, DEFAULT_FILE_MODE, Ino, Invalidation, ROOT_INO, RemoteState};
+use crate::store::Store;
+use crate::vfs::{
+    Changes, Content, DEFAULT_FILE_MODE, Ino, Invalidation, ROOT_INO, RemoteState, Tree,
+};
 use pdmount_backend::{
     BackendError, FileMeta, LinkId, NameHash, NodeKind, RemoteNode, RevisionId, UploadSource,
 };
+use rusqlite::params;
 use sha1::Digest;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -56,6 +63,9 @@ const PARK_AFTER: u32 = 5;
 /// between plans: the tree and the drive disagree in a way no step settles.
 const REPLAN_BURST: u32 = 16;
 const TRASH_BATCH: usize = 50;
+/// The longest age taken from a stored queue time: a clock that jumped must
+/// not give an absurd age (D105).
+const MAX_CARRIED_AGE: Duration = Duration::from_secs(365 * 24 * 3600);
 /// Base blocks materialized per round before a snapshot (256 MiB).
 const MATERIALIZE_BATCH: usize = 64;
 /// Largest file whose remote content is read to compare it with a local one
@@ -65,8 +75,12 @@ const MAX_WAKE: Duration = Duration::from_secs(1);
 /// How often a `sync` of a path looks at its entries.
 const SYNC_POLL: Duration = Duration::from_millis(50);
 const USER_PARK_REASON: &str = "parked by user";
-/// How far a `sync` follows what an entry waits for.
+/// How far a `sync` follows what an entry waits for, and the planner a
+/// cycle of nodes waiting for each other's places.
 const MAX_DEPENDENCY_CHAIN: usize = 4096;
+/// The start of the temporary name of a node that frees its remote place
+/// for a node waiting for it (D117).
+pub(crate) const SWAP_PREFIX: &str = ".pdmount-swap-";
 
 #[derive(Debug, Clone)]
 struct Entry {
@@ -80,18 +94,38 @@ struct Entry {
     in_flight: bool,
     /// Last local change, for the debounce.
     changed_at: Instant,
-    /// When the inode became dirty, for `max_dirty_age`.
+    /// When the inode became dirty in this process, for `max_dirty_age`
+    /// (monotonic; the age shown adds [`Self::carried`]).
     dirty_since: Instant,
+    /// How long the entry was queued before this process started: from the
+    /// stored queue time, clamped (D105). Display only.
+    carried: Duration,
     /// Upload as soon as possible (`sync`, unmount, `fsync` in remote mode).
     forced: bool,
+    /// End of the back-off after the last failure; a shutdown flush does not
+    /// start the entry before it (D075). Cleared by a change or a success.
+    retry_at: Option<Instant>,
     blocked_on: Option<Ino>,
     /// The last failure, for `status` and diagnostics.
     last_error: Option<String>,
     /// Steps in a row that ended in `Replan`.
     replans: u32,
+    /// Waits for another entry in a row ([`Journal::wait_on`]), for their
+    /// back-off; not failed attempts (D121).
+    waits: u32,
     /// Bumped by every change and force: a plan made from an older
     /// generation must not defer, block or remove the entry.
     generation: u64,
+    /// [`Self::generation`] when the last step started: a wait found by
+    /// that step keeps a change, retry or force made while it ran.
+    step_generation: u64,
+    /// Made only because another entry waits for it, and neither changed
+    /// nor stepped since: when it leaves, nothing moved that the waiting
+    /// entry could see, so it is not woken (D121).
+    waited_into: bool,
+    /// The tree's write access is withdrawn (D114): no step starts, and an
+    /// entry that would take one is parked with this reason.
+    hold: Option<String>,
 }
 
 impl Entry {
@@ -105,26 +139,57 @@ impl Entry {
             in_flight: false,
             changed_at: now,
             dirty_since: now,
+            carried: Duration::ZERO,
             forced: false,
+            retry_at: None,
             blocked_on: None,
             last_error: None,
             replans: 0,
+            waits: 0,
             generation: 0,
+            step_generation: 0,
+            waited_into: false,
+            hold: None,
         }
     }
 
-    /// A local change retries an automatic park.
+    /// How long the entry has been queued, across restarts.
+    fn age(&self, now: Instant) -> Duration {
+        self.carried + now.saturating_duration_since(self.dirty_since)
+    }
+
+    /// A local change retries an automatic park, not a hold (D114).
     fn changed(&mut self) {
         if !self.user_parked {
-            self.parked = None;
+            self.parked = self.hold.clone();
+        }
+        self.waits = 0;
+        self.waited_into = false;
+    }
+
+    /// The executor parks the entry; the user's reason stays, and under a
+    /// hold the hold's, so that lifting it retries the entry.
+    fn park(&mut self, reason: String) {
+        if !self.user_parked {
+            self.parked = Some(self.hold.clone().unwrap_or(reason));
         }
     }
 
-    /// The executor parks the entry; the user's reason stays.
-    fn park(&mut self, reason: String) {
-        if !self.user_parked {
-            self.parked = Some(reason);
+    /// Marks a step as running, unless the entry is held or parked. Under a
+    /// hold (D114) it is parked with the hold's reason instead.
+    fn start_step(&mut self) -> bool {
+        if self.held || self.parked.is_some() {
+            return false;
         }
+        if self.hold.is_some() {
+            self.parked = self.hold.clone();
+            return false;
+        }
+        self.in_flight = true;
+        self.blocked_on = None;
+        self.step_generation = self.generation;
+        self.waited_into = false;
+        true
     }
 }
 
@@ -154,6 +219,52 @@ pub(crate) struct SyncRound {
     pub parked: Vec<Ino>,
 }
 
+/// The entries a shutdown flush waits for ([`Engine::flush_barrier`]).
+#[derive(Debug, Clone, Default)]
+pub struct FlushBarrier {
+    inos: Vec<Ino>,
+}
+
+impl FlushBarrier {
+    pub fn len(&self) -> usize {
+        self.inos.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inos.is_empty()
+    }
+}
+
+/// Why a shutdown flush stopped waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushEnd {
+    /// None of the barrier's entries can finish any more: all uploaded, or
+    /// the rest parked or held up by a parked entry.
+    Reached,
+    /// The grace ran out.
+    Deadline,
+    /// Offline or `needs_login`: no wait (D075).
+    NotOnline(crate::health::Connectivity),
+}
+
+/// What a shutdown flush did ([`Engine::flush_to`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlushOutcome {
+    /// Entries in the barrier.
+    pub barrier: usize,
+    /// Of those, the entries still queued (parked ones included).
+    pub left: usize,
+    pub elapsed: Duration,
+    pub ended: FlushEnd,
+}
+
+impl FlushOutcome {
+    /// Entries of the barrier that were uploaded.
+    pub fn flushed(&self) -> usize {
+        self.barrier - self.left
+    }
+}
+
 /// Queue counts for `status`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QueueCounts {
@@ -170,6 +281,14 @@ struct State {
     draining: bool,
     /// Shutting down: no step starts any more (D062).
     stopping: bool,
+    /// Tests only: no step starts until resumed, so that changes queue up.
+    paused: bool,
+    /// Ages of the entries of the last session that have none yet (D105);
+    /// an entry made for one of these inodes takes it.
+    restored: BTreeMap<Ino, Duration>,
+    /// The reason of [`Journal::hold_all`] while it lasts: entries made
+    /// meanwhile are held too.
+    hold: Option<String>,
 }
 
 /// Directories to list again: those the executor has not taken yet, and
@@ -181,6 +300,12 @@ struct Listings {
     open: BTreeMap<Ino, u32>,
 }
 
+/// A running upload's place: one of its tree's and one of the session's.
+pub(crate) struct UploadPermit {
+    _tree: tokio::sync::OwnedSemaphorePermit,
+    _session: tokio::sync::OwnedSemaphorePermit,
+}
+
 pub(crate) struct Journal {
     state: lock_order::Mutex<State>,
     wake: tokio::sync::Notify,
@@ -188,12 +313,31 @@ pub(crate) struct Journal {
     listings: parking_lot::Mutex<Listings>,
     /// Signalled whenever an entry finishes, fails or leaves.
     progress: tokio::sync::Notify,
-    /// One permit per running upload (`upload.concurrency`).
+    /// One permit per running upload of this tree (`upload.concurrency`),
+    /// which tells when it is idle.
     uploads: Arc<tokio::sync::Semaphore>,
     upload_slots: usize,
+    /// The session's: `upload.concurrency` over every tree (D058, D110).
+    session_uploads: Arc<tokio::sync::Semaphore>,
     debounce: Duration,
     max_dirty_age: Duration,
     meta_revision: MetaRevisionPolicy,
+    /// Where the queue times go (`queued`, D105); none in unit tests.
+    store: Option<Arc<Store>>,
+}
+
+/// Unix milliseconds of `time` (0 before the epoch).
+pub(crate) fn unix_ms(time: SystemTime) -> i64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
+/// The age of an entry queued `elapsed_ms` before now: never negative, at
+/// most [`MAX_CARRIED_AGE`].
+fn carried_age(elapsed_ms: i64) -> Duration {
+    Duration::from_millis(elapsed_ms.max(0).unsigned_abs()).min(MAX_CARRIED_AGE)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -205,7 +349,16 @@ struct Timing {
 }
 
 impl Journal {
+    /// A journal with limits of its own (tests).
+    #[cfg(test)]
     pub(crate) fn new(config: &UploadConfig) -> Self {
+        let slots = config.concurrency.max(1) as usize;
+        Self::sharing(config, Arc::new(tokio::sync::Semaphore::new(slots)))
+    }
+
+    /// A journal whose uploads also take one of the session's
+    /// `session_uploads` permits.
+    fn sharing(config: &UploadConfig, session_uploads: Arc<tokio::sync::Semaphore>) -> Self {
         Self {
             state: lock_order::Mutex::new(Rank::Leaf, State::default()),
             wake: tokio::sync::Notify::new(),
@@ -215,17 +368,107 @@ impl Journal {
                 config.concurrency.max(1) as usize
             )),
             upload_slots: config.concurrency.max(1) as usize,
+            session_uploads,
             debounce: config.debounce.0,
             max_dirty_age: config.max_dirty_age.0,
             meta_revision: config.meta_revision,
+            store: None,
         }
     }
 
-    fn entry(state: &mut State, ino: Ino, now: Instant) -> &mut Entry {
+    /// A journal that keeps the time each entry was queued in `store`, its
+    /// uploads limited with the session's other trees by `session_uploads`.
+    pub(crate) fn with_store(
+        config: &UploadConfig,
+        store: Arc<Store>,
+        session_uploads: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
+        Self {
+            store: Some(store),
+            ..Self::sharing(config, session_uploads)
+        }
+    }
+
+    /// Takes the queue times stored by the last session: `rows` are
+    /// `(inode, unix milliseconds)`, `now_ms` is now. Call before any entry
+    /// exists; entries made afterwards for these inodes start with their age
+    /// (D105). The age is never negative (a clock that went back) nor more
+    /// than [`MAX_CARRIED_AGE`].
+    pub(crate) fn restore(&self, rows: &[(Ino, i64)], now_ms: i64) {
+        let mut state = self.state.lock();
+        for &(ino, queued_ms) in rows {
+            state
+                .restored
+                .insert(ino, carried_age(now_ms.saturating_sub(queued_ms)));
+        }
+    }
+
+    /// Ends [`Self::restore`]: the stored times of inodes that got no entry
+    /// (the queue was left empty, or the inode is gone) are deleted.
+    pub(crate) fn finish_restore(&self) {
+        let left: Vec<Ino> = {
+            let mut state = self.state.lock();
+            std::mem::take(&mut state.restored).into_keys().collect()
+        };
+        if left.is_empty() {
+            return;
+        }
+        if let Some(store) = &self.store {
+            store.write(move |conn| {
+                let mut delete = conn.prepare_cached("DELETE FROM queued WHERE ino = ?1")?;
+                for ino in left {
+                    delete.execute(params![ino as i64])?;
+                }
+                Ok(())
+            });
+        }
+    }
+
+    fn entry<'a>(&self, state: &'a mut State, ino: Ino, now: Instant) -> &'a mut Entry {
         let draining = state.draining;
-        let entry = state.entries.entry(ino).or_insert_with(|| Entry::new(now));
+        let entry = self.entry_or_new(state, ino, now);
         entry.forced |= draining;
         entry
+    }
+
+    /// The entry of `ino`; a new one takes its age from the last session or
+    /// records its queue time, and the tree's hold if there is one.
+    fn entry_or_new<'a>(&self, state: &'a mut State, ino: Ino, now: Instant) -> &'a mut Entry {
+        if !state.entries.contains_key(&ino) {
+            let mut entry = Entry::new(now);
+            entry.hold.clone_from(&state.hold);
+            match state.restored.remove(&ino) {
+                Some(age) => entry.carried = age,
+                None => self.record_queued(ino),
+            }
+            state.entries.insert(ino, entry);
+        }
+        state.entries.get_mut(&ino).expect("just inserted")
+    }
+
+    /// Stores the time a new entry was queued. Called under the state lock,
+    /// so the stored rows follow the entries' order.
+    fn record_queued(&self, ino: Ino) {
+        if let Some(store) = &self.store {
+            let ms = unix_ms(SystemTime::now());
+            store.write(move |conn| {
+                conn.execute(
+                    "INSERT OR REPLACE INTO queued(ino, queued_at_ms) VALUES (?1, ?2)",
+                    params![ino as i64, ms],
+                )
+                .map(drop)
+            });
+        }
+    }
+
+    /// Deletes the stored queue time of an entry that left.
+    fn record_left(&self, ino: Ino) {
+        if let Some(store) = &self.store {
+            store.write(move |conn| {
+                conn.execute("DELETE FROM queued WHERE ino = ?1", params![ino as i64])
+                    .map(drop)
+            });
+        }
     }
 
     /// Asks for `dirs` to be listed again; `run_journal` does it. `save`
@@ -272,9 +515,10 @@ impl Journal {
         let now = Instant::now();
         {
             let mut state = self.state.lock();
-            let entry = Self::entry(&mut state, ino, now);
+            let entry = self.entry(&mut state, ino, now);
             entry.changed();
             entry.attempts = 0;
+            entry.retry_at = None;
             entry.not_before = now;
             entry.generation += 1;
         }
@@ -286,9 +530,10 @@ impl Journal {
         let now = Instant::now();
         {
             let mut state = self.state.lock();
-            let entry = Self::entry(&mut state, ino, now);
+            let entry = self.entry(&mut state, ino, now);
             entry.changed();
             entry.attempts = 0;
+            entry.retry_at = None;
             entry.changed_at = now;
             entry.not_before = now;
             entry.generation += 1;
@@ -345,7 +590,7 @@ impl Journal {
             .entries
             .values()
             .filter(|entry| entry.parked.is_none())
-            .map(|entry| now.saturating_duration_since(entry.dirty_since))
+            .map(|entry| entry.age(now))
             .max()
     }
 
@@ -378,7 +623,7 @@ impl Journal {
         let now = Instant::now();
         {
             let mut state = self.state.lock();
-            let entry = Self::entry(&mut state, ino, now);
+            let entry = self.entry(&mut state, ino, now);
             entry.forced = true;
             entry.not_before = now;
             entry.generation += 1;
@@ -392,6 +637,13 @@ impl Journal {
         self.state.lock().stopping = true;
     }
 
+    /// Tests: holds back every step (`true`) or lets them go on.
+    #[cfg(test)]
+    pub(crate) fn pause(&self, paused: bool) {
+        self.state.lock().paused = paused;
+        self.wake.notify_one();
+    }
+
     /// Whether no upload and no inline step runs.
     pub(crate) fn idle(&self) -> bool {
         let state = self.state.lock();
@@ -403,7 +655,7 @@ impl Journal {
         let state = self.state.lock();
         let mut ready = Vec::new();
         let mut next: Option<Instant> = None;
-        if state.stopping {
+        if state.stopping || state.paused {
             return (ready, next);
         }
         for (&ino, entry) in &state.entries {
@@ -428,17 +680,25 @@ impl Journal {
     }
 
     /// Nothing left to do as of `generation`; a later change keeps it.
+    /// An entry made only by a wait wakes nothing when it leaves so: its
+    /// node is as the waiting entry saw it, and a node with nothing to do
+    /// now may have nothing to do ever (one in a local-only folder), so the
+    /// wake would start a loop of waits (D121).
     fn done(&self, ino: Ino, generation: u64) {
         {
             let mut state = self.state.lock();
+            let quiet = state.entries.get(&ino).is_some_and(|e| e.waited_into);
             if state
                 .entries
                 .get(&ino)
                 .is_some_and(|e| !e.in_flight && e.generation == generation)
             {
                 state.entries.remove(&ino);
+                self.record_left(ino);
             }
-            Self::unblock(&mut state, ino);
+            if !quiet {
+                Self::unblock(&mut state, ino);
+            }
         }
         self.progress.notify_waiters();
     }
@@ -455,16 +715,25 @@ impl Journal {
     fn block(&self, ino: Ino, on: Ino, generation: u64) {
         let now = Instant::now();
         let mut state = self.state.lock();
+        let mut new_dependency = false;
         if let Some(entry) = state.entries.get_mut(&ino)
             && entry.generation == generation
         {
+            new_dependency = entry.blocked_on != Some(on);
             entry.blocked_on = Some(on);
             entry.not_before = now + BLOCKED_RECHECK;
         }
         // The dependency must be scheduled itself.
         let draining = state.draining;
-        let dep = state.entries.entry(on).or_insert_with(|| Entry::new(now));
+        let new = !state.entries.contains_key(&on);
+        let dep = self.entry_or_new(&mut state, on, now);
         dep.forced |= draining;
+        dep.waited_into |= new;
+        // A dependency that waits itself (a folder's trash, D116) looks
+        // again at once: it may be waiting for this entry (D117).
+        if new_dependency && dep.blocked_on.is_some() && !dep.in_flight {
+            dep.not_before = dep.not_before.min(now);
+        }
     }
 
     fn unblock(state: &mut State, ino: Ino) {
@@ -485,32 +754,25 @@ impl Journal {
             return false;
         }
         match state.entries.get_mut(&ino) {
-            Some(entry) if entry.held || entry.parked.is_some() => false,
-            Some(entry) => {
-                entry.in_flight = true;
-                entry.blocked_on = None;
-                true
-            }
+            Some(entry) => entry.start_step(),
             // Gone since the plan: `queue drop` took it.
             None => false,
         }
     }
 
-    /// Starts an upload if fewer than `upload.concurrency` run; it runs
-    /// while the permit is held.
-    pub(crate) fn try_start_upload(&self, ino: Ino) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        let permit = Arc::clone(&self.uploads).try_acquire_owned().ok()?;
+    /// Starts an upload if fewer than `upload.concurrency` run, in this
+    /// tree and in the session; it runs while the permit is held.
+    pub(crate) fn try_start_upload(&self, ino: Ino) -> Option<UploadPermit> {
+        let permit = UploadPermit {
+            _tree: Arc::clone(&self.uploads).try_acquire_owned().ok()?,
+            _session: Arc::clone(&self.session_uploads).try_acquire_owned().ok()?,
+        };
         let mut state = self.state.lock();
         if state.stopping {
             return None;
         }
         let entry = state.entries.get_mut(&ino)?;
-        if entry.held || entry.parked.is_some() {
-            return None;
-        }
-        entry.in_flight = true;
-        entry.blocked_on = None;
-        Some(permit)
+        entry.start_step().then_some(permit)
     }
 
     /// A step succeeded: re-plan the entry at once (it may need more).
@@ -522,6 +784,8 @@ impl Journal {
                 entry.in_flight = false;
                 entry.attempts = 0;
                 entry.replans = 0;
+                entry.waits = 0;
+                entry.retry_at = None;
                 entry.not_before = now;
             }
             Self::unblock(&mut state, ino);
@@ -547,6 +811,7 @@ impl Journal {
                 } else {
                     now
                 };
+                entry.retry_at = (entry.not_before > now).then_some(entry.not_before);
             }
             Self::unblock(&mut state, ino);
         }
@@ -582,12 +847,46 @@ impl Journal {
                 };
                 delay = delay.min(BACKOFF_MAX);
                 entry.not_before = now + delay;
+                entry.retry_at = Some(entry.not_before);
                 false
             }
         };
         self.wake.notify_one();
         self.progress.notify_waiters();
         parked
+    }
+
+    /// A step found that `ino` must wait for the entry of `on` (a folder's
+    /// trash for a child folder deleted, or a child moved out, inside it):
+    /// the entry depends on `on`, which gets an entry if it has none, and is
+    /// planned again as soon as `on`'s entry finishes a step or leaves.
+    /// Each recheck asks the server, so without that wake it backs off by
+    /// its waits in a row, which are not failed attempts (D121); `reason`
+    /// is shown as its last error (D116). A change, retry or force made
+    /// while the step ran wins: the entry is planned as that asked.
+    fn wait_on(&self, ino: Ino, on: Ino, reason: &str) {
+        let now = Instant::now();
+        {
+            let mut state = self.state.lock();
+            let draining = state.draining;
+            let Some(entry) = state.entries.get_mut(&ino) else {
+                return;
+            };
+            entry.in_flight = false;
+            if entry.generation == entry.step_generation {
+                entry.waits += 1;
+                entry.last_error = Some(reason.to_owned());
+                entry.not_before = now + backoff(entry.waits);
+                entry.retry_at = Some(entry.not_before);
+                entry.blocked_on = Some(on);
+                let new = !state.entries.contains_key(&on);
+                let dep = self.entry_or_new(&mut state, on, now);
+                dep.forced |= draining;
+                dep.waited_into |= new;
+            }
+        }
+        self.wake.notify_one();
+        self.progress.notify_waiters();
     }
 
     fn park(&self, ino: Ino, reason: String) {
@@ -617,8 +916,8 @@ impl Journal {
                 in_flight: entry.in_flight,
                 last_error: entry.last_error.clone(),
                 blocked_on: entry.blocked_on,
-                age: now.saturating_duration_since(entry.dirty_since),
-                backoff: (entry.attempts > 0 && entry.not_before > now)
+                age: entry.age(now),
+                backoff: ((entry.attempts > 0 || entry.waits > 0) && entry.not_before > now)
                     .then(|| entry.not_before - now),
             })
             .collect()
@@ -635,6 +934,8 @@ impl Journal {
                     entry.user_parked = false;
                     entry.attempts = 0;
                     entry.replans = 0;
+                    entry.waits = 0;
+                    entry.retry_at = None;
                     entry.forced = true;
                     entry.not_before = now;
                     entry.generation += 1;
@@ -658,6 +959,66 @@ impl Journal {
             }
         }
         self.progress.notify_waiters();
+    }
+
+    /// Holds every entry, and every entry made until
+    /// [`Self::release_held`], with `reason` (the tree lost write access,
+    /// D114): no step starts, and a local change does not lift it, as with
+    /// `queue park`. An idle entry is parked with `reason` at once; one
+    /// parked already keeps its reason, as does one the user parked; one
+    /// whose step runs, or one made meanwhile, is planned as usual and
+    /// parked with `reason` instead of a step (D121). Returns how many
+    /// entries are held now, those the user parked left out.
+    pub(crate) fn hold_all(&self, reason: &str) -> usize {
+        let held = {
+            let mut state = self.state.lock();
+            state.hold = Some(reason.to_owned());
+            for entry in state.entries.values_mut() {
+                if entry.hold.is_some() {
+                    continue;
+                }
+                entry.hold = Some(reason.to_owned());
+                entry.generation += 1;
+                if entry.parked.is_none() && !entry.in_flight {
+                    entry.parked = Some(reason.to_owned());
+                }
+            }
+            state
+                .entries
+                .values()
+                .filter(|entry| entry.hold.is_some() && !entry.user_parked)
+                .count()
+        };
+        self.progress.notify_waiters();
+        held
+    }
+
+    /// Lifts the hold of [`Self::hold_all`] with `reason` and forces the
+    /// entries it parked; returns how many. Entries parked for another
+    /// reason stay parked (D121).
+    pub(crate) fn release_held(&self, reason: &str) -> usize {
+        let held: Vec<Ino> = {
+            let mut state = self.state.lock();
+            if state.hold.as_deref() == Some(reason) {
+                state.hold = None;
+            }
+            let mut held = Vec::new();
+            for (&ino, entry) in &mut state.entries {
+                if entry.hold.as_deref() != Some(reason) {
+                    continue;
+                }
+                entry.hold = None;
+                if entry.parked.as_deref() == Some(reason) && !entry.user_parked {
+                    held.push(ino);
+                }
+            }
+            held
+        };
+        if !held.is_empty() {
+            self.retry(&held);
+        }
+        self.wake.notify_one();
+        held.len()
     }
 
     /// Keeps steps from starting for these entries, all of them or, when
@@ -696,7 +1057,9 @@ impl Journal {
     pub(crate) fn forget(&self, ino: Ino) {
         {
             let mut state = self.state.lock();
-            state.entries.remove(&ino);
+            if state.entries.remove(&ino).is_some() {
+                self.record_left(ino);
+            }
             Self::unblock(&mut state, ino);
         }
         self.wake.notify_one();
@@ -706,6 +1069,52 @@ impl Journal {
     /// Forces `selected` and what they wait for (once each: a forced entry
     /// keeps its back-off), and counts what can still finish.
     pub(crate) fn sync_round(&self, selected: &[Ino]) -> SyncRound {
+        self.force_round(selected, true)
+    }
+
+    /// [`Self::sync_round`] for a shutdown flush (D075): skips the debounce,
+    /// but an entry in its back-off after a failure (HTTP 429 included)
+    /// waits for its end.
+    pub(crate) fn flush_round(&self, selected: &[Ino]) -> SyncRound {
+        self.force_round(selected, false)
+    }
+
+    /// Entries that are not parked.
+    pub(crate) fn unparked(&self) -> Vec<Ino> {
+        let state = self.state.lock();
+        state
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.parked.is_none())
+            .map(|(&ino, _)| ino)
+            .collect()
+    }
+
+    /// Of `inos`, how many still have an entry that is not parked, and how
+    /// many a parked one.
+    pub(crate) fn queued_among(&self, inos: &[Ino]) -> (usize, usize) {
+        let state = self.state.lock();
+        let (mut pending, mut parked) = (0, 0);
+        for entry in inos.iter().filter_map(|ino| state.entries.get(ino)) {
+            if entry.parked.is_some() {
+                parked += 1;
+            } else {
+                pending += 1;
+            }
+        }
+        (pending, parked)
+    }
+
+    /// How many of `inos` still have an entry.
+    pub(crate) fn still_queued(&self, inos: &[Ino]) -> usize {
+        let state = self.state.lock();
+        inos.iter()
+            .filter(|ino| state.entries.contains_key(ino))
+            .count()
+    }
+
+    /// `hurry`: a forced entry starts now even in its back-off (`sync`).
+    fn force_round(&self, selected: &[Ino], hurry: bool) -> SyncRound {
         let now = Instant::now();
         let mut round = SyncRound::default();
         let mut woke = false;
@@ -729,7 +1138,11 @@ impl Journal {
                     }
                     if !entry.forced {
                         entry.forced = true;
-                        entry.not_before = now;
+                        let start = match entry.retry_at {
+                            Some(retry_at) if !hurry => retry_at.max(now),
+                            _ => now,
+                        };
+                        entry.not_before = entry.not_before.min(start);
                         entry.generation += 1;
                         woke = true;
                     }
@@ -774,7 +1187,50 @@ pub(crate) fn backoff(attempts: u32) -> Duration {
     base.mul_f64(jitter).min(BACKOFF_MAX)
 }
 
-/// Errors retrying cannot fix soon. `None`: keep retrying.
+/// The temporary name that frees a node's remote place (D117).
+pub(crate) fn swap_name(ino: Ino) -> String {
+    format!("{SWAP_PREFIX}{ino}")
+}
+
+/// Whether `from`, followed through what each node waits for by the tree
+/// (the folder it goes into while that has no link, the node that holds
+/// its target name remotely), comes back to `ino`: a cycle of nodes
+/// waiting for each other's places, such as two names swapped, three
+/// rotated, or a folder created at the old name of a node moved into it
+/// (D117). A tombstone ends the walk; its trash frees its name itself.
+fn waits_for_me(tree: &Tree, from: Ino, ino: Ino) -> bool {
+    let mut current = from;
+    for _ in 0..MAX_DEPENDENCY_CHAIN {
+        if current == ino {
+            return true;
+        }
+        let Some(node) = tree.get(current) else {
+            return false;
+        };
+        if !node.attached || current == ROOT_INO || (node.local_only && node.remote.is_none()) {
+            return false;
+        }
+        current = match tree.link_of(node.parent) {
+            None => node.parent,
+            Some(parent) => match tree.remote_occupant(parent, &node.name) {
+                Some(occupant) if occupant != current => occupant,
+                _ => return false,
+            },
+        };
+    }
+    false
+}
+
+/// Whether the attached node `ino` is inside a local-only folder (§7.7):
+/// the planner has nothing to do for it, ever, so a node with a remote
+/// place keeps that place remotely.
+fn in_local_only_folder(tree: &Tree, ino: Ino) -> bool {
+    tree.get(ino)
+        .filter(|node| node.attached)
+        .and_then(|node| tree.get(node.parent))
+        .is_some_and(|parent| parent.local_only && parent.remote.is_none())
+}
+
 /// The next remote step for an inode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Plan {
@@ -809,6 +1265,17 @@ enum Work {
 enum Target {
     New { parent: LinkId, name: String },
     Revision { link: LinkId },
+}
+
+/// What the trash pre-check of a tombstone found (§8.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrashCheck {
+    /// Nothing the local delete did not know about.
+    Trash,
+    /// The remote node is kept and shown again.
+    Kept,
+    /// The entry of `on` comes first.
+    Wait { on: Ino, reason: &'static str },
 }
 
 /// What a snapshot captured, for the commit.
@@ -902,40 +1369,32 @@ impl Engine {
         if !node.attached || ino == ROOT_INO || (node.local_only && node.remote.is_none()) {
             return Plan::Done;
         }
-        if tree
-            .get(node.parent)
-            .is_some_and(|parent| parent.local_only && parent.remote.is_none())
-        {
-            // Inside a local-only folder (§7.7).
+        if in_local_only_folder(&tree, ino) {
             return Plan::Done;
         }
+        // Waits for `on`; if that waits for this node in turn, a node that
+        // has a remote place frees it under a temporary name in its folder
+        // (D117).
+        let blocked = |on: Ino| -> Plan {
+            match &node.remote {
+                Some(remote) if remote.name != swap_name(ino) && waits_for_me(&tree, on, ino) => {
+                    Plan::Work(Work::Move {
+                        link: remote.link.clone(),
+                        new_parent: None,
+                        name: swap_name(ino),
+                        expected: remote.name_hash.clone(),
+                    })
+                }
+                _ => Plan::Blocked(on),
+            }
+        };
         let Some(parent) = tree.link_of(node.parent).cloned() else {
-            return Plan::Blocked(node.parent);
+            return blocked(node.parent);
         };
         // The target name must be free remotely, or held by this node.
         let reserve = |plan: Plan| -> Plan {
             match tree.remote_occupant(&parent, &node.name) {
-                Some(occupant) if occupant != ino => {
-                    let swap = node.remote.is_some()
-                        && tree.get(occupant).is_some_and(|other| {
-                            other.attached
-                                && tree.link_of(other.parent).is_some_and(|other_parent| {
-                                    node.remote.as_ref().and_then(|r| r.parent_link.as_ref())
-                                        == Some(other_parent)
-                                        && node.remote.as_ref().map(|r| r.name.as_str())
-                                            == Some(other.name.as_str())
-                                })
-                        });
-                    match (&node.remote, swap) {
-                        (Some(remote), true) => Plan::Work(Work::Move {
-                            link: remote.link.clone(),
-                            new_parent: None,
-                            name: format!(".pdmount-swap-{ino}"),
-                            expected: remote.name_hash.clone(),
-                        }),
-                        _ => Plan::Blocked(occupant),
-                    }
-                }
+                Some(occupant) if occupant != ino => blocked(occupant),
                 _ => plan,
             }
         };
@@ -1048,6 +1507,11 @@ impl Engine {
             } => self.move_node(ino, link, new_parent, name, expected).await,
             Work::Upload(_) | Work::Trash { .. } => unreachable!("handled by the loop"),
         };
+        self.step_ended(ino, result);
+    }
+
+    /// Records how an inline step ended.
+    fn step_ended(&self, ino: Ino, result: std::result::Result<(), UploadError>) {
         match result {
             // `Replan`: the tree changed under the step; look at the node again.
             Ok(()) => self.journal.succeeded(ino),
@@ -1062,6 +1526,12 @@ impl Engine {
 
     fn step_failed(&self, ino: Ino, error: &BackendError) {
         tracing::warn!(ino, %error, "journal step failed");
+        // A tree whose gate follows the server's answer (a share, D114):
+        // every entry is held before this one is marked failed, which then
+        // keeps the hold's reason.
+        if *error == BackendError::PermissionDenied {
+            self.write_refused();
+        }
         let deferred = match error {
             BackendError::QuotaExceeded => Some(nix::libc::ENOSPC),
             BackendError::FileTooLarge => Some(nix::libc::EFBIG),
@@ -1154,8 +1624,8 @@ impl Engine {
         let target = new_parent.clone().or_else(|| known.parent_link.clone());
         let placement = (known.parent_link.clone(), known.name.clone());
         if (&fresh.parent_link_id, &fresh.name) != (&placement.0, &placement.1) {
-            // The remote committed first.
-            return Err(self.remote_moved_first(ino, &fresh, target.as_ref(), &name));
+            // The remote committed first, or an earlier step did.
+            return self.moved_meanwhile(ino, &fresh, target.as_ref(), &name);
         }
         // The precondition is the hash read just now, never an older one.
         let hash = fresh.name_hash.clone().or(expected);
@@ -1187,7 +1657,7 @@ impl Engine {
                         "the server refused the name hash of an unchanged node".into(),
                     ));
                 }
-                return Err(self.remote_moved_first(ino, &fresh, target.as_ref(), &name));
+                return self.moved_meanwhile(ino, &fresh, target.as_ref(), &name);
             }
             Err(BackendError::InvalidMove) => {
                 let fresh = self.fresh_or_vanished(ino, &link).await?;
@@ -1237,6 +1707,54 @@ impl Engine {
         }
         self.persist(&[ino]);
         Ok(())
+    }
+
+    /// The remote node `fresh` is not where the node was known to be. Found
+    /// at its own temporary name in its known folder, it is this device's
+    /// move aside (D117) whose reply was lost, or whose row a crash did not
+    /// commit: that step took effect, and only the remote state follows, so
+    /// that the plan goes on to the node's own name (D117 amended, V-7).
+    /// The node never takes the temporary name locally. Anything else was
+    /// moved by another device ([`Engine::remote_moved_first`]).
+    fn moved_meanwhile(
+        &self,
+        ino: Ino,
+        fresh: &RemoteNode,
+        target: Option<&LinkId>,
+        name: &str,
+    ) -> std::result::Result<(), UploadError> {
+        if !self.found_aside(ino, fresh) {
+            return Err(self.remote_moved_first(ino, fresh, target, name));
+        }
+        tracing::debug!(ino, "the move aside took effect before; its reply was lost");
+        if name == swap_name(ino) {
+            Ok(())
+        } else {
+            Err(UploadError::Replan)
+        }
+    }
+
+    /// Whether `fresh` is the node `ino` at its own temporary name in the
+    /// folder it was known in; if so, that becomes its remote state, and
+    /// its local placement stays.
+    fn found_aside(&self, ino: Ino, fresh: &RemoteNode) -> bool {
+        let stamp = self.stamp();
+        {
+            let mut tree = self.tree.write();
+            let Some(known) = tree
+                .get(ino)
+                .and_then(|node| node.remote.clone())
+                .filter(|remote| remote.link == fresh.link_id)
+            else {
+                return false;
+            };
+            if fresh.name != swap_name(ino) || fresh.parent_link_id != known.parent_link {
+                return false;
+            }
+            tree.set_remote_at(ino, Some(known.with_placement_of(fresh)), stamp);
+        }
+        self.persist(&[ino]);
+        true
     }
 
     /// The remote node `fresh` was moved or renamed before our rename ran.
@@ -1350,9 +1868,22 @@ impl Engine {
                 self.trash_finished(*ino, link);
                 continue;
             };
+            // A wait is recorded before this batch's trash call, so a child
+            // trashed by it wakes the folder at once.
             match self.trash_check(*ino, &node).await {
-                Ok(true) => send.push((*ino, link.clone())),
-                Ok(false) => {}
+                Ok(TrashCheck::Trash) => send.push((*ino, link.clone())),
+                Ok(TrashCheck::Kept) => {}
+                // Something waits for the name meanwhile, maybe the very
+                // child the trash waits for: free the name first (D117).
+                Ok(TrashCheck::Wait { .. }) if self.name_wanted(*ino) => {
+                    tracing::debug!(ino, "trash waits; its name goes to a temporary one");
+                    let result = self.move_aside(*ino, &node).await;
+                    self.step_ended(*ino, result);
+                }
+                Ok(TrashCheck::Wait { on, reason }) => {
+                    tracing::debug!(ino, on, reason, "trash waits");
+                    self.journal.wait_on(*ino, on, reason);
+                }
                 Err(error) => self.step_failed(*ino, &error),
             }
         }
@@ -1375,6 +1906,91 @@ impl Engine {
                 Err(error) => self.step_failed(*ino, &error),
             }
         }
+    }
+
+    /// Whether a local node other than the tombstone `ino` is placed where
+    /// `ino` still is remotely, so that it waits for that name.
+    fn name_wanted(&self, ino: Ino) -> bool {
+        let tree = self.tree.read();
+        let Some(remote) = tree.get(ino).and_then(|node| node.remote.as_ref()) else {
+            return false;
+        };
+        if remote.name == swap_name(ino) {
+            return false;
+        }
+        let Some(dir) = remote
+            .parent_link
+            .as_ref()
+            .and_then(|link| tree.by_link(link))
+        else {
+            return false;
+        };
+        tree.child(dir, &remote.name)
+            .ok()
+            .flatten()
+            .is_some_and(|holder| holder != ino)
+    }
+
+    /// Renames the tombstone `ino`, whose trash waits, to a temporary name
+    /// in its folder: a node waits for its name, and may be the child the
+    /// trash waits for, so neither would go on (D117). The trash follows
+    /// under that name.
+    async fn move_aside(
+        self: &Arc<Self>,
+        ino: Ino,
+        fresh: &RemoteNode,
+    ) -> std::result::Result<(), UploadError> {
+        check_not_hot(&self.metrics, "rename");
+        let known = self
+            .tree
+            .read()
+            .get(ino)
+            .and_then(|node| node.remote.clone())
+            .filter(|remote| remote.link == fresh.link_id)
+            .ok_or(UploadError::Replan)?;
+        let name = swap_name(ino);
+        let own_name = known.name.clone();
+        let moved = (&fresh.parent_link_id, &fresh.name) != (&known.parent_link, &known.name);
+        if !moved {
+            let hash = fresh.name_hash.clone().or_else(|| known.name_hash.clone());
+            match self
+                .backend
+                .rename(&fresh.link_id, None, &name, hash.as_ref())
+                .await
+            {
+                Ok(()) => {}
+                // Gone: the next look finishes the entry.
+                Err(BackendError::NotFound) => return Err(UploadError::Replan),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        {
+            let stamp = self.stamp();
+            let mut tree = self.tree.write();
+            if tree.link_of(ino) == Some(&fresh.link_id) {
+                // Moved by another device meanwhile: the name is free.
+                let remote = if moved {
+                    known.with_placement_of(fresh)
+                } else {
+                    RemoteState {
+                        name,
+                        name_hash: None,
+                        ..known
+                    }
+                };
+                tree.set_remote_at(ino, Some(remote), stamp);
+                // The tombstone keeps the name it had remotely, which
+                // `queue` and an export show (D121).
+                if !moved
+                    && let Some(node) = tree.get_mut(ino)
+                    && !node.attached
+                {
+                    node.name = own_name;
+                }
+            }
+        }
+        self.persist(&[ino]);
+        Ok(())
     }
 
     fn trash_finished(&self, ino: Ino, link: &LinkId) {
@@ -1406,21 +2022,21 @@ impl Engine {
         Some((base, node.remote_newer))
     }
 
-    /// Whether the tombstone `ino` may be trashed: `false` when the remote
-    /// node has something the local delete did not know about, in which case
-    /// the node is kept and shown again.
+    /// Whether the tombstone `ino` may be trashed now. Kept when the remote
+    /// node has something the local delete did not know about: the node is
+    /// shown again.
     async fn trash_check(
         self: &Arc<Self>,
         ino: Ino,
         fresh: &RemoteNode,
-    ) -> std::result::Result<bool, BackendError> {
+    ) -> std::result::Result<TrashCheck, BackendError> {
         let Some((base, remote_newer)) = self.base_of(ino) else {
-            return Ok(true);
+            return Ok(TrashCheck::Trash);
         };
         let (kind, detail, local_rev) = match fresh.kind {
             NodeKind::File => {
                 if fresh.active_revision == base && !remote_newer {
-                    return Ok(true);
+                    return Ok(TrashCheck::Trash);
                 }
                 (ConflictKind::LocalDeleteRemoteEdit, None, base)
             }
@@ -1429,12 +2045,14 @@ impl Engine {
                 let kids = match self.backend.list_children(&fresh.link_id).await {
                     Ok(kids) => kids,
                     // The folder is gone; the trash call says so.
-                    Err(BackendError::NotFound) => return Ok(true),
+                    Err(BackendError::NotFound) => return Ok(TrashCheck::Trash),
                     Err(error) => return Err(error),
                 };
                 // Kids the local tree knows: moved elsewhere (wait for the
                 // move), or deleted too (their own entries trash them; wait
-                // for deleted folders).
+                // for deleted folders). A wait depends on the kid's entry,
+                // so it ends when that entry does, not after a back-off:
+                // a deep tree goes level by level (D116).
                 let known: Vec<Option<Ino>> = {
                     let tree = self.tree.read();
                     kids.iter().map(|kid| tree.by_link(&kid.link_id)).collect()
@@ -1445,25 +2063,36 @@ impl Engine {
                         foreign += 1;
                         continue;
                     };
-                    let (attached, deleted) = {
+                    let (attached, deleted, stays) = {
                         let tree = self.tree.read();
                         let node = tree.get(held);
                         (
                             node.is_some_and(|n| n.attached),
                             node.is_some_and(|n| n.deleted),
+                            in_local_only_folder(&tree, held),
                         )
                     };
+                    if stays {
+                        // Moved into a local-only folder: it never leaves
+                        // this folder remotely, and its trash would take
+                        // the file along. Kept like a child the delete
+                        // does not account for (D121).
+                        foreign += 1;
+                        continue;
+                    }
                     if attached {
-                        return Err(BackendError::Transient(
-                            "waiting for moves out of the folder".into(),
-                        ));
+                        return Ok(TrashCheck::Wait {
+                            on: held,
+                            reason: "waiting for moves out of the folder",
+                        });
                     }
                     if deleted && kid.kind == NodeKind::Folder {
                         // Its own check lists it; until then something new
                         // inside it would go to the trash with this folder.
-                        return Err(BackendError::Transient(
-                            "waiting for the folders deleted inside it".into(),
-                        ));
+                        return Ok(TrashCheck::Wait {
+                            on: held,
+                            reason: "waiting for the folders deleted inside it",
+                        });
                     }
                     let changed = match self.base_of(held) {
                         Some((base, newer)) if deleted => {
@@ -1476,7 +2105,7 @@ impl Engine {
                     }
                 }
                 if foreign == 0 {
-                    return Ok(true);
+                    return Ok(TrashCheck::Trash);
                 }
                 (
                     ConflictKind::LocalDeleteRemoteChildren,
@@ -1486,7 +2115,7 @@ impl Engine {
             }
         };
         self.keep_remote(ino, fresh, kind, detail, local_rev).await;
-        Ok(false)
+        Ok(TrashCheck::Kept)
     }
 
     /// Does not trash the tombstone `ino`: forgets it and lists the remote
@@ -1531,12 +2160,7 @@ impl Engine {
         });
     }
 
-    async fn upload(
-        self: Arc<Self>,
-        ino: Ino,
-        target: Target,
-        permit: tokio::sync::OwnedSemaphorePermit,
-    ) {
+    async fn upload(self: Arc<Self>, ino: Ino, target: Target, permit: UploadPermit) {
         let result = self.upload_now(ino, &target).await;
         // Before the outcome wakes the loop, so the next upload can start.
         drop(permit);
@@ -1572,6 +2196,21 @@ impl Engine {
             let _ = std::fs::remove_file(&snapshot.path);
         }
         result
+    }
+
+    /// The whole content of a staged file in a file of its own, as an upload
+    /// takes it (§7.4), for an export (D114): its path in the staging
+    /// directory, mode and mtime, or why it cannot be read.
+    pub(crate) async fn snapshot_content(
+        &self,
+        ino: Ino,
+    ) -> std::result::Result<(PathBuf, u32, SystemTime), String> {
+        match self.snapshot(ino).await {
+            Ok(snapshot) => Ok((snapshot.path, snapshot.mode, snapshot.mtime)),
+            Err(UploadError::Backend(error)) => Err(error.to_string()),
+            Err(UploadError::Park(reason)) => Err(reason),
+            Err(UploadError::Replan) => Err("the file changed while it was read".into()),
+        }
     }
 
     /// Materializes everything and snapshots the staging file (§7.4 1–3).
@@ -2487,6 +3126,53 @@ impl Engine {
         }
     }
 
+    /// The entries a shutdown flush waits for: those queued now and not
+    /// parked (D075). Entries queued later do not extend the wait.
+    pub fn flush_barrier(&self) -> FlushBarrier {
+        FlushBarrier {
+            inos: self.journal.unparked(),
+        }
+    }
+
+    /// Of the barrier's entries, how many are still queued and not parked,
+    /// and how many are parked now (M5.2: the start's watch).
+    pub fn barrier_queued(&self, barrier: &FlushBarrier) -> (usize, usize) {
+        self.journal.queued_among(&barrier.inos)
+    }
+
+    /// Uploads the barrier's entries without the debounce and waits until
+    /// none of them can finish any more, the connection is lost, or
+    /// `deadline` passes (D075, D091). New writes are still accepted and
+    /// uploaded as usual; back-offs and rate limits are kept.
+    pub async fn flush_to(&self, barrier: &FlushBarrier, deadline: Instant) -> FlushOutcome {
+        let start = Instant::now();
+        let ended = loop {
+            let state = self.health.state();
+            if state != crate::health::Connectivity::Online {
+                break FlushEnd::NotOnline(state);
+            }
+            let progress = self.journal.progress.notified();
+            let round = self.journal.flush_round(&barrier.inos);
+            if round.moving == 0 {
+                break FlushEnd::Reached;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break FlushEnd::Deadline;
+            }
+            tokio::select! {
+                () = progress => {}
+                () = tokio::time::sleep(SYNC_POLL.min(deadline - now)) => {}
+            }
+        };
+        FlushOutcome {
+            barrier: barrier.inos.len(),
+            left: self.journal.still_queued(&barrier.inos),
+            elapsed: start.elapsed(),
+            ended,
+        }
+    }
+
     /// `fsync` in `remote` mode: waits until the content at call time is
     /// uploaded.
     pub async fn sync_remote(&self, ino: Ino, timeout: Duration) -> Result<()> {
@@ -2577,4 +3263,373 @@ fn hash_file(path: &std::path::Path) -> std::io::Result<(u64, [u8; 20])> {
         size += n as u64;
     }
     Ok((size, hasher.finalize().into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The session's upload permits of a journal alone.
+    fn uploads() -> Arc<tokio::sync::Semaphore> {
+        Arc::new(tokio::sync::Semaphore::new(
+            UploadConfig::default().concurrency as usize,
+        ))
+    }
+
+    fn not_before(journal: &Journal, ino: Ino) -> Instant {
+        journal.state.lock().entries[&ino].not_before
+    }
+
+    fn stored_times(store: &Store) -> Vec<(Ino, i64)> {
+        store
+            .read(|conn| {
+                let mut select =
+                    conn.prepare("SELECT ino, queued_at_ms FROM queued ORDER BY ino")?;
+                select
+                    .query_map([], |row| Ok((row.get::<_, i64>(0)? as Ino, row.get(1)?)))?
+                    .collect()
+            })
+            .expect("read")
+    }
+
+    #[test]
+    fn a_carried_age_is_never_negative_nor_absurd() {
+        assert_eq!(carried_age(300_000), Duration::from_secs(300));
+        assert_eq!(carried_age(0), Duration::ZERO);
+        assert_eq!(carried_age(-5_000), Duration::ZERO, "the clock went back");
+        assert_eq!(carried_age(i64::MAX), MAX_CARRIED_AGE, "the clock jumped");
+        assert_eq!(carried_age(i64::MIN), Duration::ZERO);
+    }
+
+    /// An entry restored from the last session counts from when it was
+    /// queued; a new one counts from now (D105).
+    #[tokio::test]
+    async fn a_restored_entry_keeps_its_age() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(Store::open(&dir.path().join("state.db")).expect("store"));
+        let now_ms = unix_ms(SystemTime::now());
+        let journal = Journal::with_store(&UploadConfig::default(), Arc::clone(&store), uploads());
+        journal.restore(&[(1, now_ms - 300_000), (3, now_ms + 60_000)], now_ms);
+        journal.touch(1);
+        journal.touch(2);
+        journal.touch(3);
+        let views: BTreeMap<Ino, Duration> = journal
+            .entries()
+            .into_iter()
+            .map(|view| (view.ino, view.age))
+            .collect();
+        assert!(views[&1] >= Duration::from_secs(300), "{:?}", views[&1]);
+        assert!(views[&1] < Duration::from_secs(310));
+        assert!(views[&2] < Duration::from_secs(5), "queued now");
+        assert!(views[&3] < Duration::from_secs(5), "a time in the future");
+        let oldest = journal.oldest_age().expect("oldest");
+        assert!(oldest >= Duration::from_secs(300), "{oldest:?}");
+    }
+
+    /// Entries write their queue time once, at creation, and delete it when
+    /// they leave; restored ones keep the stored time; unused rows go.
+    #[tokio::test]
+    async fn queue_times_follow_the_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(Store::open(&dir.path().join("state.db")).expect("store"));
+        let journal = Journal::with_store(&UploadConfig::default(), Arc::clone(&store), uploads());
+        journal.touch(7);
+        journal.touch_content(7);
+        store.flush().await.expect("flush");
+        let rows = stored_times(&store);
+        assert_eq!(rows.len(), 1, "one row per entry");
+        assert_eq!(rows[0].0, 7);
+        journal.touch_content(7);
+        store.flush().await.expect("flush");
+        assert_eq!(stored_times(&store), rows, "a later change keeps it");
+        let generation = journal.state.lock().entries[&7].generation;
+        journal.done(7, generation);
+        store.flush().await.expect("flush");
+        assert!(stored_times(&store).is_empty(), "the entry left");
+
+        journal.touch(8);
+        journal.touch(9);
+        journal.forget(9);
+        store.flush().await.expect("flush");
+        assert_eq!(stored_times(&store).len(), 1, "forgotten: no row");
+
+        // A restart: 8 gets an entry again, 5 has none.
+        store.write(|conn| {
+            conn.execute("INSERT INTO queued VALUES (5, 1000)", [])
+                .map(drop)
+        });
+        store.flush().await.expect("flush");
+        let before = stored_times(&store);
+        let again = Journal::with_store(&UploadConfig::default(), Arc::clone(&store), uploads());
+        again.restore(&before, unix_ms(SystemTime::now()));
+        again.touch(8);
+        again.finish_restore();
+        store.flush().await.expect("flush");
+        let rows = stored_times(&store);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, 8);
+        assert_eq!(rows[0].1, before.iter().find(|r| r.0 == 8).expect("8").1);
+    }
+
+    /// The shutdown flush (D075) starts an entry that waits for its
+    /// debounce at once, but one in its back-off (HTTP 429 here) only when
+    /// the back-off ends; `sync` hurries both.
+    #[test]
+    fn a_flush_round_skips_the_debounce_but_keeps_a_back_off() {
+        for hurry in [false, true] {
+            let journal = Journal::new(&UploadConfig::default());
+            let now = Instant::now();
+            journal.touch_content(1);
+            journal.defer(1, now + Duration::from_secs(60), 1);
+            journal.touch_content(2);
+            assert!(journal.start(2));
+            journal.failed(
+                2,
+                &BackendError::RateLimited {
+                    retry_after: Some(Duration::from_secs(30)),
+                },
+            );
+            let round = if hurry {
+                journal.sync_round(&[1, 2])
+            } else {
+                journal.flush_round(&[1, 2])
+            };
+            assert_eq!((round.pending, round.moving), (2, 2));
+            assert!(not_before(&journal, 1) <= Instant::now(), "the debounce");
+            let ready: Vec<Ino> = journal
+                .ready(Instant::now())
+                .0
+                .iter()
+                .map(|r| r.0)
+                .collect();
+            if hurry {
+                assert_eq!(ready, [1, 2]);
+            } else {
+                assert_eq!(ready, [1]);
+                assert!(not_before(&journal, 2) >= now + Duration::from_secs(29));
+            }
+        }
+    }
+
+    /// A change after the failure ends its back-off for the flush too.
+    #[test]
+    fn a_change_ends_the_back_off_for_a_flush() {
+        let journal = Journal::new(&UploadConfig::default());
+        journal.touch_content(1);
+        assert!(journal.start(1));
+        journal.failed(
+            1,
+            &BackendError::RateLimited {
+                retry_after: Some(Duration::from_secs(30)),
+            },
+        );
+        journal.touch_content(1);
+        journal.defer(1, Instant::now() + Duration::from_secs(60), 2);
+        journal.flush_round(&[1]);
+        assert!(not_before(&journal, 1) <= Instant::now());
+    }
+
+    /// A folder's trash that waits for a child's entry (D116) is planned
+    /// again as soon as that entry finishes a step or leaves, however often
+    /// it waited; the child gets an entry if it had none. (One made by the
+    /// wait alone that leaves at once wakes nothing:
+    /// `a_dependency_that_leaves_at_once_does_not_wake_its_waiter`.)
+    #[test]
+    fn a_wait_ends_with_the_entry_it_waits_for() {
+        for finish in ["succeeded", "done", "forget"] {
+            let journal = Journal::new(&UploadConfig::default());
+            journal.touch(1);
+            if finish == "done" {
+                // The child's own change, which it then had done.
+                journal.touch(2);
+            }
+            for _ in 0..10 {
+                assert!(journal.start(1));
+                journal.wait_on(1, 2, "waiting for the folders deleted inside it");
+            }
+            assert!(not_before(&journal, 1) > Instant::now() + Duration::from_secs(60));
+            let view = journal.entries().into_iter().find(|e| e.ino == 1);
+            let view = view.expect("entry");
+            assert_eq!(view.blocked_on, Some(2));
+            assert_eq!(
+                view.last_error.as_deref(),
+                Some("waiting for the folders deleted inside it")
+            );
+            assert!(journal.inos().contains(&2), "the child is scheduled");
+            match finish {
+                "succeeded" => {
+                    assert!(journal.start(2));
+                    journal.succeeded(2);
+                }
+                "done" => journal.done(2, 1),
+                _ => journal.forget(2),
+            }
+            assert!(not_before(&journal, 1) <= Instant::now(), "{finish}");
+        }
+    }
+
+    /// A dependency that exists only because something waits for it, and
+    /// leaves at its first look without a step (a node in a local-only
+    /// folder: nothing to do, ever), does not wake what waits for it. Each
+    /// such wake made a folder's trash ask the server again, about once a
+    /// second, forever (D121).
+    #[test]
+    fn a_dependency_that_leaves_at_once_does_not_wake_its_waiter() {
+        // A folder's trash waits (D116).
+        let journal = Journal::new(&UploadConfig::default());
+        journal.touch(1);
+        assert!(journal.start(1));
+        journal.wait_on(1, 2, "waiting for moves out of the folder");
+        let after_wait = not_before(&journal, 1);
+        assert!(after_wait > Instant::now());
+        journal.done(2, 0);
+        assert!(!journal.inos().contains(&2), "the dependency left");
+        assert_eq!(not_before(&journal, 1), after_wait, "not woken");
+        // A node blocked on the remote occupant of its name.
+        let journal = Journal::new(&UploadConfig::default());
+        journal.touch(1);
+        journal.block(1, 2, 1);
+        let after_block = not_before(&journal, 1);
+        assert!(after_block > Instant::now());
+        journal.done(2, 0);
+        assert_eq!(not_before(&journal, 1), after_block, "not woken");
+    }
+
+    /// Waits are not failed attempts (D121): after many waits the first
+    /// permanent error does not park the entry at once, and its first
+    /// transient one backs off from the start.
+    #[test]
+    fn waits_are_not_failed_attempts() {
+        let journal = Journal::new(&UploadConfig::default());
+        journal.touch(1);
+        for _ in 0..=PARK_AFTER {
+            assert!(journal.start(1));
+            journal.wait_on(1, 2, "waiting for moves out of the folder");
+        }
+        assert!(journal.start(1));
+        assert!(
+            !journal.failed(1, &BackendError::Other("refused".into())),
+            "the first permanent error does not park"
+        );
+        assert!(journal.parked().is_empty());
+        assert!(journal.start(1));
+        journal.failed(1, &BackendError::Transient("timeout".into()));
+        assert!(
+            not_before(&journal, 1) < Instant::now() + Duration::from_secs(5),
+            "the second failure backs off about 2 s"
+        );
+    }
+
+    /// A change, `retry` or force made while the check ran is not undone by
+    /// the wait's back-off (D121).
+    #[test]
+    fn a_wait_keeps_a_change_made_while_the_check_ran() {
+        for meanwhile in ["change", "retry", "force"] {
+            let journal = Journal::new(&UploadConfig::default());
+            journal.touch(1);
+            assert!(journal.start(1));
+            match meanwhile {
+                "change" => journal.touch(1),
+                "retry" => journal.retry(&[1]),
+                _ => journal.force(1),
+            }
+            journal.wait_on(1, 2, "waiting for moves out of the folder");
+            assert!(not_before(&journal, 1) <= Instant::now(), "{meanwhile}");
+        }
+    }
+
+    const HOLD: &str = "no write access";
+
+    /// Entries made after a tree's hold (D114) are held too: a write that
+    /// passed the gate just before it closed, and a dependency its plan
+    /// finds. A step that ran at the hold and found a wait starts no other
+    /// step either. Nothing starts until the hold is lifted (D121).
+    #[test]
+    fn entries_made_after_a_hold_are_held() {
+        let journal = Journal::new(&UploadConfig::default());
+        journal.touch(1);
+        assert!(journal.start(1));
+        journal.hold_all(HOLD);
+        journal.wait_on(1, 2, "waiting for the folders deleted inside it");
+        journal.touch(3);
+        journal.block(3, 4, 1);
+        for ino in [1, 2, 3, 4] {
+            assert!(!journal.start(ino), "{ino} is held");
+        }
+        let held: Vec<Ino> = journal
+            .parked()
+            .into_iter()
+            .filter(|(_, reason)| reason == HOLD)
+            .map(|(ino, _)| ino)
+            .collect();
+        assert_eq!(held, [1, 3, 4]);
+        assert_eq!(journal.release_held(HOLD), 3);
+        for ino in [1, 3, 4] {
+            assert!(journal.start(ino), "{ino} is released");
+        }
+    }
+
+    /// A hold keeps the reason of an entry parked for something else, and
+    /// lifting it does not retry that entry (D121).
+    #[test]
+    fn a_hold_keeps_other_park_reasons() {
+        let journal = Journal::new(&UploadConfig::default());
+        journal.touch(1);
+        assert!(journal.start(1));
+        assert!(journal.failed(1, &BackendError::QuotaExceeded));
+        journal.touch(2);
+        assert_eq!(journal.hold_all(HOLD), 2);
+        let quota = BackendError::QuotaExceeded.to_string();
+        assert_eq!(journal.parked(), [(1, quota.clone()), (2, HOLD.to_owned())]);
+        // A local change lifts the automatic park, not the hold.
+        journal.touch_content(1);
+        assert_eq!(
+            journal.parked(),
+            [(1, HOLD.to_owned()), (2, HOLD.to_owned())]
+        );
+        assert_eq!(journal.release_held(HOLD), 2);
+        assert!(journal.parked().is_empty());
+
+        // Without a change in between, the quota park outlives the hold.
+        let journal = Journal::new(&UploadConfig::default());
+        journal.touch(1);
+        assert!(journal.start(1));
+        assert!(journal.failed(1, &BackendError::QuotaExceeded));
+        journal.hold_all(HOLD);
+        assert_eq!(journal.release_held(HOLD), 0);
+        assert_eq!(journal.parked(), [(1, quota)]);
+    }
+
+    /// An entry whose step was running at the hold is not shown as held
+    /// once that step succeeded: it is planned again, and held only if it
+    /// needs another step (D121).
+    #[test]
+    fn an_entry_running_at_a_hold_is_not_held_after_its_step_succeeded() {
+        let journal = Journal::new(&UploadConfig::default());
+        journal.touch(1);
+        assert!(journal.start(1));
+        journal.hold_all(HOLD);
+        journal.succeeded(1);
+        assert!(journal.parked().is_empty(), "{:?}", journal.parked());
+        let ready: Vec<Ino> = journal
+            .ready(Instant::now())
+            .0
+            .iter()
+            .map(|r| r.0)
+            .collect();
+        assert_eq!(ready, [1], "planned again");
+        assert!(!journal.start(1), "another step waits for the hold");
+        assert_eq!(journal.parked(), [(1, HOLD.to_owned())]);
+    }
+
+    /// Parked entries are not part of a barrier.
+    #[test]
+    fn parked_entries_are_left_out_of_a_barrier() {
+        let journal = Journal::new(&UploadConfig::default());
+        journal.touch(1);
+        journal.touch(2);
+        journal.park_by_user(&[2]);
+        assert_eq!(journal.unparked(), [1]);
+        assert_eq!(journal.still_queued(&[1, 2, 3]), 2);
+    }
 }

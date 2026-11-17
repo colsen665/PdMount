@@ -34,6 +34,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("0001.sql"),
     include_str!("0002.sql"),
     include_str!("0003.sql"),
+    include_str!("0004.sql"),
 ];
 /// The sync thread checkpoints the WAL once no commit came for
 /// [`CHECKPOINT_IDLE`], or after [`CHECKPOINT_WRITES`] writes under steady
@@ -127,7 +128,7 @@ impl Store {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "wal_autocheckpoint", 0)?;
         conn.pragma_update(None, "foreign_keys", "OFF")?;
-        // The writes' `prepare_cached` statements (`rows.rs`, `cache.rs`: 10)
+        // The writes' `prepare_cached` statements (`rows.rs`, `cache/`: 10)
         // fit SQLite's default statement cache of 16 per connection.
         migrate(&mut conn, path)?;
 
@@ -299,6 +300,20 @@ impl Drop for Store {
             let _ = syncer.join();
         }
     }
+}
+
+/// The drive root a profile's database was made for (`meta.root_link`), read
+/// without creating or migrating anything: `None` when there is no database
+/// or no root yet (a first mount that did not finish). A mount that may
+/// start without the drive needs it (D042, D106).
+pub fn stored_root(path: &Path) -> Option<String> {
+    if !path.exists() {
+        return None;
+    }
+    let conn =
+        Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    conn.busy_timeout(Duration::from_secs(5)).ok()?;
+    meta_get(&conn, "root_link").ok().flatten()
 }
 
 /// Reads a `meta` value stored as text.
@@ -584,6 +599,23 @@ mod tests {
         assert_eq!(store.meta_get("k").expect("read").as_deref(), Some("v"));
     }
 
+    /// A first mount that did not finish leaves a database without a root:
+    /// that profile has not mounted before (D106).
+    #[tokio::test]
+    async fn the_stored_root_is_read_without_opening_the_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.db");
+        assert_eq!(stored_root(&path), None);
+        assert!(!path.exists(), "nothing is created");
+        let store = Store::open(&path).expect("open");
+        assert_eq!(stored_root(&path), None);
+        store
+            .write_durable(|tx| meta_set(tx, "root_link", "root-1"))
+            .await
+            .expect("write");
+        assert_eq!(stored_root(&path).as_deref(), Some("root-1"));
+    }
+
     #[tokio::test]
     async fn a_wal_sync_waits_for_another_file_s_sync() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -833,7 +865,31 @@ mod tests {
                 Ok((version, detail, other, indexes))
             })
             .expect("read");
-        assert_eq!((version, detail, other, indexes), (3, None, None, 1));
+        assert_eq!((version, detail, other, indexes), (4, None, None, 1));
+    }
+
+    #[test]
+    fn migration_0004_adds_the_queue_times() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).expect("open");
+        for sql in &MIGRATIONS[..3] {
+            conn.execute_batch(sql).expect("migration");
+        }
+        conn.pragma_update(None, "user_version", 3)
+            .expect("version");
+        drop(conn);
+        let store = Store::open(&path).expect("migrate");
+        let (version, rows): (i64, i64) = store
+            .read(|conn| {
+                conn.execute("INSERT INTO queued VALUES (5, 1000)", [])?;
+                Ok((
+                    conn.pragma_query_value(None, "user_version", |row| row.get(0))?,
+                    conn.query_row("SELECT COUNT(*) FROM queued", [], |row| row.get(0))?,
+                ))
+            })
+            .expect("read");
+        assert_eq!((version, rows), (4, 1));
     }
 
     #[test]

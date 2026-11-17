@@ -162,7 +162,11 @@ pub async fn store_login(
 ) -> anyhow::Result<LoggedIn> {
     let credentials = Credentials::new(paths);
     match persist(&credentials, &session).await {
-        Ok(storage) => Ok(LoggedIn { session, storage }),
+        Ok(storage) => Ok(LoggedIn {
+            session,
+            storage,
+            unsaved: None,
+        }),
         Err(error) => {
             // A session that cannot be stored would stay open on the server.
             end_unstored(session).await;
@@ -181,6 +185,15 @@ pub async fn end_unstored(mut session: ProtonAPISession) {
 pub struct LoggedIn {
     pub session: ProtonAPISession,
     pub storage: Storage,
+    /// Why the session's current tokens are not stored (D106 amended): the
+    /// server accepted them, but the write failed. The daemon's token saver
+    /// writes them later.
+    pub unsaved: Option<String>,
+}
+
+/// The `status` line of tokens that are not stored yet (D106 amended).
+pub fn unsaved_text(reason: &str) -> String {
+    format!("not yet saved to the keyring ({reason})")
 }
 
 async fn persist(
@@ -215,6 +228,16 @@ impl TokenSaver {
         Self { saved }
     }
 
+    /// For a session that resumed or signed in: its tokens count as stored
+    /// unless the write failed ([`LoggedIn::unsaved`], D106 amended), in
+    /// which case the next save writes them.
+    pub async fn of(logged_in: &LoggedIn) -> Self {
+        match logged_in.unsaved {
+            Some(_) => Self { saved: None },
+            None => Self::new(&logged_in.session).await,
+        }
+    }
+
     /// The tokens as they are now, to hand to [`TokenSaver::save`].
     pub async fn snapshot(
         session: &ProtonAPISession,
@@ -229,12 +252,28 @@ impl TokenSaver {
         paths: &ProfilePaths,
         stored: proton_drive_sdk::proton_sdk_rs2::ser::StoredCredentials,
     ) -> anyhow::Result<()> {
+        let paths = paths.clone();
+        self.save_with(stored, move |stored| {
+            Credentials::new(&paths).save(stored).map(drop)
+        })
+        .await
+    }
+
+    /// [`TokenSaver::save`] with `write` storing the session.
+    async fn save_with(
+        &mut self,
+        stored: proton_drive_sdk::proton_sdk_rs2::ser::StoredCredentials,
+        write: impl FnOnce(
+            &proton_drive_sdk::proton_sdk_rs2::ser::StoredCredentials,
+        ) -> anyhow::Result<()>
+        + Send
+        + 'static,
+    ) -> anyhow::Result<()> {
         let json = serde_json::to_string(&stored)?;
         if self.saved.as_ref() == Some(&json) {
             return Ok(());
         }
-        let paths = paths.clone();
-        tokio::task::spawn_blocking(move || Credentials::new(&paths).save(&stored))
+        tokio::task::spawn_blocking(move || write(&stored))
             .await
             .context("the token store task failed")??;
         self.saved = Some(json);
@@ -288,6 +327,27 @@ pub fn drive_client(
     Ok(limits.apply(ProtonDriveClient::new(session, Some(device.client_uid()))?))
 }
 
+/// The Photos clients of a session (M5.13, D113), with this device's
+/// client uid and the transfer limits; `None` (logged) when they cannot be
+/// made, which only a Photos mount notices.
+pub fn photos_clients(
+    session: &ProtonAPISession,
+    device: &DeviceIdentity,
+    limits: TransferLimits,
+) -> Option<pdmount_backend::proton::PhotosClients> {
+    match pdmount_backend::proton::PhotosClients::new(
+        session,
+        Some(device.client_uid()),
+        |client| limits.apply(client),
+    ) {
+        Ok(photos) => Some(photos),
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "cannot make the Photos clients");
+            None
+        }
+    }
+}
+
 /// Drive client and backend of a signed-in session.
 pub async fn proton_backend(
     logged_in: &LoggedIn,
@@ -295,12 +355,14 @@ pub async fn proton_backend(
     limits: TransferLimits,
 ) -> anyhow::Result<ProtonBackend> {
     let client = drive_client(&logged_in.session, device, limits)?;
-    Ok(ProtonBackend::new(
+    let backend = ProtonBackend::new(
         client,
         logged_in.session.token_credential.clone(),
         logged_in.session.username.clone(),
     )
-    .await?)
+    .await?;
+    backend.set_photos(photos_clients(&logged_in.session, device, limits));
+    Ok(backend)
 }
 
 /// Where the drive's volume and root were last seen (`proton-root.json`).
@@ -320,9 +382,27 @@ impl KnownRoot {
         }
     }
 
+    /// The account and root, as the backend's `account` reports them.
+    pub fn account(&self) -> pdmount_backend::AccountInfo {
+        pdmount_backend::AccountInfo {
+            username: self.username.clone(),
+            root: pdmount_backend::LinkId::new(self.root.clone()),
+        }
+    }
+
     pub fn load(paths: &ProfilePaths) -> Option<Self> {
         let text = std::fs::read_to_string(paths.proton_root_file()).ok()?;
         serde_json::from_str(&text).ok()
+    }
+
+    /// The stored root of a profile that has mounted before: its local state
+    /// was made for this root (`root_link` in `state.db`), so the engine can
+    /// open it without the drive (D042, D106). A first mount that did not
+    /// finish leaves `state.db` without a root, which does not count.
+    pub fn mounted_before(paths: &ProfilePaths) -> Option<Self> {
+        let known = Self::load(paths)?;
+        let stored = pdmount_core::store::stored_root(&paths.state_db())?;
+        (stored == known.root).then_some(known)
     }
 
     /// Writes the file when it is missing or differs.
@@ -347,13 +427,15 @@ pub fn proton_backend_offline(
     limits: TransferLimits,
 ) -> anyhow::Result<ProtonBackend> {
     let client = drive_client(&logged_in.session, device, limits)?;
-    Ok(ProtonBackend::with_root(
+    let backend = ProtonBackend::with_root(
         client,
         logged_in.session.token_credential.clone(),
         known.username.clone(),
         known.volume.clone(),
         pdmount_backend::LinkId::new(known.root.clone()),
-    ))
+    );
+    backend.set_photos(photos_clients(&logged_in.session, device, limits));
+    Ok(backend)
 }
 
 /// Outcome of resuming the stored session.
@@ -376,31 +458,75 @@ pub enum Resumed {
 }
 
 /// Resumes the stored session, refreshing tokens if needed, and stores the
-/// latest tokens.
+/// latest tokens when they changed. A failed write leaves the session active
+/// with [`LoggedIn::unsaved`] set (D106 amended): `status` shows it, the
+/// daemon writes the tokens later, and a one-off command (`status`, `login`,
+/// `trash empty`) goes on, since the session works.
 pub async fn resume(paths: &ProfilePaths) -> anyhow::Result<Resumed> {
+    resume_with(paths, false).await
+}
+
+/// [`resume`] for the mount daemon: a keyring that does not answer is an
+/// error in allow mode too, never "not logged in" (D106).
+pub async fn resume_strict(paths: &ProfilePaths) -> anyhow::Result<Resumed> {
+    resume_with(paths, true).await
+}
+
+async fn resume_with(paths: &ProfilePaths, strict: bool) -> anyhow::Result<Resumed> {
     let credentials = Credentials::new(paths);
-    let Some((stored, storage)) = credentials.load()? else {
+    let loaded = if strict {
+        credentials.load_strict()?
+    } else {
+        credentials.load()?
+    };
+    let Some((stored, storage)) = loaded else {
         return Ok(Resumed::NotLoggedIn);
     };
+    // The session as loaded, to tell whether the check changed its tokens.
+    let loaded = serde_json::to_string(&stored)?;
     let options = client_options(paths, &credentials)?;
     let mut session = ProtonAPISession::from_stored_credentials(stored, app_version(), options);
+    let unchecked = |session| LoggedIn {
+        session,
+        storage,
+        unsaved: None,
+    };
     if let Err(error) = session.ensure_authenticated().await {
         if is_session_rejected(&error) {
             return Ok(Resumed::NeedsLogin {
-                logged_in: Box::new(LoggedIn { session, storage }),
+                logged_in: Box::new(unchecked(session)),
                 error,
             });
         }
         if pdmount_backend::proton::is_connection_error(&error) {
             return Ok(Resumed::Offline {
-                logged_in: Box::new(LoggedIn { session, storage }),
+                logged_in: Box::new(unchecked(session)),
                 error,
             });
         }
         return Err(error.context("cannot reach Proton to check the session"));
     }
-    let storage = persist(&credentials, &session).await?;
-    Ok(Resumed::Active(Box::new(LoggedIn { session, storage })))
+    // The server accepted the session: the tokens are written only when the
+    // check changed them, and a failed write does not fail the resume (D106
+    // amended, rules 1 and 2).
+    let current = current_credentials(&session).await?;
+    let (storage, unsaved) = match credentials.save_changed(&loaded, &current) {
+        credentials::SessionWrite::Unchanged => (storage, None),
+        credentials::SessionWrite::Saved(storage) => (storage, None),
+        credentials::SessionWrite::Failed(reason) => {
+            tracing::warn!(
+                reason,
+                "the server accepted the session, but its new tokens could not be stored; \
+                 they are kept in memory"
+            );
+            (storage, Some(reason))
+        }
+    };
+    Ok(Resumed::Active(Box::new(LoggedIn {
+        session,
+        storage,
+        unsaved,
+    })))
 }
 
 /// Whether the server definitively rejected the stored session.
@@ -478,6 +604,57 @@ mod tests {
         assert!(needs_login(&locked));
         assert!(!needs_login(&anyhow::Error::from(BackendError::NotFound)));
         assert!(!needs_login(&anyhow::anyhow!("other")));
+    }
+
+    fn stored(access: &str) -> proton_drive_sdk::proton_sdk_rs2::ser::StoredCredentials {
+        proton_drive_sdk::proton_sdk_rs2::ser::StoredCredentials::new(
+            "sid".into(),
+            "user@example.test".into(),
+            "uid".into(),
+            access.into(),
+            "refresh".into(),
+            vec!["full".into()],
+            false,
+            proton_drive_sdk::proton_sdk_rs2::PasswordMode::Single,
+        )
+    }
+
+    /// D106 amended, rule 2: tokens a resume could not store are written by
+    /// the saver's next save; a failed one stays pending, a stored one is
+    /// not written again.
+    #[tokio::test]
+    async fn the_saver_writes_tokens_a_resume_could_not_store() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let writes = Arc::new(AtomicUsize::new(0));
+        let write = |fail: bool| {
+            let writes = Arc::clone(&writes);
+            move |_: &proton_drive_sdk::proton_sdk_rs2::ser::StoredCredentials| {
+                writes.fetch_add(1, Ordering::SeqCst);
+                if fail {
+                    anyhow::bail!("no reply")
+                }
+                Ok(())
+            }
+        };
+        let mut saver = TokenSaver { saved: None };
+        saver
+            .save_with(stored("a"), write(true))
+            .await
+            .expect_err("the keyring failed");
+        saver
+            .save_with(stored("a"), write(false))
+            .await
+            .expect("written");
+        saver
+            .save_with(stored("a"), write(false))
+            .await
+            .expect("unchanged");
+        assert_eq!(writes.load(Ordering::SeqCst), 2);
+        saver
+            .save_with(stored("b"), write(false))
+            .await
+            .expect("rotated");
+        assert_eq!(writes.load(Ordering::SeqCst), 3);
     }
 
     #[test]

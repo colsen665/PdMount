@@ -96,22 +96,27 @@ pub struct SyncOutcome {
 }
 
 /// Where an entry is: the node's path or, for a tombstone, where the remote
-/// file it is about to trash lives.
-fn entry_path(tree: &Tree, ino: Ino) -> String {
+/// file it is about to trash lives, under the name it had before it moved
+/// aside to a temporary one (D117, D121).
+pub(super) fn entry_path(tree: &Tree, ino: Ino) -> String {
     if let Some(path) = tree.path(ino) {
         return path;
     }
-    let remote_place = tree
-        .get(ino)
-        .and_then(|node| node.remote.as_ref())
-        .and_then(|remote| {
-            let parent = tree.by_link(remote.parent_link.as_ref()?)?;
-            Some(format!(
-                "{}/{}",
-                entry_path(tree, parent).trim_end_matches('/'),
-                remote.name
-            ))
-        });
+    let remote_place = tree.get(ino).and_then(|node| {
+        let remote = node.remote.as_ref()?;
+        let parent = tree.by_link(remote.parent_link.as_ref()?)?;
+        let aside = remote.name == crate::journal::swap_name(ino);
+        let name = if aside && !node.name.is_empty() {
+            &node.name
+        } else {
+            &remote.name
+        };
+        Some(format!(
+            "{}/{}",
+            entry_path(tree, parent).trim_end_matches('/'),
+            name
+        ))
+    });
     remote_place.unwrap_or_else(|| format!("(inode {ino})"))
 }
 
@@ -139,7 +144,7 @@ fn entry_within(tree: &Tree, mut ino: Ino, root: Ino) -> bool {
     false
 }
 
-fn kind_of(tree: &Tree, ino: Ino) -> QueueKind {
+pub(super) fn kind_of(tree: &Tree, ino: Ino) -> QueueKind {
     let Some(node) = tree.get(ino) else {
         return QueueKind::Nothing;
     };
@@ -552,7 +557,7 @@ impl Engine {
                         return Ok(());
                     };
                     // The name is a step of the executor, not a place to go back to.
-                    if remote.name.starts_with(".pdmount-swap-") {
+                    if remote.name.starts_with(crate::journal::SWAP_PREFIX) {
                         return Err("it is in the middle of a name swap; retry later".to_owned());
                     }
                     let Some(moved) = tree.adopt_remote_placement(ino) else {

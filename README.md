@@ -8,6 +8,9 @@ A FUSE filesystem for Linux that mounts Proton Drive "My Files" read-write. It i
 
 **Status:** see [TODO.md](TODO.md).
 
+**Install:** each milestone has a release on the project's GitHub Releases page with a `.tar.gz` for x86-64 Linux and its
+checksum; the steps, or building from source, are in [docs/user-guide.md](docs/user-guide.md#build-and-install).
+
 | Document | Content |
 |---|---|
 | [docs/user-guide.md](docs/user-guide.md) | Installing and using PdMount: mount, autostart, access rules, conflicts, queue, cache, troubleshooting |

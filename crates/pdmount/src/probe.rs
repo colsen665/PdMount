@@ -424,7 +424,7 @@ async fn probe() -> anyhow::Result<()> {
     let profile_b = std::env::var("PROBE_PROFILE_B").unwrap_or_else(|_| "second".into());
 
     let (paths_a, session_a) = signed_in(&profile_a).await?;
-    let mut saver_a = TokenSaver::new(&session_a.session).await;
+    let mut saver_a = TokenSaver::of(&session_a).await;
     let a = dev("A", &session_a, "pdmount-q1probe-a".into()).await?;
     // A after a restart: same client UID, its own client (and transfer slot).
     let a2 = dev("A2", &session_a, "pdmount-q1probe-a".into()).await?;
@@ -444,7 +444,7 @@ async fn probe() -> anyhow::Result<()> {
             }
             (
                 dev("B", session_b, "pdmount-q1probe-b".into()).await?,
-                Some(TokenSaver::new(&session_b.session).await),
+                Some(TokenSaver::of(session_b).await),
             )
         }
     };

@@ -12,17 +12,29 @@
 //! so a node moved between two listed directories keeps its inode and its
 //! listed subtree.
 //!
+//! The polling itself is the [`crate::poller`]'s: one poller per volume
+//! hands each page to every tree on the volume (D110), and an engine
+//! without a daemon's pollers runs one of its own with itself as the only
+//! tree.
+//!
 //! A `refresh` page, or a profile without a cursor, starts a refresh
 //! (§9.4): a cursor is taken, events are followed from it at once, and a
-//! background task lists every listed directory again (D025), paced. Only
+//! background task lists every listed directory again (D027), paced. Only
 //! when that is done is a cursor stored again; a crash before that finds
 //! the old cursor, and the next mount refreshes again. A refresh asked for
 //! while one runs makes it run once more, because listings done before the
-//! new cursor may have missed changes.
+//! new cursor may have missed changes. The refresh task is one of the
+//! engine's background tasks, so a shutdown ends it; it also ends, without
+//! storing a cursor, when the tree's root is gone or refused (a revoked
+//! share), which the daemon handles by removing the tree (D120).
+//!
+//! The steps of a sync (a poll, a `get_nodes` batch, a listing) take turns
+//! of the session's gate that wait for user requests at most
+//! [`EVENT_PATIENCE`] ([`crate::gate::Gate::background_patient`]), so a
+//! steady load in one tree cannot stop every tree's sync (D120).
 
 use crate::engine::{Engine, MY_FILES_VOLUME};
 use crate::errors::{CoreError, Result};
-use crate::health::Connectivity;
 use crate::metrics::check_not_hot;
 use crate::store::Store;
 use crate::vfs::Ino;
@@ -32,20 +44,38 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Multiples of the poll interval after consecutive failures
-/// (`cs/client/js/src/internal/events/eventManager.ts:4`).
-const BACKOFF_STEPS: [u32; 7] = [1, 1, 2, 3, 5, 8, 13];
-const JITTER: Duration = Duration::from_secs(1);
 /// Links resolved per `get_nodes` call.
 pub(crate) const NODE_BATCH: usize = 100;
 /// Wait before listing again after a failed refresh.
 const REFRESH_RETRY: Duration = Duration::from_secs(30);
+/// How long a step of the event sync waits for user requests to end before
+/// it takes its turn anyway (D120): the sync is not a guess, and remote
+/// changes must arrive under any load (D037).
+pub(crate) const EVENT_PATIENCE: Duration = Duration::from_secs(2);
 
-/// Whether a refresh runs, and whether it must run once more.
+/// Whether a refresh runs, whether it must run once more, and whether one
+/// is owed.
 #[derive(Debug, Default)]
 pub(crate) struct RefreshState {
+    /// The refresh task runs.
     running: bool,
+    /// It must run once more: a refresh was asked for while it ran.
     again: bool,
+    /// A refresh was asked for and has not finished: no cursor is stored.
+    owed: bool,
+    /// The engine stops: no refresh task starts any more.
+    stopped: bool,
+}
+
+/// How a pass over the listed directories ended
+/// ([`Engine::revalidate_pass`]).
+pub(crate) enum Revalidated {
+    Done,
+    /// Some listings failed; the last error.
+    Failed(CoreError),
+    /// The tree's root is gone or refused (a revoked share): the pass
+    /// stopped at its first listing.
+    RootGone(CoreError),
 }
 
 /// Stores the cursor of My Files.
@@ -92,44 +122,18 @@ fn listing_order(dirs: Vec<Ino>, moves: &[(Ino, Ino)]) -> Vec<Ino> {
     order
 }
 
-/// How long to wait after `failures` failed polls in a row (0 = the first).
-fn backoff(interval: Duration, failures: usize, error: &CoreError) -> Duration {
-    let step = BACKOFF_STEPS[failures.min(BACKOFF_STEPS.len() - 1)];
-    let delay = interval * step + JITTER.mul_f64(rand::random::<f64>());
-    match error {
-        CoreError::Backend(BackendError::RateLimited {
-            retry_after: Some(after),
-        }) => delay.max(*after),
-        _ => delay,
-    }
-}
-
 impl Engine {
-    /// The event task: follows the stream until the engine stops.
+    /// The event task of an engine that polls its own volume: a
+    /// [`Poller`](crate::poller::Poller) with this one tree, so it runs the
+    /// same code as the pollers of a daemon with several trees (D110).
     pub(crate) async fn run_events(self: Arc<Self>) {
-        let interval = self.config.sync.poll_interval.0;
-        let mut failures = 0;
-        loop {
-            // After a lost connection the first poll comes at once.
-            self.health.wait_online().await;
-            let delay = match self.sync_events().await {
-                Ok(()) => {
-                    failures = 0;
-                    interval
-                }
-                Err(_) if self.health.state() != Connectivity::Online => {
-                    failures = 0;
-                    continue;
-                }
-                Err(error) => {
-                    let delay = backoff(interval, failures, &error);
-                    failures += 1;
-                    tracing::warn!(%error, ?delay, failures, "event sync failed");
-                    delay
-                }
-            };
-            tokio::time::sleep(delay).await;
-        }
+        let volume = crate::poller::Poller::new(
+            MY_FILES_VOLUME,
+            true,
+            Arc::new(crate::poller::Cadence::default()),
+        );
+        volume.add(self);
+        volume.run().await;
     }
 
     /// Applies the events waiting on the server, page by page, until none
@@ -137,42 +141,15 @@ impl Engine {
     /// to the store after the rows a page changed, so a crash never stores
     /// it without them. While a refresh runs it is not stored at all.
     pub async fn sync_events(self: &Arc<Self>) -> Result<()> {
-        let mut cursor = self.event_cursor.lock().await;
-        let mut since = match cursor.clone() {
-            Some(since) => since,
-            None => {
-                let fresh = self.start_refresh().await?;
-                *cursor = Some(fresh.clone());
-                fresh
-            }
-        };
-        loop {
-            let page = {
-                let _turn = self.gate.background().await;
-                check_not_hot(&self.metrics, "poll_events");
-                self.backend.poll_events(&since).await?
-            };
-            if page.refresh {
-                tracing::info!("the server asked for a refresh; listing every listed directory");
-                since = self.start_refresh().await?;
-                *cursor = Some(since.clone());
-                continue;
-            }
-            if !page.events.is_empty() {
-                self.apply_events(&page.events).await?;
-            }
-            if page.next != since {
-                if !self.events_refreshing() {
-                    self.store_cursor(&page.next);
-                }
-                since = page.next;
-                *cursor = Some(since.clone());
-            }
-            if !page.more {
-                *self.last_poll.lock() = Some(std::time::Instant::now());
-                return Ok(());
-            }
-        }
+        crate::poller::sync_trees(std::slice::from_ref(self)).await
+    }
+
+    /// The pass of [`Self::sync_events`] is done: the stream was read to its
+    /// end.
+    pub(crate) fn events_caught_up(&self) {
+        *self.last_poll.lock() = Some(std::time::Instant::now());
+        // The pending markers of other devices (D076).
+        self.markers.scan.notify_one();
     }
 
     /// How long ago the event stream was last read to its end (`status`).
@@ -180,42 +157,77 @@ impl Engine {
         self.last_poll.lock().map(|at| at.elapsed())
     }
 
-    /// Whether a refresh is listing directories again.
+    /// Whether a refresh is listing directories again, or is owed: no
+    /// cursor is stored meanwhile.
     pub fn events_refreshing(&self) -> bool {
-        self.refresh.lock().running
+        self.refresh.lock().owed
     }
 
-    /// Takes a fresh cursor and starts (or repeats) the refresh task.
-    async fn start_refresh(self: &Arc<Self>) -> Result<EventId> {
-        let fresh = {
-            let _turn = self.gate.background().await;
-            check_not_hot(&self.metrics, "latest_event_id");
-            self.backend.latest_event_id().await?
-        };
+    /// A cursor at the end of the stream, for a refresh (§9.4).
+    pub(crate) async fn fresh_cursor(&self) -> Result<EventId> {
+        let _turn = self.gate.background_patient(EVENT_PATIENCE).await;
+        check_not_hot(&self.metrics, "latest_event_id");
+        Ok(self.backend.latest_event_id().await?)
+    }
+
+    /// Starts the refresh task, or makes the running one go once more.
+    /// Called with the cursor lock held, which the task takes to finish.
+    /// After [`Engine::stop_refresh`] none starts; the refresh stays owed,
+    /// so the next mount refreshes.
+    pub(crate) fn begin_refresh(self: &Arc<Self>) {
         let start = {
             let mut state = self.refresh.lock();
+            state.owed = true;
             state.again = state.running;
-            !std::mem::replace(&mut state.running, true)
+            !state.stopped && !std::mem::replace(&mut state.running, true)
         };
         if start {
             let this = Arc::clone(self);
-            self.runtime().spawn(async move { this.refresh().await });
+            let task = self.runtime().spawn(async move { this.refresh().await });
+            let abort = task.abort_handle();
+            self.keep_task(task);
+            // A shutdown sets `stopped` before it aborts the background
+            // tasks, so one that aborted them before the push above is seen
+            // here.
+            if self.refresh.lock().stopped {
+                abort.abort();
+            }
         }
-        Ok(fresh)
+    }
+
+    /// No refresh task starts from now on: the first step of a shutdown,
+    /// which then aborts the running one with the other background tasks.
+    pub(crate) fn stop_refresh(&self) {
+        self.refresh.lock().stopped = true;
     }
 
     /// Lists every listed directory again until a pass succeeds with no
-    /// refresh asked for meanwhile, then stores the cursor reached.
+    /// refresh asked for meanwhile, then stores the cursor reached. Ends
+    /// without one when the tree's root is gone or refused.
     async fn refresh(self: Arc<Self>) {
         loop {
-            if let Err(error) = self.revalidate().await {
+            let failed = match self.revalidate_pass().await {
+                Revalidated::Done => None,
+                Revalidated::Failed(error) => Some(error),
+                Revalidated::RootGone(error) => {
+                    // The daemon removes such a tree (a revoked share,
+                    // D112); listing it again every 30 s would only keep the
+                    // engine alive. The refresh stays owed.
+                    tracing::warn!(%error, "the tree's root is gone or refused; the refresh ends");
+                    let mut state = self.refresh.lock();
+                    state.running = false;
+                    state.again = false;
+                    return;
+                }
+            };
+            if let Some(error) = failed {
                 tracing::warn!(%error, "refresh incomplete; listing again later");
                 tokio::time::sleep(REFRESH_RETRY).await;
                 self.health.wait_online().await;
                 continue;
             }
-            // Refreshes start only under the cursor lock (`sync_events`),
-            // so none can be asked for between this check and the end.
+            // Refreshes start only under the cursor lock (the poller's
+            // pass), so none can be asked for between this check and the end.
             let cursor = self.event_cursor.lock().await;
             {
                 let mut state = self.refresh.lock();
@@ -223,6 +235,7 @@ impl Engine {
                     continue;
                 }
                 state.running = false;
+                state.owed = false;
             }
             if let Some(cursor) = cursor.as_ref() {
                 self.store_cursor(cursor);
@@ -232,13 +245,13 @@ impl Engine {
         }
     }
 
-    fn store_cursor(&self, cursor: &EventId) {
+    pub(crate) fn store_cursor(&self, cursor: &EventId) {
         let cursor = cursor.clone();
         self.store.write(move |conn| write_cursor(conn, &cursor));
     }
 
     /// Lists again the listed directories that a page of events changes.
-    async fn apply_events(self: &Arc<Self>, events: &[RemoteEvent]) -> Result<()> {
+    pub(crate) async fn apply_events(self: &Arc<Self>, events: &[RemoteEvent]) -> Result<()> {
         // Only links the tree knows, or that appear in a listed directory;
         // the rest is fetched fresh when its directory is first listed.
         let links: Vec<LinkId> = {
@@ -261,7 +274,7 @@ impl Engine {
         let mut nodes = Vec::with_capacity(links.len());
         let mut echoes = 0;
         for batch in links.chunks(NODE_BATCH) {
-            let _turn = self.gate.background().await;
+            let _turn = self.gate.background_patient(EVENT_PATIENCE).await;
             check_not_hot(&self.metrics, "get_nodes");
             nodes.extend(self.backend.get_nodes(batch).await?);
         }
@@ -324,7 +337,7 @@ impl Engine {
             "event page applied"
         );
         for dir in dirs {
-            let _turn = self.gate.background().await;
+            let _turn = self.gate.background_patient(EVENT_PATIENCE).await;
             match self.list(dir).await {
                 // Removed by an earlier listing of this page, or trashed on
                 // the drive (the server no longer lists a trashed folder).
@@ -374,19 +387,5 @@ mod tests {
         assert_eq!(listing_order(vec![1, 2, 3], &[(3, 2), (2, 1)]), [3, 2, 1]);
         // A swap cannot be ordered; both are still listed once.
         assert_eq!(listing_order(vec![1, 2], &[(1, 2), (2, 1)]), [1, 2]);
-    }
-
-    #[test]
-    fn backoff_follows_the_official_steps_and_honours_retry_after() {
-        let interval = Duration::from_secs(30);
-        let other = CoreError::Internal("x".into());
-        let steps: Vec<u64> = (0..9)
-            .map(|failures| backoff(interval, failures, &other).as_secs())
-            .collect();
-        assert_eq!(steps, [30, 30, 60, 90, 150, 240, 390, 390, 390]);
-        let limited = CoreError::Backend(BackendError::RateLimited {
-            retry_after: Some(Duration::from_secs(600)),
-        });
-        assert_eq!(backoff(interval, 0, &limited), Duration::from_secs(600));
     }
 }

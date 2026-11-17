@@ -8,25 +8,40 @@
 //! variants, so the server refuses a rename that raced another device's;
 //! without one they send no precondition.
 
+use crate::photos::{
+    MAX_THUMBNAIL_BYTES, Photos, PhotosVolume, RelatedPhoto, ThumbnailRef, TimelineItem,
+};
+use crate::shared::{CorePage, DegradedShare, ShareRole, SharedEntry, SharedListing, SharedWithMe};
 use crate::{
     AccountInfo, Backend, BackendError, BlockInfo, EventId, EventKind, EventPage, FileMeta, LinkId,
-    NameHash, NodeKind, RemoteEvent, RemoteNode, Result, RevisionId, StorageInfo, UploadSource,
+    NameHash, NodeKind, NodeLookup, RemoteEvent, RemoteNode, Result, RevisionId, StorageInfo,
+    UploadSource,
 };
 use bytes::Bytes;
 use parking_lot::Mutex;
-use proton_drive_sdk::client::ProtonDriveClient;
+use proton_drive_sdk::account::{AccountClient, AccountClientAdapter};
+use proton_drive_sdk::api::share::ShareTargetType;
+use proton_drive_sdk::client::{ProtonDriveClient, ProtonDriveDefaults};
 use proton_drive_sdk::error::{ApiError, HttpTransferError, TooManyRequestsException};
+use proton_drive_sdk::http::retry::DriveApiRetryMiddleware;
 use proton_drive_sdk::node::download::{
     CompletedDownloadManifestVerificationException, DataIntegrityException,
 };
 use proton_drive_sdk::node::draft::{NodeWithSameNameExistsError, RevisionDraftConflictError};
-use proton_drive_sdk::node::file::block_map::BlockMap;
-use proton_drive_sdk::node::revision::RevisionUid;
-use proton_drive_sdk::node::{Node, NodeUid};
+use proton_drive_sdk::node::file::FileOperations;
+use proton_drive_sdk::node::file::block_map::{BlockMap, verify_block_listing};
+use proton_drive_sdk::node::revision::{RevisionOperations, RevisionUid};
+use proton_drive_sdk::node::thumbnail::ThumbnailType;
+use proton_drive_sdk::node::{Node, NodeMemberRole, NodeUid};
+use proton_drive_sdk::photo::ProtonPhotosClient;
 use proton_drive_sdk::proton_sdk_rs2::auth::{TokenCredential, TokenRefreshError};
+use proton_drive_sdk::proton_sdk_rs2::client::ProtonApiDefaults;
+use proton_drive_sdk::proton_sdk_rs2::crypto::proton_rpgp::AsPublicKeyRef;
+use proton_drive_sdk::proton_sdk_rs2::session::ProtonAPISession;
+use proton_drive_sdk::share::ShareId;
 use proton_drive_sdk::utils::PotentialObject;
 use proton_drive_sdk::volume::VolumeId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -49,15 +64,250 @@ type BlockMapSlot = Arc<tokio::sync::Mutex<Option<(Instant, Arc<BlockMap>)>>>;
 struct Live {
     client: ProtonDriveClient,
     credential: TokenCredential,
+    /// The Photos clients of the session ([`ProtonBackend::set_photos`]).
+    photos: Option<PhotosClients>,
+}
+
+/// The clients a Photos mount needs (M5.13, D113): the SDK's Photos client,
+/// whose drive client reads photos through the Photos API's link endpoints
+/// once it has found the Photos share, and PdMount's own client of the
+/// timeline endpoint ([`TimelineClient`]): the SDK's `get_timeline_page`
+/// drops `RelatedPhotos`, and its timeline types refuse a whole page for
+/// one tag or capture time they do not know (D119).
+#[derive(Clone)]
+pub struct PhotosClients {
+    client: Arc<ProtonPhotosClient>,
+    drive: ProtonDriveClient,
+    timeline: Arc<TimelineClient>,
+    /// The account client of the session, as the drive client's: the keys
+    /// that verify a thumbnail's manifest (M5.13b), which the drive client
+    /// keeps to itself.
+    account: Arc<dyn AccountClient>,
+    /// The Photos volume and root, found once per session: finding them
+    /// also gives the drive client the Photos share's key.
+    ready: Arc<tokio::sync::OnceCell<PhotosVolume>>,
+    /// The session's tokens, which every call through these clients uses
+    /// and refreshes: a call never mixes two sessions (D119).
+    credential: TokenCredential,
+}
+
+impl PhotosClients {
+    /// The Photos clients of `session`, with this device's client uid;
+    /// `limits` sets the transfer limits on the drive client as on My
+    /// Files' (D033).
+    pub fn new(
+        session: &ProtonAPISession,
+        uid: Option<String>,
+        limits: impl FnOnce(ProtonDriveClient) -> ProtonDriveClient,
+    ) -> anyhow::Result<Self> {
+        let client = ProtonPhotosClient::new(session, uid)?;
+        let drive = limits(client.drive().clone());
+        // As `ProtonPhotosClient::new` builds its own.
+        let http = session.get_http_client(
+            Some(ProtonDriveDefaults::DRIVE_BASE_ROUTE.to_owned()),
+            Some(Duration::from_secs(u64::from(
+                ProtonApiDefaults::DEFAULT_TIMEOUT_SECONDS,
+            ))),
+            None,
+        )?;
+        let base = reqwest::Url::parse(&session.client_config.base_url.to_string())?
+            .join(ProtonDriveDefaults::DRIVE_BASE_ROUTE)?;
+        let timeline = TimelineClient {
+            http: reqwest_middleware::ClientBuilder::new(http)
+                .with(DriveApiRetryMiddleware::default())
+                .build(),
+            base,
+            credential: session.token_credential.clone(),
+        };
+        Ok(Self {
+            client: Arc::new(client),
+            drive,
+            timeline: Arc::new(timeline),
+            account: Arc::new(AccountClientAdapter::new(session)),
+            ready: Arc::default(),
+            credential: session.token_credential.clone(),
+        })
+    }
+
+    /// The drive client the Photos client reads photos with (its link
+    /// endpoints), once the Photos share is found.
+    pub fn drive(&self) -> &ProtonDriveClient {
+        &self.drive
+    }
+}
+
+/// PdMount's client of the timeline endpoint (`volumes/<id>/photos`), sent
+/// as the SDK's `DefaultPhotosApiClient::get_timeline_photos` sends it, read
+/// into PdMount's own types ([`TimelineDto`]): the SDK's take tags as a
+/// closed enum (0-9) and capture times as what chrono holds, so one photo
+/// with a newer tag or a far capture time failed the whole page, and with it
+/// the timeline and the Photos events, for good (D119).
+struct TimelineClient {
+    http: reqwest_middleware::ClientWithMiddleware,
+    base: reqwest::Url,
+    credential: TokenCredential,
+}
+
+impl TimelineClient {
+    /// One page: the first with `after` `None`, else the page after the
+    /// item `after`.
+    async fn page(&self, volume: &str, after: Option<&LinkId>) -> anyhow::Result<TimelineDto> {
+        let mut url = self.base.join(&format!("volumes/{volume}/photos"))?;
+        if let Some(after) = after {
+            url.query_pairs_mut()
+                .append_pair("PreviousPageLastLinkID", after.as_str());
+        }
+        let (access, _) = self.credential.get_tokens().await?;
+        let response = self
+            .http
+            .get(url)
+            .header("Authorization", format!("Bearer {access}"))
+            .header("x-pm-uid", self.credential.session_id().raw())
+            .send()
+            .await?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        // A body cut off is the connection's failure, not an empty page.
+        let body = response.text().await?;
+        parse_timeline(status, &headers, &body)
+    }
+}
+
+/// A timeline page as the server sends it, with the fields PdMount uses.
+/// `Photos` has no default: an error object with a 2xx status must not read
+/// as an empty page, which ends the timeline.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct TimelineDto {
+    #[serde(default)]
+    code: Option<u64>,
+    photos: Vec<TimelinePhotoDto>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct TimelinePhotoDto {
+    #[serde(rename = "LinkID")]
+    link_id: String,
+    /// Seconds, as claimed: any number (or none) is read.
+    #[serde(default)]
+    capture_time: serde_json::Value,
+    #[serde(default)]
+    related_photos: Vec<RelatedPhotoDto>,
+    /// Numbers, also the ones PdMount does not know.
+    #[serde(default)]
+    tags: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct RelatedPhotoDto {
+    #[serde(rename = "LinkID")]
+    link_id: String,
+    #[serde(default)]
+    capture_time: serde_json::Value,
+}
+
+impl TimelinePhotoDto {
+    fn item(self) -> TimelineItem {
+        TimelineItem {
+            link: LinkId::new(self.link_id),
+            capture_time: seconds(&self.capture_time),
+            // A tag over 255 means nothing to PdMount: left out.
+            tags: self
+                .tags
+                .iter()
+                .filter_map(serde_json::Value::as_u64)
+                .filter_map(|tag| u8::try_from(tag).ok())
+                .collect(),
+            related: self
+                .related_photos
+                .into_iter()
+                .map(|related| RelatedPhoto {
+                    link: LinkId::new(related.link_id),
+                    capture_time: seconds(&related.capture_time),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// A claimed capture time in seconds: an integer as it is (beyond `i64`
+/// saturated), a fraction cut, anything else the epoch, as the SDK reads a
+/// missing one. The tree places what no four-digit year holds at the epoch.
+fn seconds(value: &serde_json::Value) -> i64 {
+    if let Some(seconds) = value.as_i64() {
+        return seconds;
+    }
+    if value.as_u64().is_some() {
+        return i64::MAX;
+    }
+    // `as` saturates, and NaN becomes 0.
+    value.as_f64().map_or(0, |seconds| seconds as i64)
+}
+
+/// A timeline response: a non-2xx status or a `Code` other than 1000 is the
+/// API's error, classified as any SDK error ([`map_error`]).
+fn parse_timeline(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    body: &str,
+) -> anyhow::Result<TimelineDto> {
+    if !status.is_success() {
+        return Err(ApiError::from_http(status, headers, body).into());
+    }
+    let refused = || {
+        ApiError::from_body(body)
+            .filter(|api| api.code != Some(1000))
+            .map(anyhow::Error::from)
+    };
+    match serde_json::from_str::<TimelineDto>(body) {
+        Ok(page) if page.code.is_none_or(|code| code == 1000) => Ok(page),
+        Ok(_) => {
+            Err(refused().unwrap_or_else(|| anyhow::anyhow!("the timeline answered an error")))
+        }
+        Err(error) => Err(refused().unwrap_or_else(|| {
+            let cut = body
+                .char_indices()
+                .nth(512)
+                .map_or(body.len(), |(at, _)| at);
+            anyhow::anyhow!(
+                "timeline: JSON parse error: {error}. Body: {}",
+                &body[..cut]
+            )
+        })),
+    }
 }
 
 pub struct ProtonBackend {
-    live: parking_lot::RwLock<Live>,
+    /// Shared by the backends of every tree of the session
+    /// ([`ProtonBackend::tree`]), so a new login reaches all of them.
+    live: Arc<parking_lot::RwLock<Live>>,
     username: String,
     volume: VolumeId,
     root: LinkId,
+    /// Whether `root` is My Files' root (`get_my_files_folder`); a further
+    /// tree's root is fetched by its id.
+    my_files: bool,
+    /// A tree of the Photos volume ([`ProtonBackend::photos_tree`]): its
+    /// calls go through the Photos clients' drive client.
+    photos_tree: bool,
     block_maps: Mutex<HashMap<BlockMapKey, BlockMapSlot>>,
+    /// Creator and creation time by share id: they never change, so the
+    /// shared-with-me listing asks for each share once (M5.12).
+    share_info: Mutex<HashMap<String, ShareInfo>>,
 }
+
+/// What `get_share` says about a share that the listing uses.
+#[derive(Debug, Clone)]
+struct ShareInfo {
+    creator: String,
+    created: Option<SystemTime>,
+}
+
+/// Pages of the shared-with-me listing read at most (each holds up to
+/// 150 links): a bound on what the server can make PdMount hold.
+const MAX_SHARED_PAGES: usize = 64;
 
 /// Access tokens for [`with_reauth`].
 #[async_trait::async_trait]
@@ -114,9 +364,16 @@ impl ProtonBackend {
         Ok(Self {
             volume: root.base.uid.volume_id.clone(),
             root: LinkId::new(root.base.uid.link_id.raw()),
-            live: parking_lot::RwLock::new(Live { client, credential }),
+            my_files: true,
+            photos_tree: false,
+            live: Arc::new(parking_lot::RwLock::new(Live {
+                client,
+                credential,
+                photos: None,
+            })),
             username,
             block_maps: Mutex::new(HashMap::new()),
+            share_info: Mutex::new(HashMap::new()),
         })
     }
 
@@ -131,18 +388,101 @@ impl ProtonBackend {
         root: LinkId,
     ) -> Self {
         Self {
-            live: parking_lot::RwLock::new(Live { client, credential }),
+            live: Arc::new(parking_lot::RwLock::new(Live {
+                client,
+                credential,
+                photos: None,
+            })),
             username,
             volume: VolumeId::new(volume.into()),
             root,
+            my_files: true,
+            photos_tree: false,
             block_maps: Mutex::new(HashMap::new()),
+            share_info: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Continues with a new login's connection (the same account): calls
-    /// already running finish on the old one.
-    pub fn replace_session(&self, client: ProtonDriveClient, credential: TokenCredential) {
-        *self.live.write() = Live { client, credential };
+    /// The backend of a further tree (M5.10, D080): the folder `root` on
+    /// `volume`, over this backend's session, client and transfer limits.
+    /// Every node id it builds is on that volume; `root` and `account`
+    /// name the tree's root, and `poll_events` follows that volume.
+    pub fn tree(&self, volume: impl Into<String>, root: LinkId) -> Self {
+        Self {
+            live: Arc::clone(&self.live),
+            username: self.username.clone(),
+            volume: VolumeId::new(volume.into()),
+            root,
+            my_files: false,
+            photos_tree: false,
+            block_maps: Mutex::new(HashMap::new()),
+            share_info: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The backend of the Photos tree (M5.13, D113): [`ProtonBackend::tree`]
+    /// for the Photos volume and root, whose calls go through the Photos
+    /// clients ([`ProtonBackend::set_photos`]), as the official Photos
+    /// client reads photos.
+    pub fn photos_tree(&self, volume: impl Into<String>, root: LinkId) -> Self {
+        Self {
+            photos_tree: true,
+            ..self.tree(volume, root)
+        }
+    }
+
+    /// Continues with a new login's connection (the same account), the
+    /// Photos clients of the new session with it in one write, so no call
+    /// finds one session's drive client beside another's Photos clients
+    /// (D119). Calls already running finish on the old session.
+    pub fn replace_session(
+        &self,
+        client: ProtonDriveClient,
+        credential: TokenCredential,
+        photos: Option<PhotosClients>,
+    ) {
+        *self.live.write() = Live {
+            client,
+            credential,
+            photos,
+        };
+    }
+
+    /// The session's Photos clients (M5.13), for a Photos mount.
+    pub fn set_photos(&self, photos: Option<PhotosClients>) {
+        self.live.write().photos = photos;
+    }
+
+    /// The Photos clients, with the Photos volume found: `NotFound` when
+    /// the account has no Photos. A call uses the clients this returns,
+    /// and their credential, from its start to its end, its retry
+    /// included, whatever a new login replaces meanwhile.
+    async fn photos_ready(&self) -> Result<(PhotosClients, PhotosVolume)> {
+        let photos = self
+            .live
+            .read()
+            .photos
+            .clone()
+            .ok_or(BackendError::Unsupported("Photos without its clients"))?;
+        let volume = photos
+            .ready
+            .get_or_try_init(|| async {
+                let root = with_reauth(&photos.credential, || async {
+                    photos
+                        .client
+                        .get_photos_root_folder()
+                        .await
+                        .map_err(map_error)
+                })
+                .await?;
+                Ok::<_, BackendError>(PhotosVolume {
+                    volume: root.base.uid.volume_id.raw().to_owned(),
+                    root: link_of(&root.base.uid),
+                })
+            })
+            .await?
+            .clone();
+        Ok((photos, volume))
     }
 
     /// The volume id, kept for [`ProtonBackend::with_root`].
@@ -150,19 +490,29 @@ impl ProtonBackend {
         self.volume.raw()
     }
 
-    fn client(&self) -> ProtonDriveClient {
-        self.live.read().client.clone()
+    /// The drive client of a call and the credential of its session, read
+    /// together. A Photos tree's goes through the Photos API: the clients
+    /// [`ProtonBackend::photos_ready`] gives, never My Files' client (D119).
+    async fn session_for_call(&self) -> Result<(ProtonDriveClient, TokenCredential)> {
+        if self.photos_tree {
+            let (photos, _) = self.photos_ready().await?;
+            return Ok((photos.drive, photos.credential));
+        }
+        let live = self.live.read();
+        Ok((live.client.clone(), live.credential.clone()))
     }
 
-    /// Runs `call` on the current client, with one token refresh on a
-    /// rejected token ([`with_reauth`]).
+    /// Runs `call` on the session's client, with one token refresh on a
+    /// rejected token ([`with_reauth`]); the retry uses the same client and
+    /// credential. A Photos tree finds the Photos share first, once per
+    /// session.
     async fn authed<T, F, Fut>(&self, call: F) -> Result<T>
     where
         F: Fn(ProtonDriveClient) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
-        let credential = self.live.read().credential.clone();
-        with_reauth(&credential, || call(self.client())).await
+        let (client, credential) = self.session_for_call().await?;
+        with_reauth(&credential, || call(client.clone())).await
     }
 
     /// Deletes everything in the account's trash for good (`pdmount trash
@@ -339,7 +689,13 @@ fn overflowed(error: &anyhow::Error) -> bool {
 
 /// Classifies an SDK error (DESIGN.md Appendix A).
 fn map_error(error: anyhow::Error) -> BackendError {
-    if let Some(conflict) = cause::<NodeWithSameNameExistsError>(&error) {
+    classify(&error)
+}
+
+/// [`map_error`] for an error the caller keeps: a session check at the
+/// start, say, whose rate limit a retry must honour (D106).
+pub fn classify(error: &anyhow::Error) -> BackendError {
+    if let Some(conflict) = cause::<NodeWithSameNameExistsError>(error) {
         return BackendError::AlreadyExists {
             existing: conflict
                 .conflict
@@ -348,7 +704,7 @@ fn map_error(error: anyhow::Error) -> BackendError {
                 .map(|link| LinkId::new(link.raw())),
         };
     }
-    if let Some(conflict) = cause::<RevisionDraftConflictError>(&error) {
+    if let Some(conflict) = cause::<RevisionDraftConflictError>(error) {
         return BackendError::RevisionConflict {
             current: conflict
                 .conflict
@@ -357,32 +713,32 @@ fn map_error(error: anyhow::Error) -> BackendError {
                 .map(|revision| RevisionId::new(revision.raw())),
         };
     }
-    if cause::<DataIntegrityException>(&error).is_some()
-        || cause::<CompletedDownloadManifestVerificationException>(&error).is_some()
-        || cause::<proton_drive_sdk::error::ChecksumMismatchIntegrityException>(&error).is_some()
-        || cause::<proton_drive_sdk::error::ContentSizeMismatchIntegrityException>(&error).is_some()
+    if cause::<DataIntegrityException>(error).is_some()
+        || cause::<CompletedDownloadManifestVerificationException>(error).is_some()
+        || cause::<proton_drive_sdk::error::ChecksumMismatchIntegrityException>(error).is_some()
+        || cause::<proton_drive_sdk::error::ContentSizeMismatchIntegrityException>(error).is_some()
     {
         return BackendError::Integrity(format!("{error:#}"));
     }
-    if let Some(refresh) = cause::<TokenRefreshError>(&error) {
+    if let Some(refresh) = cause::<TokenRefreshError>(error) {
         return if refresh.is_refresh_token_expired() {
             BackendError::Unauthorized
         } else {
             BackendError::Transient(format!("{error:#}"))
         };
     }
-    if let Some(api) = ApiError::find(&error) {
-        return map_api_error(api, &error);
+    if let Some(api) = ApiError::find(error) {
+        return map_api_error(api, error);
     }
-    if let Some(too_many) = cause::<TooManyRequestsException>(&error) {
+    if let Some(too_many) = cause::<TooManyRequestsException>(error) {
         return BackendError::RateLimited {
             retry_after: too_many.retry_after,
         };
     }
-    if let Some(transfer) = cause::<HttpTransferError>(&error) {
-        return map_transfer_error(transfer, &error);
+    if let Some(transfer) = cause::<HttpTransferError>(error) {
+        return map_transfer_error(transfer, error);
     }
-    if let Some(http) = transport_error(&error) {
+    if let Some(http) = transport_error(error) {
         if http.is_connect() {
             return BackendError::Offline(format!("{error:#}"));
         }
@@ -629,7 +985,8 @@ impl Backend for ProtonBackend {
     /// (`sdk/node/revision.rs:529`), whatever its doc says about encrypted
     /// sizes; the cache seeds its layout from it.
     fn upload_block_size(&self) -> u64 {
-        self.client().target_block_size() as u64
+        // The SDK's constant, the same for every client of the session.
+        self.live.read().client.target_block_size() as u64
     }
 
     async fn account(&self) -> Result<AccountInfo> {
@@ -640,6 +997,21 @@ impl Backend for ProtonBackend {
     }
 
     async fn root(&self) -> Result<RemoteNode> {
+        if !self.my_files {
+            // A further tree: its root by id, as any node of the volume. A
+            // root that cannot be decrypted is not gone (D119).
+            return match self
+                .get_nodes_checked(std::slice::from_ref(&self.root))
+                .await?
+                .pop()
+            {
+                Some(NodeLookup::Found(root)) => Ok(root),
+                Some(NodeLookup::Degraded) => Err(BackendError::Transient(
+                    "the tree's root cannot be decrypted".into(),
+                )),
+                Some(NodeLookup::Absent) | None => Err(BackendError::NotFound),
+            };
+        }
         let root = self
             .authed(|client| async move { client.get_my_files_folder().await.map_err(map_error) })
             .await?;
@@ -672,8 +1044,21 @@ impl Backend for ProtonBackend {
     /// nor other devices' changes update, so events would look like echoes
     /// (D035). `get_nodes_uncached` refreshes those cache entries on the way.
     /// Each node carries its name hash (P14), the precondition of `rename`.
-    /// The API leaves out links that no longer exist.
+    /// The API leaves out links that no longer exist; a node whose
+    /// metadata cannot be decrypted is `None` here too
+    /// ([`Backend::get_nodes_checked`] tells them apart).
     async fn get_nodes(&self, ids: &[LinkId]) -> Result<Vec<Option<RemoteNode>>> {
+        Ok(self
+            .get_nodes_checked(ids)
+            .await?
+            .into_iter()
+            .map(NodeLookup::found)
+            .collect())
+    }
+
+    /// [`Backend::get_nodes`], with a node the API returns but whose
+    /// metadata cannot be decrypted `Degraded`, not absent (D119).
+    async fn get_nodes_checked(&self, ids: &[LinkId]) -> Result<Vec<NodeLookup>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -689,17 +1074,30 @@ impl Backend for ProtonBackend {
                     .map_err(map_error)
             })
             .await?;
-        let mut found: HashMap<LinkId, RemoteNode> = fetched
+        let mut found: HashMap<LinkId, NodeLookup> = fetched
             .into_iter()
-            .filter_map(|(object, digest)| {
-                decrypted(object).map(|node| RemoteNode {
-                    name_hash: Some(hash_to_hex(&digest)),
-                    ..node
-                })
+            .map(|(object, digest)| match object {
+                PotentialObject::Node(node) => {
+                    let node = RemoteNode {
+                        name_hash: Some(hash_to_hex(&digest)),
+                        ..convert_node(node)
+                    };
+                    (node.link_id.clone(), NodeLookup::Found(node))
+                }
+                PotentialObject::Degraded(degraded) => {
+                    let link = link_of(degraded.uid());
+                    tracing::warn!(
+                        %link,
+                        "a node's metadata cannot be decrypted; what is known of it stays"
+                    );
+                    (link, NodeLookup::Degraded)
+                }
             })
-            .map(|node| (node.link_id.clone(), node))
             .collect();
-        Ok(ids.iter().map(|id| found.remove(id)).collect())
+        Ok(ids
+            .iter()
+            .map(|id| found.remove(id).unwrap_or(NodeLookup::Absent))
+            .collect())
     }
 
     async fn blocks(&self, file: &LinkId, revision: &RevisionId) -> Result<Vec<BlockInfo>> {
@@ -950,6 +1348,390 @@ impl Backend for ProtonBackend {
             max: u64::try_from(max).unwrap_or(0),
         })
     }
+}
+
+/// A share root's name, kind and the user's role; `None` for a trashed
+/// root or one that is not a file or folder (Photos).
+fn share_root(node: &Node) -> Option<(LinkId, String, NodeKind, ShareRole)> {
+    let (base, kind) = match node {
+        Node::Folder(folder) => (&folder.base, NodeKind::Folder),
+        Node::File(file) => (&file.base.base, NodeKind::File),
+        Node::Album(_) | Node::Photo(_) => return None,
+    };
+    if base.trash_time.is_some() {
+        return None;
+    }
+    let role = match base.direct_role {
+        NodeMemberRole::Admin => ShareRole::Admin,
+        NodeMemberRole::Editor => ShareRole::Editor,
+        // `Inherited` on a share's root would be the server's error: the
+        // least role.
+        NodeMemberRole::Viewer | NodeMemberRole::Inherited => ShareRole::Viewer,
+    };
+    Some((link_of(&base.uid), base.name.clone(), kind, role))
+}
+
+/// Shared-with-me as the official clients read it (M5.9): the listing's
+/// pages, then each share's creator once (`get_share`), then the roots
+/// fresh, one batch per volume, for their names and the user's role. A
+/// share whose root is not returned (revoked meanwhile) is left out; one
+/// whose root's metadata cannot be decrypted is listed as degraded (D119).
+#[async_trait::async_trait]
+impl SharedWithMe for ProtonBackend {
+    async fn shared_with_me(&self) -> Result<Vec<SharedEntry>> {
+        Ok(self.shared_listing().await?.entries)
+    }
+
+    async fn shared_listing(&self) -> Result<SharedListing> {
+        let mut links = Vec::new();
+        let mut anchor = None;
+        for _ in 0..MAX_SHARED_PAGES {
+            let page = self
+                .authed(|client| {
+                    let anchor = anchor.clone();
+                    async move {
+                        client
+                            .api()
+                            .shares()
+                            .get_shared_with_me(anchor)
+                            .await
+                            .map_err(map_error)
+                    }
+                })
+                .await?;
+            for link in page.links {
+                let kind = match link.share_target_type {
+                    ShareTargetType::Folder => NodeKind::Folder,
+                    ShareTargetType::File => NodeKind::File,
+                    _ => continue,
+                };
+                links.push((
+                    link.share_id.raw().clone(),
+                    link.volume_id.raw().to_owned(),
+                    link.link_id.raw().to_owned(),
+                    kind,
+                ));
+            }
+            match page.anchor_id {
+                Some(next) if page.more => anchor = Some(next),
+                _ => break,
+            }
+        }
+        for (share, ..) in &links {
+            if self.share_info.lock().contains_key(share) {
+                continue;
+            }
+            let id = ShareId::new(share.clone());
+            let fetched = self
+                .authed(|client| {
+                    let id = id.clone();
+                    async move { client.api().shares().get_share(id).await.map_err(map_error) }
+                })
+                .await;
+            match fetched {
+                Ok(response) => {
+                    self.share_info.lock().insert(
+                        share.clone(),
+                        ShareInfo {
+                            creator: response.creator_email_address,
+                            created: response.creation_time.map(system_time),
+                        },
+                    );
+                }
+                // Gone since the listing: left out below.
+                Err(BackendError::NotFound | BackendError::PermissionDenied) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let mut by_volume: HashMap<String, Vec<String>> = HashMap::new();
+        for (_, volume, link, _) in &links {
+            by_volume
+                .entry(volume.clone())
+                .or_default()
+                .push(link.clone());
+        }
+        let mut roots = HashMap::new();
+        let mut unreadable = HashSet::new();
+        for (volume, ids) in by_volume {
+            let fetched = self
+                .authed(|client| {
+                    let volume = VolumeId::new(volume.clone());
+                    let ids = ids
+                        .iter()
+                        .map(|id| proton_drive_sdk::links::LinkId::new(id.clone()))
+                        .collect();
+                    async move {
+                        client
+                            .get_nodes_uncached(volume, ids)
+                            .await
+                            .map_err(map_error)
+                    }
+                })
+                .await?;
+            for object in fetched {
+                match object {
+                    PotentialObject::Node(node) => {
+                        if let Some((link, name, kind, role)) = share_root(&node) {
+                            roots.insert((volume.clone(), link), (name, kind, role));
+                        }
+                    }
+                    PotentialObject::Degraded(degraded) => {
+                        let link = link_of(degraded.uid());
+                        tracing::warn!(
+                            %link,
+                            "a shared root's metadata cannot be decrypted; listed as degraded"
+                        );
+                        unreadable.insert((volume.clone(), link));
+                    }
+                }
+            }
+        }
+        let infos = self.share_info.lock().clone();
+        let mut degraded = Vec::new();
+        let entries = links
+            .into_iter()
+            .filter_map(|(share, volume, link, listed_kind)| {
+                let link = LinkId::new(link);
+                if unreadable.contains(&(volume.clone(), link.clone())) {
+                    degraded.push(DegradedShare {
+                        share,
+                        volume,
+                        root: link,
+                    });
+                    return None;
+                }
+                let (name, kind, role) = roots.remove(&(volume.clone(), link.clone()))?;
+                let info = infos.get(&share)?;
+                (kind == listed_kind).then(|| SharedEntry {
+                    share,
+                    volume,
+                    root: link,
+                    kind,
+                    name,
+                    owner: info.creator.clone(),
+                    role,
+                    created: info.created,
+                })
+            })
+            .collect();
+        Ok(SharedListing { entries, degraded })
+    }
+
+    async fn latest_core_event_id(&self) -> Result<EventId> {
+        self.authed(|client| async move {
+            client
+                .get_core_latest_event_id()
+                .await
+                .map(EventId::new)
+                .map_err(map_error)
+        })
+        .await
+    }
+
+    async fn poll_core_events(&self, since: &EventId) -> Result<CorePage> {
+        let response = self
+            .authed(|client| async move {
+                client
+                    .poll_core_events(since.as_str())
+                    .await
+                    .map_err(map_error)
+            })
+            .await?;
+        Ok(CorePage {
+            next: EventId::new(response.event_id),
+            more: response.more != 0,
+            refresh: response.refresh != 0,
+            // Action 2 is the only one seen (M5.9); any action means the
+            // listing changed.
+            shares_changed: response.drive_share_refresh.is_some(),
+        })
+    }
+}
+
+/// Photos as the official Photos client reads them (M5.9, D113): the
+/// Photos share's volume and root, and the timeline with each item's
+/// related photos.
+#[async_trait::async_trait]
+impl Photos for ProtonBackend {
+    async fn photos_volume(&self) -> Result<Option<PhotosVolume>> {
+        match self.photos_ready().await {
+            Ok((_, volume)) => Ok(Some(volume)),
+            Err(BackendError::NotFound) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn timeline_page(
+        &self,
+        volume: &str,
+        after: Option<&LinkId>,
+    ) -> Result<Vec<TimelineItem>> {
+        let (photos, _) = self.photos_ready().await?;
+        let page = with_reauth(&photos.credential, || async {
+            photos.timeline.page(volume, after).await.map_err(map_error)
+        })
+        .await?;
+        Ok(page
+            .photos
+            .into_iter()
+            .map(TimelinePhotoDto::item)
+            .collect())
+    }
+
+    /// The revision's block listing, verified as `get_block_map` verifies
+    /// it: the manifest (the thumbnails' digests, then the blocks') signed
+    /// by the node key, or by the signer's address keys. The SDK's
+    /// `enumerate_thumbnails` checks nothing of a thumbnail but that it
+    /// decrypts, as the official SDKs (D115).
+    async fn thumbnail_ref(
+        &self,
+        volume: &str,
+        link: &LinkId,
+        revision: &RevisionId,
+    ) -> Result<Option<ThumbnailRef>> {
+        let (photos, _) = self.photos_ready().await?;
+        let credential = photos.credential.clone();
+        let uid = RevisionUid::new(
+            NodeUid::from_parts(volume, link.as_str()),
+            proton_drive_sdk::revision::RevisionId::new(revision.as_str().to_owned()),
+        );
+        let (drive, account) = (photos.drive(), &photos.account);
+        let listed = with_reauth(&credential, || async {
+            let secrets = FileOperations::get_secrets(drive, uid.node_uid.clone())
+                .await
+                .map_err(map_error)?;
+            let listing = RevisionOperations::get_revision_with_all_blocks(drive, &uid)
+                .await
+                .map_err(map_error)?;
+            // The keys of the SDK's `manifest_verification_keys`.
+            let keys = match listing.revision.signature_email_address.as_deref() {
+                None | Some("") => vec![secrets.base.key.0.as_public_key().clone()],
+                Some(email) => account
+                    .get_address_public_keys(email)
+                    .await
+                    .map_err(map_error)?,
+            };
+            verify_block_listing(&listing, &keys)
+                .map_err(|error| map_error(error.context("the thumbnail's revision manifest")))?;
+            Ok(listing
+                .revision
+                .thumbnails
+                .into_iter()
+                .flatten()
+                .find(|thumbnail| thumbnail.r#type == ThumbnailType::Thumbnail))
+        })
+        .await?;
+        Ok(listed.map(|thumbnail| ThumbnailRef {
+            link: link.clone(),
+            revision: revision.clone(),
+            id: thumbnail.id,
+            digest: thumbnail.hash_digest,
+            size: u64::try_from(thumbnail.size_on_cloud_storage).unwrap_or(u64::MAX),
+        }))
+    }
+
+    async fn fetch_thumbnails(
+        &self,
+        volume: &str,
+        thumbnails: &[ThumbnailRef],
+    ) -> Result<Vec<Result<Bytes>>> {
+        use futures::StreamExt;
+        if thumbnails.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (photos, _) = self.photos_ready().await?;
+        let credential = photos.credential.clone();
+        let drive = photos.drive();
+        let ids: Vec<String> = thumbnails.iter().map(|t| t.id.clone()).collect();
+        let listed = with_reauth(&credential, || async {
+            drive
+                .api()
+                .files()
+                .get_thumbnail_blocks(VolumeId::new(volume.to_owned()), ids.clone())
+                .await
+                .map_err(map_error)
+        })
+        .await?;
+        let urls: HashMap<String, (String, String)> = listed
+            .blocks
+            .into_iter()
+            .map(|block| (block.thumbnail_id, (block.bare_url, block.token)))
+            .collect();
+        let downloads = thumbnails.iter().cloned().map(|thumbnail| {
+            let url = urls.get(&thumbnail.id).cloned();
+            async move {
+                let (url, token) = url.ok_or(BackendError::NotFound)?;
+                download_thumbnail(drive, volume, &thumbnail, &url, &token).await
+            }
+        });
+        Ok(futures::stream::iter(downloads)
+            .buffered(THUMBNAIL_DOWNLOADS)
+            .collect()
+            .await)
+    }
+}
+
+/// Thumbnails downloaded at once: the SDK's `enumerate_thumbnails` (8),
+/// below the official web client's 10.
+const THUMBNAIL_DOWNLOADS: usize = 8;
+
+/// One thumbnail: at most [`MAX_THUMBNAIL_BYTES`] from storage, whose
+/// SHA-256 must be the one the revision's verified manifest lists, then
+/// decrypted with the file's content key.
+async fn download_thumbnail(
+    drive: &ProtonDriveClient,
+    volume: &str,
+    thumbnail: &ThumbnailRef,
+    url: &str,
+    token: &str,
+) -> Result<Bytes> {
+    use sha2::Digest;
+    let too_large = |size: u64| {
+        BackendError::Integrity(format!(
+            "the thumbnail of {} has {size} bytes, more than a thumbnail's {MAX_THUMBNAIL_BYTES}",
+            thumbnail.link
+        ))
+    };
+    if thumbnail.size > MAX_THUMBNAIL_BYTES as u64 {
+        return Err(too_large(thumbnail.size));
+    }
+    let mut response = drive
+        .api()
+        .storage()
+        .get_blob_stream(url, token)
+        .await
+        .map_err(map_error)?;
+    let mut blob = Vec::with_capacity(thumbnail.size as usize);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| map_error(anyhow::Error::from(error).context("thumbnail download")))?
+    {
+        if blob.len() + chunk.len() > MAX_THUMBNAIL_BYTES {
+            return Err(too_large((blob.len() + chunk.len()) as u64));
+        }
+        blob.extend_from_slice(&chunk);
+    }
+    if sha2::Sha256::digest(&blob).as_slice() != thumbnail.digest.as_slice() {
+        return Err(BackendError::Integrity(format!(
+            "the thumbnail of {} is not the one its revision's manifest signs",
+            thumbnail.link
+        )));
+    }
+    let secrets =
+        FileOperations::get_secrets(drive, NodeUid::from_parts(volume, thumbnail.link.as_str()))
+            .await
+            .map_err(map_error)?;
+    let plain = secrets.content_key.decrypt(&blob).map_err(|error| {
+        BackendError::Integrity(format!(
+            "the thumbnail of {} does not decrypt: {error:#}",
+            thumbnail.link
+        ))
+    })?;
+    if plain.len() > MAX_THUMBNAIL_BYTES {
+        return Err(too_large(plain.len() as u64));
+    }
+    Ok(Bytes::from(plain))
 }
 
 #[cfg(test)]
@@ -1498,5 +2280,172 @@ mod tests {
         assert_eq!(convert_event_kind(2), Some(EventKind::UpdateMetadata));
         assert_eq!(convert_event_kind(3), Some(EventKind::UpdateContent));
         assert_eq!(convert_event_kind(7), None);
+    }
+
+    /// One photo with a tag the SDK's enum does not know (10 and up) or a
+    /// capture time chrono cannot hold failed the SDK's whole page, and so
+    /// the timeline and the Photos events for good; PdMount's own types
+    /// read every item (D119).
+    #[test]
+    fn a_timeline_page_with_new_tags_and_far_capture_times_is_read() {
+        let body = r#"{"Code":1000,"Photos":[
+            {"LinkID":"a","CaptureTime":1700000000,"Hash":"h1","ContentHash":null,
+             "Tags":[0,3,10,300,-1],
+             "RelatedPhotos":[{"LinkID":"v","CaptureTime":-99999999999999999,"Hash":"h2"}]},
+            {"LinkID":"b","CaptureTime":99999999999999999,"Hash":"h3","Tags":[]},
+            {"LinkID":"c","CaptureTime":1.7e9,"Hash":"h4"},
+            {"LinkID":"d","CaptureTime":null,"Hash":"h5"},
+            {"LinkID":"e","CaptureTime":18446744073709551615,"Hash":"h6"}]}"#;
+        assert!(
+            serde_json::from_str::<proton_drive_sdk::api::file::photos::TimelinePhotoListResponse>(
+                body
+            )
+            .is_err(),
+            "the SDK's types refuse the page (else this test needs a new case)"
+        );
+        let page = parse_timeline(reqwest::StatusCode::OK, &Default::default(), body)
+            .expect("the page is read");
+        let items: Vec<TimelineItem> = page
+            .photos
+            .into_iter()
+            .map(TimelinePhotoDto::item)
+            .collect();
+        let links: Vec<&str> = items.iter().map(|item| item.link.as_str()).collect();
+        assert_eq!(links, ["a", "b", "c", "d", "e"]);
+        assert_eq!(
+            items[0].tags,
+            [0, 3, 10],
+            "known and new tags; none over 255"
+        );
+        assert_eq!(items[0].capture_time, 1_700_000_000);
+        assert_eq!(
+            items[0].related,
+            [RelatedPhoto {
+                link: LinkId::new("v"),
+                capture_time: -99_999_999_999_999_999,
+            }]
+        );
+        assert_eq!(items[1].capture_time, 99_999_999_999_999_999);
+        assert_eq!(items[2].capture_time, 1_700_000_000);
+        assert_eq!(items[3].capture_time, 0);
+        assert_eq!(items[4].capture_time, i64::MAX);
+    }
+
+    /// An error answer is the API's error, never an empty page: an empty
+    /// first page would end the timeline with nothing in it.
+    #[test]
+    fn a_timeline_error_is_never_an_empty_page() {
+        let read = |status: u16, body: &str| {
+            parse_timeline(
+                reqwest::StatusCode::from_u16(status).expect("status"),
+                &Default::default(),
+                body,
+            )
+            .map(|page| page.photos.len())
+            .map_err(map_error)
+        };
+        assert_eq!(
+            read(200, r#"{"Code":2501,"Error":"Volume not found"}"#),
+            Err(BackendError::NotFound)
+        );
+        assert_eq!(
+            read(422, r#"{"Code":2501,"Error":"Volume not found"}"#),
+            Err(BackendError::NotFound)
+        );
+        assert!(matches!(
+            read(429, r#"{"Code":2028,"Error":"Too many requests"}"#),
+            Err(BackendError::RateLimited { .. })
+        ));
+        assert!(read(200, r#"{"Code":1000}"#).is_err(), "no Photos, no page");
+        assert!(read(200, "not json").is_err());
+        assert_eq!(read(200, r#"{"Code":1000,"Photos":[]}"#), Ok(0));
+    }
+
+    /// Sessions made offline, for the clients' bookkeeping.
+    mod offline {
+        use super::*;
+        use proton_drive_sdk::proton_sdk_rs2::cache::InMemoryCacheRepository;
+        use proton_drive_sdk::proton_sdk_rs2::{
+            AppVersionConfiguration, PasswordMode, SessionId, UserId,
+        };
+
+        /// A session with id `id` that never reaches a server.
+        pub fn session(id: &str) -> ProtonAPISession {
+            ProtonAPISession::resume(
+                SessionId::new(id.to_owned()),
+                "user",
+                UserId::new("user-id".to_owned()),
+                "access".to_owned(),
+                "refresh".to_owned(),
+                Vec::new(),
+                false,
+                PasswordMode::Single,
+                AppVersionConfiguration::new("pdmount-test", 0, 0, 1),
+                Arc::new(InMemoryCacheRepository::new()),
+            )
+        }
+
+        /// The Photos clients of `session`, their Photos volume found.
+        pub fn photos(session: &ProtonAPISession) -> PhotosClients {
+            let photos = PhotosClients::new(session, None, |client| client).expect("clients");
+            photos
+                .ready
+                .set(PhotosVolume {
+                    volume: "photos-volume".into(),
+                    root: LinkId::new("photos-root"),
+                })
+                .expect("not set yet");
+            photos
+        }
+
+        pub fn drive(session: &ProtonAPISession) -> ProtonDriveClient {
+            ProtonDriveClient::new(session, None).expect("drive client")
+        }
+    }
+
+    /// A Photos call takes the drive client and credential of one session's
+    /// Photos clients, never My Files' client and never another session's
+    /// credential; a new login replaces both in one write (D119).
+    #[tokio::test]
+    async fn a_photos_call_uses_one_sessions_photos_clients() {
+        let (a, b) = (offline::session("a"), offline::session("b"));
+        let backend = ProtonBackend::with_root(
+            offline::drive(&a),
+            a.token_credential.clone(),
+            "user".into(),
+            "volume",
+            LinkId::new("root"),
+        );
+        let photos_tree = backend.photos_tree("photos-volume", LinkId::new("photos-root"));
+        let session_of = |call: Result<(ProtonDriveClient, TokenCredential)>| {
+            call.map(|(_, credential)| credential.session_id().raw().clone())
+        };
+        // Without Photos clients a Photos call fails: My Files' client
+        // cannot read the Photos volume.
+        assert!(matches!(
+            photos_tree.session_for_call().await,
+            Err(BackendError::Unsupported(_))
+        ));
+        backend.set_photos(Some(offline::photos(&a)));
+        assert_eq!(
+            session_of(photos_tree.session_for_call().await),
+            Ok("a".into())
+        );
+        // A new login: its drive client, credential and Photos clients at once.
+        backend.replace_session(
+            offline::drive(&b),
+            b.token_credential.clone(),
+            Some(offline::photos(&b)),
+        );
+        assert_eq!(
+            session_of(photos_tree.session_for_call().await),
+            Ok("b".into())
+        );
+        assert_eq!(session_of(backend.session_for_call().await), Ok("b".into()));
+        // A login whose Photos clients could not be made: Photos calls fail
+        // rather than use another session's.
+        backend.replace_session(offline::drive(&a), a.token_credential.clone(), None);
+        assert!(photos_tree.session_for_call().await.is_err());
+        assert_eq!(session_of(backend.session_for_call().await), Ok("a".into()));
     }
 }

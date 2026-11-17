@@ -1,0 +1,17 @@
+# Written by `pdmount service install`; the next install rewrites it.
+# One instance per profile: pdmount@<profile>.service. The profile's settings are in
+# pdmount@<profile>.service.d/pdmount.conf.
+[Unit]
+Description=PdMount (profile %i)
+After=dbus.socket dbus.service
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/pdmount --profile %i $PDMOUNT_SECRETS -v mount $PDMOUNT_MOUNT_ARGS --foreground --service systemd --clear-stale
+Restart=on-failure
+RestartSec=5
+# A start that fails before the mount is ready is final (D109).
+RestartPreventExitStatus=78
+
+[Install]
+WantedBy=default.target

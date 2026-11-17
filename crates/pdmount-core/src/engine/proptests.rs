@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::UNIX_EPOCH;
 
 const NAMES: [&str; 3] = ["a", "b", "d"];
-const PARENTS: [&str; 3] = ["", "/d", "/b"];
+const PARENTS: [&str; 4] = ["", "/d", "/b", "/d/a"];
 const MODES: [u32; 3] = [0o600, 0o644, 0o755];
 
 #[derive(Clone)]
@@ -45,6 +45,9 @@ enum Op {
     Chmod(String, u32),
     Touch(String, u64),
     Drain,
+    /// No journal step starts until the next drain, so the changes queue
+    /// up and meet in the executor as after an offline spell (D117).
+    Pause,
     Restart,
     Crash,
     Remote(Remote),
@@ -79,6 +82,7 @@ impl std::fmt::Debug for Op {
             Self::Chmod(p, m) => write!(f, "Chmod({p:?}, {m:o})"),
             Self::Touch(p, t) => write!(f, "Touch({p:?}, {t})"),
             Self::Drain => write!(f, "Drain"),
+            Self::Pause => write!(f, "Pause"),
             Self::Restart => write!(f, "Restart"),
             Self::Crash => write!(f, "Crash"),
             Self::Remote(change) => write!(f, "Remote({change:?})"),
@@ -133,6 +137,7 @@ fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
         18 => local_op(),
         1 => Just(Op::Drain),
+        1 => Just(Op::Pause),
         1 => Just(Op::Restart),
         1 => Just(Op::Crash),
         4 => remote().prop_map(Op::Remote),
@@ -169,17 +174,19 @@ const ENOTEMPTY: i32 = nix::libc::ENOTEMPTY;
 const EINVAL: i32 = nix::libc::EINVAL;
 
 impl Model {
-    /// The parent directory must exist and be a directory.
+    /// The parent directory must exist and be a directory, as each folder
+    /// above it, resolved from the root.
     fn check_parent(&self, path: &str) -> std::result::Result<(), i32> {
         let (parent, _) = parent_of(path);
-        match parent {
-            "" => Ok(()),
-            parent => match self.entries.get(parent) {
-                Some(Entry::Dir) => Ok(()),
-                Some(Entry::File { .. }) => Err(ENOTDIR),
-                None => Err(ENOENT),
-            },
+        let ends = parent.match_indices('/').map(|(i, _)| i).skip(1);
+        for end in ends.chain([parent.len()]).filter(|&end| end > 0) {
+            match self.entries.get(&parent[..end]) {
+                Some(Entry::Dir) => {}
+                Some(Entry::File { .. }) => return Err(ENOTDIR),
+                None => return Err(ENOENT),
+            }
         }
+        Ok(())
     }
 
     fn file(&mut self, path: &str) -> std::result::Result<&mut Entry, i32> {
@@ -324,7 +331,7 @@ impl Model {
                 }
                 Ok(())
             }
-            Op::Drain | Op::Restart | Op::Crash | Op::Remote(_) => Ok(()),
+            Op::Drain | Op::Pause | Op::Restart | Op::Crash | Op::Remote(_) => Ok(()),
         }
     }
 
@@ -636,7 +643,7 @@ async fn apply(engine: &Arc<Engine>, op: &Op) -> std::result::Result<Option<Ino>
             }
             .map(|_| None)
         }
-        Op::Drain | Op::Restart | Op::Crash | Op::Remote(_) => Ok(None),
+        Op::Drain | Op::Pause | Op::Restart | Op::Crash | Op::Remote(_) => Ok(None),
     }
 }
 
@@ -799,6 +806,7 @@ fn run_case(ops: Vec<Op>) {
         match op {
             Op::Drain => {
                 let engine = &instance.engine;
+                engine.journal.pause(false);
                 let counts = instance.run(engine.drain(Duration::from_secs(5)));
                 assert_eq!(
                     (counts.pending, counts.parked),
@@ -816,8 +824,10 @@ fn run_case(ops: Vec<Op>) {
                 instance.kill();
                 instance = Instance::open(&backend, &state(generation), "dev-a", DEBOUNCE);
             }
+            Op::Pause => instance.engine.journal.pause(true),
             Op::Remote(change) => {
                 let engine = &instance.engine;
+                engine.journal.pause(false);
                 let counts = instance.run(engine.drain(Duration::from_secs(5)));
                 assert_eq!(
                     (counts.pending, counts.parked),
@@ -842,6 +852,7 @@ fn run_case(ops: Vec<Op>) {
         check_tree(&instance.engine, || format!("{op:?}"));
     }
     let engine = Arc::clone(&instance.engine);
+    engine.journal.pause(false);
     let counts = instance.run(engine.drain(Duration::from_secs(5)));
     assert_eq!(
         (counts.pending, counts.parked),
@@ -1119,6 +1130,7 @@ impl Fleet {
                 uid: Some(uid.to_owned()),
                 claims_sha1: own,
                 claims_mode: own,
+                ..FakeClient::default()
             })
         };
         let handles = [client("pdmount-a", true), client("pdmount-b", true)];
@@ -1364,6 +1376,17 @@ proptest! {
 fn regression_cases() {
     use Op::*;
     let s = |p: &str| p.to_owned();
+    // An `rm -rf` of a deep tree, cut off by a stop and finished after the
+    // start: each folder's trash waited for the one inside it with a
+    // back-off that doubled per level, far beyond the final drain (D116).
+    let deep: Vec<String> = (1..=10).map(|n| "/d".repeat(n)).collect();
+    let mut ops: Vec<Op> = deep.iter().cloned().map(Mkdir).collect();
+    ops.push(Create(format!("{}/a", deep[9])));
+    ops.extend([Drain, Restart, Unlink(format!("{}/a", deep[9]))]);
+    ops.extend(deep[5..].iter().rev().cloned().map(Rmdir));
+    ops.push(Restart);
+    ops.extend(deep[..5].iter().rev().cloned().map(Rmdir));
+    run_case(ops);
     // A zero-length write past the end set the size without writing, so
     // after a restart no block list could hold that size.
     run_case(vec![
@@ -1431,6 +1454,130 @@ fn regression_cases() {
         Remote(super::proptests::Remote::Write(s("/a"), vec![7])),
         Crash,
     ]);
+}
+
+/// Nodes that wait for each other's places, queued together (`Pause`):
+/// each case deadlocked, the final drain left its entries pending (D117).
+/// Each runs as written and with a restart before the final drain.
+#[test]
+fn cycles_of_nodes_waiting_for_each_other() {
+    use Op::*;
+    let s = |p: &str| p.to_owned();
+    let mv = |a: &str, b: &str| Rename(s(a), s(b), false);
+    let cases: Vec<(&str, Vec<Op>)> = vec![
+        // The child waits for its deleted parent's name, the parent's
+        // trash for the child to move out.
+        (
+            "a child folder takes its deleted parent's name",
+            vec![
+                Mkdir(s("/d")),
+                Mkdir(s("/d/a")),
+                Drain,
+                Pause,
+                mv("/d/a", "/b"),
+                Rmdir(s("/d")),
+                mv("/b", "/d"),
+            ],
+        ),
+        (
+            "a child file takes its deleted parent's name",
+            vec![
+                Mkdir(s("/d")),
+                Create(s("/d/a")),
+                Write(s("/d/a"), 0, vec![7; 100]),
+                Drain,
+                Pause,
+                mv("/d/a", "/b"),
+                Rmdir(s("/d")),
+                mv("/b", "/d"),
+            ],
+        ),
+        // The trash of /d waits for that of /d/a, which waits for /d/a/b.
+        (
+            "a grandchild takes its deleted grandparent's name",
+            vec![
+                Mkdir(s("/d")),
+                Mkdir(s("/d/a")),
+                Mkdir(s("/d/a/b")),
+                Drain,
+                Pause,
+                mv("/d/a/b", "/b"),
+                Rmdir(s("/d/a")),
+                Rmdir(s("/d")),
+                mv("/b", "/d"),
+            ],
+        ),
+        // /d/a waits for /b's name, /b for the deleted /d's.
+        (
+            "through a sibling's rename",
+            vec![
+                Mkdir(s("/d")),
+                Mkdir(s("/d/a")),
+                Mkdir(s("/b")),
+                Drain,
+                Pause,
+                mv("/d/a", "/a"),
+                Rmdir(s("/d")),
+                mv("/b", "/d"),
+                mv("/a", "/b"),
+            ],
+        ),
+        // The new /d waits for the deleted one's name, /d/a for the new
+        // /d's link.
+        (
+            "into a new folder of the deleted folder's name",
+            vec![
+                Mkdir(s("/d")),
+                Mkdir(s("/d/a")),
+                Drain,
+                Pause,
+                mv("/d/a", "/a"),
+                Rmdir(s("/d")),
+                Mkdir(s("/d")),
+                mv("/a", "/d/a"),
+            ],
+        ),
+        // No deleted folder: the new /d waits for the name /b still holds,
+        // /b for the new /d's link.
+        (
+            "into a new folder at its own old name",
+            vec![
+                Mkdir(s("/d")),
+                Drain,
+                Pause,
+                mv("/d", "/b"),
+                Mkdir(s("/d")),
+                mv("/b", "/d/b"),
+            ],
+        ),
+        // Each waits for the next one's name; only a swap of two was
+        // broken.
+        (
+            "three names rotated",
+            vec![
+                Create(s("/a")),
+                Write(s("/a"), 0, vec![1; 10]),
+                Create(s("/b")),
+                Write(s("/b"), 0, vec![2; 10]),
+                Create(s("/d")),
+                Write(s("/d"), 0, vec![3; 10]),
+                Drain,
+                Pause,
+                mv("/a", "/x"),
+                mv("/b", "/a"),
+                mv("/d", "/b"),
+                mv("/x", "/d"),
+            ],
+        ),
+    ];
+    for (name, ops) in cases {
+        eprintln!("case: {name}");
+        run_case(ops.clone());
+        let mut restarted = ops;
+        restarted.push(Restart);
+        eprintln!("case: {name}, restarted");
+        run_case(restarted);
+    }
 }
 
 /// Debounce of the replayed interleavings: nothing uploads before the
@@ -1646,4 +1793,56 @@ fn concurrent_regression_cases() {
         Step::Sync(A),
         Step::Sync(B),
     ]);
+}
+
+/// A folder the app trashed while A wrote into a clean file inside it: the
+/// event that removed the file came between the write's lookup and the
+/// write, which landed on the detached node and was lost (D128; shrunk from
+/// the 10 000-case run, data as `vec![first_byte; len]`; failed in about 2
+/// of 5 replays before).
+#[test]
+fn a_write_into_a_folder_the_app_trashed_survives() {
+    use self::Remote as R;
+    use Dev::*;
+    use Op::*;
+    let s = |p: &str| p.to_owned();
+    let a = |op| Step::Local(A, op);
+    let b = |op| Step::Local(B, op);
+    for _ in 0..20 {
+        run_concurrent_case(
+            &[
+                b(Rename(s("/a"), s("/d/a/b"), false)),
+                b(Write(s("/b/b"), 9627, vec![11; 76])),
+                b(Rmdir(s("/b/a"))),
+                a(Mkdir(s("/d"))),
+                b(Truncate(s("/d/d"), 8752)),
+                a(Create(s("/d/d"))),
+                Step::Restart(B),
+                a(Create(s("/d/a/b"))),
+                b(Touch(s("/d/a/a"), 1_994_402)),
+                Step::Sync(B),
+                b(Create(s("/d/a/a"))),
+                b(Create(s("/b/b"))),
+                Step::App(R::Trash(s("/b"))),
+                Step::Drain(A),
+                a(Truncate(s("/b/a"), 3573)),
+                b(Mkdir(s("/d/a"))),
+                a(Truncate(s("/d/b"), 13_732)),
+                b(Unlink(s("/d/b"))),
+                Step::App(R::Trash(s("/d"))),
+                Step::Drain(B),
+                a(Truncate(s("/d"), 1535)),
+                a(Mkdir(s("/d/a"))),
+                a(Chmod(s("/b"), 0o600)),
+                a(Mkdir(s("/d/d"))),
+                a(Write(s("/d/d"), 6512, vec![0; 448])),
+                b(Rename(s("/b/b"), s("/b/a"), true)),
+                b(Create(s("/d/b"))),
+                Step::Drain(A),
+                a(Mkdir(s("/d/a/b"))),
+                Step::App(R::Write(s("/d/a/b"), vec![33; 159])),
+            ],
+            DEBOUNCE,
+        );
+    }
 }

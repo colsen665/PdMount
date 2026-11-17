@@ -1,5 +1,14 @@
 //! FUSE adapter (DESIGN.md §4): maps fuser callbacks onto [`Engine`].
 //!
+//! A mount serves one tree or several (D080, D110). With several, a
+//! [`Router`] gives the mount a virtual read-only top level with one folder
+//! per tree and maps inode numbers to their tree; a rename between two trees
+//! is EXDEV. With one tree nothing is mapped, so My Files keeps its paths and
+//! inode numbers. A mount from [`mount_dynamic`] (Shared, D112) always has a
+//! router, and its trees come and go while it is mounted ([`TreeSet`]); trees
+//! whose root is a single file show in a second virtual folder, the files
+//! folder.
+//!
 //! Hot operations are answered on the fuser thread inside a
 //! [`metrics::hot`] scope. Operations that need the network (a directory
 //! that was never listed, a block that is not cached, a base block a write
@@ -11,20 +20,53 @@
 //! Every request carries a [`Stopwatch`] (§5.8) that travels with its Reply
 //! and drops right after it: a reply deferred until the store commit, or
 //! sent from the slow path, counts that wait.
+//!
+//! # Module map
+//!
+//! - `lib.rs` (here): `PdFs`, the `Filesystem` implementation (the callbacks,
+//!   their hot and slow paths and deadlines).
+//! - `router.rs`: [`Router`] and [`Route`], the inode numbers of a mount with
+//!   several trees, with their tests.
+//! - `trees.rs`: the trees of a mount by slot, and [`TreeSet`], the handle
+//!   that adds, removes and renames them while mounted.
+//! - `mount.rs`: [`MountTree`], [`Mounted`], [`mount`], [`mount_trees`] and
+//!   [`mount_dynamic`] (session setup) and the notify threads (kernel
+//!   invalidations).
+//! - `convert.rs`: conversions between the engine's types and the kernel's
+//!   (`file_attr`, `errno`, `open_mode`, ...) and small reply helpers.
+//! - `readonly.rs`: [`RoFs`] and [`mount_read_only`], a mount over a
+//!   read-only tree that is not an engine (Photos, D113).
+
+mod convert;
+mod mount;
+mod readonly;
+mod router;
+mod trees;
+
+pub use mount::{MountTree, Mounted, mount, mount_dynamic, mount_trees, set_profile};
+pub use readonly::{RoFs, mount_read_only};
+pub use router::{Route, Router};
+pub use trees::{MAX_TREES, TreePlace, TreeSet};
+
+use convert::{
+    errno, file_attr, fill_dir, open_mode, reply_empty, time, top_read_only, xattr_reply,
+};
+use router::{FILES_INO, TOP_INO};
+use trees::Trees;
 
 use fuser::{
-    Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags,
-    KernelConfig, MountOption, Notifier, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen,
-    ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
+    Errno, FileAttr, FileHandle, Filesystem, FopenFlags, Generation, INodeNo, InitFlags,
+    KernelConfig, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
+    Request, TimeOrNow,
 };
 use pdmount_backend::NodeKind;
 use pdmount_core::cache::ReadFrom;
-use pdmount_core::engine::{Engine, OpenMode, SetAttr};
+use pdmount_core::engine::{Engine, MAY_WRITE, SetAttr};
 use pdmount_core::errors::{CoreError, Result};
 use pdmount_core::health::Connectivity;
 use pdmount_core::metrics::{self, Metrics, Op, Stopwatch};
-use pdmount_core::vfs::{Attr, Invalidation, Lookup, RenameMode};
+use pdmount_core::vfs::{Attr, DirEntry, Ino, Lookup, ROOT_INO, RenameMode};
 use std::ffi::OsStr;
 use std::future::Future;
 use std::os::unix::ffi::OsStrExt;
@@ -32,7 +74,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::Semaphore;
 use tracing::Instrument;
 
 /// Concurrent slow-path requests (§4.2); matches `max_background`.
@@ -54,7 +96,12 @@ fn deadline_for(state: Connectivity, normal: Duration, offline_read: Duration) -
 }
 
 pub struct PdFs {
-    engine: Arc<Engine>,
+    trees: Arc<parking_lot::RwLock<Trees>>,
+    router: Router,
+    /// The files folder's name; `None`: a fixed set of trees without one.
+    files_folder: Option<Arc<str>>,
+    /// Counts the requests of a mount that holds no tree.
+    metrics: Arc<Metrics>,
     slow: Arc<Semaphore>,
     uid: u32,
     gid: u32,
@@ -65,52 +112,133 @@ pub struct PdFs {
     block_deadline: Duration,
 }
 
+/// What a request's inode leads to.
+enum Target {
+    /// A virtual folder: the top level, or the files folder.
+    Top,
+    Tree {
+        index: usize,
+        ino: Ino,
+        engine: Arc<Engine>,
+    },
+}
+
+/// An entry of a virtual folder, with what readdirplus needs.
+struct VirtualEntry {
+    entry: DirEntry,
+    /// The kernel's attributes; `None` when they are not known.
+    attr: Option<Attr>,
+    /// The tree's engine and its inode, which counts a kernel reference
+    /// when the entry goes out in readdirplus; `None` for virtual entries.
+    referenced: Option<(Arc<Engine>, Ino)>,
+}
+
 impl PdFs {
-    pub fn new(engine: Arc<Engine>, uid: u32, gid: u32) -> Self {
-        let config = engine.config();
+    fn new(
+        trees: Arc<parking_lot::RwLock<Trees>>,
+        router: Router,
+        config: &pdmount_core::Config,
+        files_folder: Option<Arc<str>>,
+        uid: u32,
+        gid: u32,
+    ) -> Self {
         Self {
             attr_ttl: config.kernel.attr_ttl.0,
             entry_ttl: config.kernel.entry_ttl.0,
             negative_ttl: config.kernel.negative_ttl.0,
             metadata_deadline: config.timeouts.metadata.0,
             block_deadline: config.timeouts.block.0,
-            engine,
+            router,
+            trees,
+            files_folder,
+            metrics: Arc::new(Metrics::default()),
             slow: Arc::new(Semaphore::new(SLOW_PATH_LIMIT)),
             uid,
             gid,
         }
     }
 
+    /// The tree behind `ino`; `None` for a number no tree has (any more).
+    fn target(&self, ino: u64) -> Option<Target> {
+        match self.router.route(ino) {
+            Route::Top => Some(Target::Top),
+            Route::Files => self.has_files().then_some(Target::Top),
+            Route::Tree(index, ino) => {
+                let trees = self.trees.read();
+                let slot = trees.get(index)?;
+                Some(Target::Tree {
+                    index,
+                    ino,
+                    engine: Arc::clone(&slot.engine),
+                })
+            }
+        }
+    }
+
+    /// The answer of a request on an inode that leads nowhere (a tree that
+    /// left the mount, a revoked share, D112, D114): ENOENT for a request on
+    /// the name (a lookup in it, `stat`, `open`, `access`), as for a deleted
+    /// file; EIO for one on an open handle (`read`, `write`, `fstat`,
+    /// `fsync`, `readdir`, `close`), whose content can no longer be kept.
+    /// Releasing a handle always succeeds.
+    fn gone(handle: bool) -> Errno {
+        if handle { Errno::EIO } else { Errno::ENOENT }
+    }
+
+    /// Whether the mount shows the files folder now.
+    fn has_files(&self) -> bool {
+        self.files_folder.is_some() && self.trees.read().has_files()
+    }
+
+    /// Marks tree `index`'s volume as in use (D107).
+    fn touch(&self, index: usize) {
+        if let Some(volume_use) = self
+            .trees
+            .read()
+            .get(index)
+            .and_then(|slot| slot.volume_use.as_ref())
+        {
+            volume_use.touch();
+        }
+    }
+
+    /// The engine a request on `ino` counts in: its tree's, or the first
+    /// tree's for a virtual folder; `None` in a mount without trees.
+    fn engine_for(&self, ino: u64) -> Option<Arc<Engine>> {
+        match self.target(ino) {
+            Some(Target::Tree { engine, .. }) => Some(engine),
+            _ => self.trees.read().first().cloned(),
+        }
+    }
+
     /// Deadline of a metadata request: short while the drive cannot be
     /// reached, so uncached listings fail with EIO instead of hanging (§9.6).
-    fn metadata_deadline(&self) -> Duration {
-        self.deadline(self.metadata_deadline)
+    fn metadata_deadline(&self, engine: &Engine) -> Duration {
+        self.deadline(engine, self.metadata_deadline)
     }
 
     /// Deadline of a request that may fetch blocks.
-    fn block_deadline(&self) -> Duration {
-        self.deadline(self.block_deadline)
+    fn block_deadline(&self, engine: &Engine) -> Duration {
+        self.deadline(engine, self.block_deadline)
     }
 
-    fn deadline(&self, normal: Duration) -> Duration {
+    fn deadline(&self, engine: &Engine, normal: Duration) -> Duration {
         deadline_for(
-            self.engine.health().state(),
+            engine.health().state(),
             normal,
-            self.engine.config().timeouts.offline_read.0,
+            engine.config().timeouts.offline_read.0,
         )
     }
 
     /// Runs a callback body as a hot-path handler, catching panics. The
     /// body gets the request's stopwatch and drops it after the reply.
     fn handle(&self, op: Op, req: &Request, ino: Option<u64>, body: impl FnOnce(Stopwatch)) {
-        let watch = Stopwatch::new(
-            Arc::clone(self.engine.metrics()),
-            op,
-            req.unique().into(),
-            ino,
-        );
+        let metrics = self
+            .engine_for(ino.unwrap_or(TOP_INO))
+            .map_or_else(|| Arc::clone(&self.metrics), |e| Arc::clone(e.metrics()));
+        let watch = Stopwatch::new(Arc::clone(&metrics), op, req.unique().into(), ino);
         if catch_unwind(AssertUnwindSafe(|| metrics::hot(|| body(watch)))).is_err() {
-            Metrics::inc(&self.engine.metrics().handler_panics);
+            Metrics::inc(&metrics.handler_panics);
             tracing::error!(op = op.as_str(), "FUSE handler panicked; answered EIO");
         }
     }
@@ -118,6 +246,7 @@ impl PdFs {
     /// Moves the rest of a request to a tokio task with a deadline.
     fn slow<T, F>(
         &self,
+        engine: &Engine,
         mut watch: Stopwatch,
         deadline: Duration,
         work: F,
@@ -127,7 +256,7 @@ impl PdFs {
         F: Future<Output = Result<T>> + Send + 'static,
     {
         let permits = Arc::clone(&self.slow);
-        let metrics = Arc::clone(self.engine.metrics());
+        let metrics = Arc::clone(engine.metrics());
         let span = watch.slow_path();
         let op = watch.op().as_str();
         let task = async move {
@@ -159,13 +288,14 @@ impl PdFs {
             }
             reply(result, watch);
         };
-        self.engine.runtime().spawn(task.instrument(span));
+        engine.runtime().spawn(task.instrument(span));
     }
 
     /// Runs `attempt` on the hot path; if it needs a listing or inode
     /// numbers, provides them on the slow path and tries again.
     fn retrying<T, A>(
         &self,
+        engine: &Arc<Engine>,
         watch: Stopwatch,
         attempt: A,
         reply: impl FnOnce(Result<T>, Stopwatch) + Send + 'static,
@@ -175,14 +305,15 @@ impl PdFs {
     {
         match attempt() {
             Err(error) if is_resolvable(&error) => {
-                let engine = Arc::clone(&self.engine);
+                let resolver = Arc::clone(engine);
                 self.slow(
+                    engine,
                     watch,
-                    self.metadata_deadline(),
+                    self.metadata_deadline(engine),
                     async move {
                         let mut error = error;
                         for _ in 0..SLOW_ATTEMPTS {
-                            resolve(&engine, &error).await?;
+                            resolve(&resolver, &error).await?;
                             match attempt() {
                                 Err(next) if is_resolvable(&next) => error = next,
                                 result => return result,
@@ -201,17 +332,122 @@ impl PdFs {
         file_attr(attr, self.uid, self.gid)
     }
 
+    /// The attributes of a virtual folder (the top level, or the files
+    /// folder): read-only, its times those of the last change of the trees.
+    fn virtual_attr(&self, ino: u64) -> Attr {
+        let trees = self.trees.read();
+        let folders = trees.placed(false).count() as u32;
+        let files = self.files_folder.is_some() && trees.has_files();
+        Attr {
+            ino,
+            kind: NodeKind::Folder,
+            size: 0,
+            mtime: trees.changed,
+            ctime: trees.changed,
+            atime: trees.changed,
+            perm: 0o555,
+            nlink: if ino == FILES_INO {
+                2
+            } else {
+                2 + folders + u32::from(files)
+            },
+        }
+    }
+
+    fn top_attr(&self) -> Attr {
+        self.virtual_attr(TOP_INO)
+    }
+
+    /// The entries of a virtual folder, `.` and `..` first. The top level:
+    /// one folder per tree placed as a folder, and the files folder while
+    /// a tree holds a file. The files folder: each such tree's file, under
+    /// the tree's name.
+    fn virtual_entries(&self, dir: u64) -> Vec<VirtualEntry> {
+        let dot = |name: &str, ino| VirtualEntry {
+            entry: DirEntry {
+                ino,
+                kind: NodeKind::Folder,
+                name: name.into(),
+            },
+            attr: Some(self.virtual_attr(ino)),
+            referenced: None,
+        };
+        let mut entries = vec![dot(".", dir), dot("..", TOP_INO)];
+        let files_attr = self.virtual_attr(FILES_INO);
+        let trees = self.trees.read();
+        if dir == FILES_INO {
+            for (index, slot) in trees.placed(true) {
+                let TreePlace::File(child) = &slot.place else {
+                    continue;
+                };
+                // The tree's root is listed when it opens; one that is not
+                // is left out until it is.
+                let Ok(Some(attr)) = slot.engine.peek_child(ROOT_INO, child) else {
+                    continue;
+                };
+                let local = attr.ino;
+                let Ok(attr) = self.router.attr(index, attr) else {
+                    continue;
+                };
+                entries.push(VirtualEntry {
+                    entry: DirEntry {
+                        ino: attr.ino,
+                        kind: NodeKind::File,
+                        name: slot.name.clone(),
+                    },
+                    attr: Some(attr),
+                    referenced: Some((Arc::clone(&slot.engine), local)),
+                });
+            }
+            return entries;
+        }
+        for (index, slot) in trees.placed(false) {
+            let Ok(ino) = self.router.global(index, ROOT_INO) else {
+                continue;
+            };
+            let attr = slot
+                .engine
+                .getattr(ROOT_INO)
+                .and_then(|attr| self.router.attr(index, attr))
+                .ok();
+            entries.push(VirtualEntry {
+                entry: DirEntry {
+                    ino,
+                    kind: NodeKind::Folder,
+                    name: slot.name.clone(),
+                },
+                attr,
+                referenced: Some((Arc::clone(&slot.engine), ROOT_INO)),
+            });
+        }
+        if let Some(files) = &self.files_folder
+            && trees.has_files()
+        {
+            entries.push(VirtualEntry {
+                entry: DirEntry {
+                    ino: FILES_INO,
+                    kind: NodeKind::Folder,
+                    name: files.to_string(),
+                },
+                attr: Some(files_attr),
+                referenced: None,
+            });
+        }
+        entries
+    }
+
     /// Sends a successful reply only once the store has committed the rows
     /// the request queued (§5.6); errors go out at once. The stopwatch
     /// stops after the reply.
     fn committed<T: Send + 'static>(
         &self,
+        engine: &Arc<Engine>,
         reply: impl FnOnce(Result<T>) + Send + 'static,
     ) -> impl FnOnce(Result<T>, Stopwatch) + Send + 'static {
-        let engine = Arc::clone(&self.engine);
+        let engine = Arc::clone(engine);
         move |result, watch| match result {
-            Ok(value) => engine.after_commit(move || {
-                reply(Ok(value));
+            Ok(value) => engine.after_commit_kept(move |kept| {
+                reply(kept.map(|()| value));
                 drop(watch);
             }),
             Err(error) => reply(Err(error)),
@@ -258,13 +494,64 @@ impl PdFs {
             Err(error) => reply.error(errno(&error)),
         }
     }
-}
 
-/// Answers an empty reply with a result.
-fn reply_empty(reply: ReplyEmpty) -> impl FnOnce(Result<()>) + Send + 'static {
-    move |result| match result {
-        Ok(()) => reply.ok(),
-        Err(error) => reply.error(errno(&error)),
+    /// Looks up a tree's folder, or the files folder, in the top level; a
+    /// tree's folder counts as a kernel reference of the tree's root.
+    fn top_lookup(&self, name: &OsStr) -> Result<Lookup> {
+        if self
+            .files_folder
+            .as_deref()
+            .is_some_and(|files| files.as_bytes() == name.as_bytes())
+            && self.has_files()
+        {
+            return Ok(Lookup::Found(self.virtual_attr(FILES_INO)));
+        }
+        let found = {
+            let trees = self.trees.read();
+            trees
+                .find(false, name.as_bytes())
+                .and_then(|index| Some((index, Arc::clone(&trees.get(index)?.engine))))
+        };
+        let Some((index, engine)) = found else {
+            return Ok(Lookup::Negative);
+        };
+        self.touch(index);
+        let attr = engine
+            .readdirplus_entry(ROOT_INO)
+            .ok_or(CoreError::NotFound)?;
+        self.router.lookup(index, Lookup::Found(attr))
+    }
+
+    /// Looks up a file in the files folder: the one file of the tree of
+    /// that name.
+    fn files_lookup(&self, name: &OsStr, watch: Stopwatch, reply: ReplyEntry) {
+        let respond = self.lookup_reply();
+        let found = {
+            let trees = self.trees.read();
+            trees.find(true, name.as_bytes()).and_then(|index| {
+                let slot = trees.get(index)?;
+                let TreePlace::File(child) = &slot.place else {
+                    return None;
+                };
+                Some((index, Arc::clone(&slot.engine), child.clone()))
+            })
+        };
+        let Some((index, engine, child)) = found else {
+            return respond(Ok(Lookup::Negative), reply);
+        };
+        self.touch(index);
+        let router = self.router;
+        let looked_up = Arc::clone(&engine);
+        self.retrying(
+            &engine,
+            watch,
+            move || {
+                looked_up
+                    .lookup(ROOT_INO, child.as_bytes())
+                    .and_then(|lookup| router.lookup(index, lookup))
+            },
+            move |result, _watch| respond(result, reply),
+        );
     }
 }
 
@@ -277,79 +564,6 @@ async fn resolve(engine: &Arc<Engine>, error: &CoreError) -> Result<()> {
         CoreError::NeedsListing(dir) => engine.ensure_listed(*dir).await,
         CoreError::NeedsInos => engine.reserve_inos(16).await,
         other => Err(other.clone()),
-    }
-}
-
-/// The size protocol of `getxattr` and `listxattr`: a zero `size` asks for
-/// the length, a smaller buffer is ERANGE.
-fn xattr_reply(reply: ReplyXattr, data: &[u8], size: u32) {
-    if size == 0 {
-        reply.size(data.len() as u32);
-    } else if (size as usize) < data.len() {
-        reply.error(Errno::ERANGE);
-    } else {
-        reply.data(data);
-    }
-}
-
-fn errno(error: &CoreError) -> Errno {
-    Errno::from_i32(error.errno())
-}
-
-fn file_attr(attr: &Attr, uid: u32, gid: u32) -> FileAttr {
-    FileAttr {
-        ino: INodeNo(attr.ino),
-        size: attr.size,
-        blocks: attr.size.div_ceil(512),
-        atime: attr.atime,
-        mtime: attr.mtime,
-        ctime: attr.ctime,
-        crtime: attr.mtime,
-        kind: file_type(attr.kind),
-        perm: attr.perm as u16,
-        nlink: attr.nlink,
-        uid,
-        gid,
-        rdev: 0,
-        blksize: BLKSIZE,
-        flags: 0,
-    }
-}
-
-fn file_type(kind: NodeKind) -> FileType {
-    match kind {
-        NodeKind::File => FileType::RegularFile,
-        NodeKind::Folder => FileType::Directory,
-    }
-}
-
-/// Adds directory entries from `offset` on; returns when the buffer is full.
-fn fill_dir(entries: &[pdmount_core::vfs::DirEntry], offset: u64, reply: &mut ReplyDirectory) {
-    for (index, entry) in entries.iter().enumerate().skip(offset as usize) {
-        if reply.add(
-            INodeNo(entry.ino),
-            index as u64 + 1,
-            file_type(entry.kind),
-            &entry.name,
-        ) {
-            break;
-        }
-    }
-}
-
-fn open_mode(flags: i32) -> OpenMode {
-    let access = OpenFlags(flags).acc_mode();
-    OpenMode {
-        read: access != OpenAccMode::O_WRONLY,
-        write: access != OpenAccMode::O_RDONLY,
-        truncate: flags & nix::libc::O_TRUNC != 0,
-    }
-}
-
-fn time(value: TimeOrNow) -> SystemTime {
-    match value {
-        TimeOrNow::SpecificTime(time) => time,
-        TimeOrNow::Now => SystemTime::now(),
     }
 }
 
@@ -383,26 +597,49 @@ impl Filesystem for PdFs {
 
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         self.handle(Op::Lookup, req, Some(parent.0), |watch| {
-            let engine = Arc::clone(&self.engine);
-            let name = name.to_owned();
             let respond = self.lookup_reply();
-            self.retrying(
-                watch,
-                move || engine.lookup(parent.0, name.as_bytes()),
-                move |result, _watch| respond(result, reply),
-            );
+            match self.target(parent.0) {
+                None => reply.error(Self::gone(false)),
+                Some(Target::Top) if parent.0 == FILES_INO => self.files_lookup(name, watch, reply),
+                Some(Target::Top) => respond(self.top_lookup(name), reply),
+                Some(Target::Tree { index, ino, engine }) => {
+                    self.touch(index);
+                    let router = self.router;
+                    let looked_up = Arc::clone(&engine);
+                    let name = name.to_owned();
+                    self.retrying(
+                        &engine,
+                        watch,
+                        move || {
+                            looked_up
+                                .lookup(ino, name.as_bytes())
+                                .and_then(|lookup| router.lookup(index, lookup))
+                        },
+                        move |result, _watch| respond(result, reply),
+                    );
+                }
+            }
         });
     }
 
     fn forget(&self, req: &Request, ino: INodeNo, nlookup: u64) {
         self.handle(Op::Forget, req, Some(ino.0), |_watch| {
-            self.engine.forget(ino.0, nlookup);
+            if let Some(Target::Tree { ino, engine, .. }) = self.target(ino.0) {
+                engine.forget(ino, nlookup);
+            }
         });
     }
 
-    fn getattr(&self, req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+    fn getattr(&self, req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
         self.handle(Op::Getattr, req, Some(ino.0), |_watch| {
-            match self.engine.getattr(ino.0) {
+            let attr = match self.target(ino.0) {
+                None => return reply.error(Self::gone(fh.is_some())),
+                Some(Target::Top) => Ok(self.virtual_attr(ino.0)),
+                Some(Target::Tree { index, ino, engine }) => engine
+                    .getattr(ino)
+                    .and_then(|attr| self.router.attr(index, attr)),
+            };
+            match attr {
                 Ok(attr) => reply.attr(&self.attr_ttl, &self.file_attr(&attr)),
                 Err(error) => reply.error(errno(&error)),
             }
@@ -432,6 +669,12 @@ impl Filesystem for PdFs {
             if uid.is_some_and(|u| u != self.uid) || gid.is_some_and(|g| g != self.gid) {
                 return reply.error(Errno::EPERM);
             }
+            let (index, ino, engine) = match self.target(ino.0) {
+                None => return reply.error(Self::gone(fh.is_some())),
+                Some(Target::Top) => return reply.error(top_read_only()),
+                Some(Target::Tree { index, ino, engine }) => (index, ino, engine),
+            };
+            let engine = &engine;
             let change = SetAttr {
                 mode,
                 size,
@@ -439,18 +682,21 @@ impl Filesystem for PdFs {
                 atime: atime.map(time),
                 handle: fh.map(|fh| fh.0),
             };
-            let (uid, gid, ttl) = (self.uid, self.gid, self.attr_ttl);
-            let respond = self.committed(move |result: Result<Attr>| match result {
-                Ok(attr) => reply.attr(&ttl, &file_attr(&attr, uid, gid)),
-                Err(error) => reply.error(errno(&error)),
+            let (uid, gid, ttl, router) = (self.uid, self.gid, self.attr_ttl, self.router);
+            let respond = self.committed(engine, move |result: Result<Attr>| {
+                match result.and_then(|attr| router.attr(index, attr)) {
+                    Ok(attr) => reply.attr(&ttl, &file_attr(&attr, uid, gid)),
+                    Err(error) => reply.error(errno(&error)),
+                }
             });
-            match self.engine.setattr(ino.0, &change) {
+            match engine.setattr(ino, &change) {
                 Err(CoreError::NeedsMaterialize(_)) => {
-                    let engine = Arc::clone(&self.engine);
+                    let slow = Arc::clone(engine);
                     self.slow(
+                        engine,
                         watch,
-                        self.block_deadline(),
-                        async move { engine.setattr_slow(ino.0, change).await },
+                        self.block_deadline(engine),
+                        async move { slow.setattr_slow(ino, change).await },
                         respond,
                     );
                 }
@@ -483,37 +729,62 @@ impl Filesystem for PdFs {
         reply: ReplyEntry,
     ) {
         self.handle(Op::Mkdir, req, Some(parent.0), |watch| {
-            let engine = Arc::clone(&self.engine);
+            let (index, parent, engine) = match self.target(parent.0) {
+                None => return reply.error(Errno::ENOENT),
+                Some(Target::Top) => return reply.error(top_read_only()),
+                Some(Target::Tree { index, ino, engine }) => (index, ino, engine),
+            };
+            let engine = &engine;
+            let made = Arc::clone(engine);
             let name = name.to_owned();
             let respond = self.entry_reply();
+            let router = self.router;
             self.retrying(
+                engine,
                 watch,
-                move || engine.mkdir(parent.0, name.as_bytes(), mode & !umask),
-                self.committed(move |result| respond(result, reply)),
+                move || {
+                    made.mkdir(parent, name.as_bytes(), mode & !umask)
+                        .and_then(|attr| router.attr(index, attr))
+                },
+                self.committed(engine, move |result| respond(result, reply)),
             );
         });
     }
 
     fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         self.handle(Op::Unlink, req, Some(parent.0), |watch| {
-            let engine = Arc::clone(&self.engine);
+            let (parent, engine) = match self.target(parent.0) {
+                None => return reply.error(Errno::ENOENT),
+                Some(Target::Top) => return reply.error(top_read_only()),
+                Some(Target::Tree { ino, engine, .. }) => (ino, engine),
+            };
+            let engine = &engine;
+            let removed = Arc::clone(engine);
             let name = name.to_owned();
             self.retrying(
+                engine,
                 watch,
-                move || engine.unlink(parent.0, name.as_bytes()),
-                self.committed(reply_empty(reply)),
+                move || removed.unlink(parent, name.as_bytes()),
+                self.committed(engine, reply_empty(reply)),
             );
         });
     }
 
     fn rmdir(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         self.handle(Op::Rmdir, req, Some(parent.0), |watch| {
-            let engine = Arc::clone(&self.engine);
+            let (parent, engine) = match self.target(parent.0) {
+                None => return reply.error(Errno::ENOENT),
+                Some(Target::Top) => return reply.error(top_read_only()),
+                Some(Target::Tree { ino, engine, .. }) => (ino, engine),
+            };
+            let engine = &engine;
+            let removed = Arc::clone(engine);
             let name = name.to_owned();
             self.retrying(
+                engine,
                 watch,
-                move || engine.rmdir(parent.0, name.as_bytes()),
-                self.committed(reply_empty(reply)),
+                move || removed.rmdir(parent, name.as_bytes()),
+                self.committed(engine, reply_empty(reply)),
             );
         });
     }
@@ -550,20 +821,43 @@ impl Filesystem for PdFs {
             } else {
                 RenameMode::Replace
             };
-            let engine = Arc::clone(&self.engine);
+            let (from, to) = match (self.target(parent.0), self.target(newparent.0)) {
+                (None, _) | (_, None) => return reply.error(Errno::ENOENT),
+                (Some(Target::Top), _) | (_, Some(Target::Top)) => {
+                    return reply.error(top_read_only());
+                }
+                (Some(from), Some(to)) => (from, to),
+            };
+            let (
+                Target::Tree {
+                    index,
+                    ino: parent,
+                    engine,
+                },
+                Target::Tree {
+                    index: new_index,
+                    ino: newparent,
+                    ..
+                },
+            ) = (from, to)
+            else {
+                return reply.error(Errno::EIO);
+            };
+            // Every tree is a file system of its own: `mv`, `rsync` and
+            // `git` copy instead (D080).
+            if index != new_index {
+                return reply.error(Errno::EXDEV);
+            }
+            let engine = &engine;
+            let renamed = Arc::clone(engine);
             let (name, newname) = (name.to_owned(), newname.to_owned());
             self.retrying(
+                engine,
                 watch,
                 move || {
-                    engine.rename(
-                        parent.0,
-                        name.as_bytes(),
-                        newparent.0,
-                        newname.as_bytes(),
-                        mode,
-                    )
+                    renamed.rename(parent, name.as_bytes(), newparent, newname.as_bytes(), mode)
                 },
-                self.committed(reply_empty(reply)),
+                self.committed(engine, reply_empty(reply)),
             );
         });
     }
@@ -581,7 +875,14 @@ impl Filesystem for PdFs {
 
     fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         self.handle(Op::Open, req, Some(ino.0), |watch| {
-            let respond = self.committed(move |result: Result<(u64, bool)>| match result {
+            let (index, ino, engine) = match self.target(ino.0) {
+                None => return reply.error(Self::gone(false)),
+                Some(Target::Top) => return reply.error(Errno::EISDIR),
+                Some(Target::Tree { index, ino, engine }) => (index, ino, engine),
+            };
+            let engine = &engine;
+            self.touch(index);
+            let respond = self.committed(engine, move |result: Result<(u64, bool)>| match result {
                 Ok((handle, keep_cache)) => {
                     let flags = if keep_cache {
                         FopenFlags::FOPEN_KEEP_CACHE
@@ -592,7 +893,7 @@ impl Filesystem for PdFs {
                 }
                 Err(error) => reply.error(errno(&error)),
             });
-            respond(self.engine.open_file(ino.0, open_mode(flags.0)), watch);
+            respond(engine.open_file(ino, open_mode(flags.0)), watch);
         });
     }
 
@@ -607,16 +908,32 @@ impl Filesystem for PdFs {
         reply: ReplyCreate,
     ) {
         self.handle(Op::Create, req, Some(parent.0), |watch| {
-            let engine = Arc::clone(&self.engine);
+            let (index, parent, engine) = match self.target(parent.0) {
+                None => return reply.error(Errno::ENOENT),
+                Some(Target::Top) => return reply.error(top_read_only()),
+                Some(Target::Tree { index, ino, engine }) => (index, ino, engine),
+            };
+            let engine = &engine;
+            let created = Arc::clone(engine);
             let name = name.to_owned();
             let exclusive = flags & nix::libc::O_EXCL != 0;
             let open = open_mode(flags);
-            let (uid, gid, attr_ttl, entry_ttl) =
-                (self.uid, self.gid, self.attr_ttl, self.entry_ttl);
+            let (uid, gid, attr_ttl, entry_ttl, router) = (
+                self.uid,
+                self.gid,
+                self.attr_ttl,
+                self.entry_ttl,
+                self.router,
+            );
             self.retrying(
+                engine,
                 watch,
-                move || engine.create(parent.0, name.as_bytes(), mode & !umask, exclusive, open),
-                self.committed(move |result| match result {
+                move || {
+                    let (attr, handle) =
+                        created.create(parent, name.as_bytes(), mode & !umask, exclusive, open)?;
+                    Ok((router.attr(index, attr)?, handle))
+                },
+                self.committed(engine, move |result| match result {
                     Ok((attr, handle)) => {
                         // `created` takes one TTL for both entry and attributes.
                         let ttl = attr_ttl.min(entry_ttl);
@@ -646,7 +963,13 @@ impl Filesystem for PdFs {
         reply: ReplyData,
     ) {
         self.handle(Op::ReadRam, req, Some(ino.0), |mut watch| {
-            match self.engine.read_local(fh.0, offset, size) {
+            // A tree removed from its mount (a revoked share, D112): its
+            // open files answer EIO.
+            let Some(Target::Tree { engine, .. }) = self.target(ino.0) else {
+                return reply.error(Self::gone(true));
+            };
+            let engine = &engine;
+            match engine.read_local(fh.0, offset, size) {
                 Ok(Some((data, from))) => {
                     watch.set_op(match from {
                         ReadFrom::Ram => Op::ReadRam,
@@ -656,12 +979,13 @@ impl Filesystem for PdFs {
                     reply.data(&data);
                 }
                 Ok(None) => {
-                    let engine = Arc::clone(&self.engine);
+                    let reader = Arc::clone(engine);
                     watch.set_op(Op::ReadSlow);
                     self.slow(
+                        engine,
                         watch,
-                        self.block_deadline(),
-                        async move { engine.read(fh.0, offset, size).await },
+                        self.block_deadline(engine),
+                        async move { reader.read(fh.0, offset, size).await },
                         move |result, _watch| match result {
                             Ok(data) => reply.data(&data),
                             Err(error) => reply.error(errno(&error)),
@@ -686,18 +1010,23 @@ impl Filesystem for PdFs {
         reply: ReplyWrite,
     ) {
         self.handle(Op::Write, req, Some(ino.0), |watch| {
-            let respond = self.committed(move |result: Result<u32>| match result {
+            let Some(Target::Tree { engine, .. }) = self.target(ino.0) else {
+                return reply.error(Self::gone(true));
+            };
+            let engine = &engine;
+            let respond = self.committed(engine, move |result: Result<u32>| match result {
                 Ok(written) => reply.written(written),
                 Err(error) => reply.error(errno(&error)),
             });
-            match self.engine.write_local(fh.0, offset, data) {
+            match engine.write_local(fh.0, offset, data) {
                 Err(CoreError::NeedsMaterialize(_)) => {
-                    let engine = Arc::clone(&self.engine);
+                    let writer = Arc::clone(engine);
                     let data = data.to_vec();
                     self.slow(
+                        engine,
                         watch,
-                        self.block_deadline(),
-                        async move { engine.write(fh.0, offset, data).await },
+                        self.block_deadline(engine),
+                        async move { writer.write(fh.0, offset, data).await },
                         respond,
                     );
                 }
@@ -715,8 +1044,18 @@ impl Filesystem for PdFs {
         reply: ReplyEmpty,
     ) {
         self.handle(Op::Flush, req, Some(ino.0), |watch| {
-            match self.engine.flush(fh.0) {
-                Ok(()) => self.engine.after_commit(move || {
+            let Some(Target::Tree { engine, .. }) = self.target(ino.0) else {
+                return reply.error(Self::gone(true));
+            };
+            // The close of a writer answers for its writes: EIO once the
+            // tree was retired before they committed (D114).
+            let writes = engine.handle_writes(fh.0);
+            match engine.flush(fh.0) {
+                Ok(()) if writes => engine.after_commit_kept(move |kept| {
+                    reply_empty(reply)(kept);
+                    drop(watch);
+                }),
+                Ok(()) => engine.after_commit(move || {
                     reply.ok();
                     drop(watch);
                 }),
@@ -736,8 +1075,11 @@ impl Filesystem for PdFs {
         reply: ReplyEmpty,
     ) {
         self.handle(Op::Release, req, Some(ino.0), |watch| {
-            self.engine.release_file(fh.0);
-            self.engine.after_commit(move || {
+            let Some(Target::Tree { engine, .. }) = self.target(ino.0) else {
+                return reply.ok();
+            };
+            engine.release_file(fh.0);
+            engine.after_commit(move || {
                 reply.ok();
                 drop(watch);
             });
@@ -753,20 +1095,27 @@ impl Filesystem for PdFs {
         reply: ReplyEmpty,
     ) {
         self.handle(Op::Fsync, req, Some(ino.0), |watch| {
-            let engine = Arc::clone(&self.engine);
-            let remote = engine.fsync_is_remote(ino.0);
+            let (ino, engine) = match self.target(ino.0) {
+                None => return reply.error(Self::gone(true)),
+                Some(Target::Top) => return reply.ok(),
+                Some(Target::Tree { ino, engine, .. }) => (ino, engine),
+            };
+            let engine = &engine;
+            let synced = Arc::clone(engine);
+            let remote = engine.fsync_is_remote(ino);
             let deadline = if remote {
-                self.block_deadline()
+                self.block_deadline(engine)
             } else {
                 self.metadata_deadline
             };
             self.slow(
+                engine,
                 watch,
                 deadline,
                 async move {
-                    engine.fsync(ino.0).await?;
+                    synced.fsync(ino).await?;
                     if remote {
-                        engine.sync_remote(ino.0, deadline).await?;
+                        synced.sync_remote(ino, deadline).await?;
                     }
                     Ok(())
                 },
@@ -777,10 +1126,19 @@ impl Filesystem for PdFs {
 
     fn opendir(&self, req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         self.handle(Op::Opendir, req, Some(ino.0), |watch| {
-            let engine = Arc::clone(&self.engine);
+            let (index, ino, engine) = match self.target(ino.0) {
+                None => return reply.error(Self::gone(false)),
+                // The top level has no handle: its entries are the trees.
+                Some(Target::Top) => return reply.opened(FileHandle(0), FopenFlags::empty()),
+                Some(Target::Tree { index, ino, engine }) => (index, ino, engine),
+            };
+            let engine = &engine;
+            self.touch(index);
+            let opened = Arc::clone(engine);
             self.retrying(
+                engine,
                 watch,
-                move || engine.opendir(ino.0),
+                move || opened.opendir(ino),
                 move |result, _watch| match result {
                     Ok((handle, keep_cache)) => {
                         let flags = if keep_cache {
@@ -805,7 +1163,23 @@ impl Filesystem for PdFs {
         mut reply: ReplyDirectory,
     ) {
         self.handle(Op::Readdir, req, Some(ino.0), |_watch| {
-            match self.engine.dir_snapshot(fh.0) {
+            let entries = match self.target(ino.0) {
+                None => Err(CoreError::Errno(nix::libc::EIO)),
+                Some(Target::Top) => Ok(self
+                    .virtual_entries(ino.0)
+                    .into_iter()
+                    .map(|entry| entry.entry)
+                    .collect::<Vec<_>>()),
+                Some(Target::Tree { index, ino, engine }) => {
+                    engine.dir_snapshot(fh.0).and_then(|entries| {
+                        entries
+                            .iter()
+                            .map(|entry| self.router.entry(index, ino, entry))
+                            .collect()
+                    })
+                }
+            };
+            match entries {
                 Ok(entries) => {
                     fill_dir(&entries, offset, &mut reply);
                     reply.ok();
@@ -824,47 +1198,100 @@ impl Filesystem for PdFs {
         mut reply: ReplyDirectoryPlus,
     ) {
         self.handle(Op::Readdirplus, req, Some(ino.0), |_watch| {
-            let entries = match self.engine.dir_snapshot(fh.0) {
-                Ok(entries) => entries,
-                Err(error) => return reply.error(errno(&error)),
-            };
-            for (index, entry) in entries.iter().enumerate().skip(offset as usize) {
-                let next = index as u64 + 1;
-                if entry.name == "." || entry.name == ".." {
-                    // No lookup reference for these; the kernel ignores the attributes.
-                    let Ok(attr) = self.engine.getattr(entry.ino) else {
-                        continue;
-                    };
-                    let full = reply.add(
-                        INodeNo(entry.ino),
-                        next,
-                        &entry.name,
-                        &Duration::ZERO,
-                        &self.file_attr(&attr),
-                        Generation(0),
-                    );
-                    if full {
-                        break;
+            match self.target(ino.0) {
+                None => reply.error(Self::gone(true)),
+                Some(Target::Top) => {
+                    let entries = self.virtual_entries(ino.0);
+                    for (index, virt) in entries.iter().enumerate().skip(offset as usize) {
+                        let next = index as u64 + 1;
+                        let entry = &virt.entry;
+                        // No lookup reference for `.` and `..`.
+                        let ttl = if entry.name == "." || entry.name == ".." {
+                            Duration::ZERO
+                        } else {
+                            self.entry_ttl
+                        };
+                        let Some(attr) = &virt.attr else {
+                            continue;
+                        };
+                        if reply.add(
+                            INodeNo(entry.ino),
+                            next,
+                            &entry.name,
+                            &ttl,
+                            &self.file_attr(attr),
+                            Generation(0),
+                        ) {
+                            break;
+                        }
+                        // Only entries that fit count as kernel references.
+                        if let Some((engine, local)) = &virt.referenced {
+                            engine.readdirplus_entry(*local);
+                        }
                     }
-                    continue;
+                    reply.ok();
                 }
-                let Ok(attr) = self.engine.getattr(entry.ino) else {
-                    continue;
-                };
-                if reply.add(
-                    INodeNo(entry.ino),
-                    next,
-                    &entry.name,
-                    &self.entry_ttl,
-                    &self.file_attr(&attr),
-                    Generation(0),
-                ) {
-                    break;
+                Some(Target::Tree {
+                    index: tree,
+                    ino: dir,
+                    engine,
+                }) => {
+                    let entries = match engine.dir_snapshot(fh.0) {
+                        Ok(entries) => entries,
+                        Err(error) => return reply.error(errno(&error)),
+                    };
+                    for (index, entry) in entries.iter().enumerate().skip(offset as usize) {
+                        let next = index as u64 + 1;
+                        let Ok(out) = self.router.entry(tree, dir, entry) else {
+                            continue;
+                        };
+                        if entry.name == "." || entry.name == ".." {
+                            // No lookup reference for these; the kernel ignores the attributes.
+                            let attr = if out.ino == TOP_INO {
+                                Ok(self.top_attr())
+                            } else {
+                                engine
+                                    .getattr(entry.ino)
+                                    .and_then(|attr| self.router.attr(tree, attr))
+                            };
+                            let Ok(attr) = attr else {
+                                continue;
+                            };
+                            let full = reply.add(
+                                INodeNo(out.ino),
+                                next,
+                                &entry.name,
+                                &Duration::ZERO,
+                                &self.file_attr(&attr),
+                                Generation(0),
+                            );
+                            if full {
+                                break;
+                            }
+                            continue;
+                        }
+                        let Ok(attr) = engine
+                            .getattr(entry.ino)
+                            .and_then(|attr| self.router.attr(tree, attr))
+                        else {
+                            continue;
+                        };
+                        if reply.add(
+                            INodeNo(out.ino),
+                            next,
+                            &entry.name,
+                            &self.entry_ttl,
+                            &self.file_attr(&attr),
+                            Generation(0),
+                        ) {
+                            break;
+                        }
+                        // Only entries that fit count as kernel references.
+                        engine.readdirplus_entry(entry.ino);
+                    }
+                    reply.ok();
                 }
-                // Only entries that fit count as kernel references.
-                self.engine.readdirplus_entry(entry.ino);
             }
-            reply.ok();
         });
     }
 
@@ -877,7 +1304,9 @@ impl Filesystem for PdFs {
         reply: ReplyEmpty,
     ) {
         self.handle(Op::Releasedir, req, Some(ino.0), |_watch| {
-            self.engine.releasedir(fh.0);
+            if let Some(Target::Tree { engine, .. }) = self.target(ino.0) {
+                engine.releasedir(fh.0);
+            }
             reply.ok();
         });
     }
@@ -891,11 +1320,18 @@ impl Filesystem for PdFs {
         reply: ReplyEmpty,
     ) {
         self.handle(Op::Fsyncdir, req, Some(ino.0), |watch| {
-            let engine = Arc::clone(&self.engine);
+            let engine = match self.target(ino.0) {
+                None => return reply.error(Self::gone(true)),
+                Some(Target::Top) => return reply.ok(),
+                Some(Target::Tree { engine, .. }) => engine,
+            };
+            let engine = &engine;
+            let synced = Arc::clone(engine);
             self.slow(
+                engine,
                 watch,
-                self.metadata_deadline(),
-                async move { engine.fsyncdir().await },
+                self.metadata_deadline(engine),
+                async move { synced.fsyncdir().await },
                 move |result, _watch| reply_empty(reply)(result),
             );
         });
@@ -903,7 +1339,13 @@ impl Filesystem for PdFs {
 
     fn statfs(&self, req: &Request, ino: INodeNo, reply: ReplyStatfs) {
         self.handle(Op::Statfs, req, Some(ino.0), |_watch| {
-            let s = self.engine.statfs();
+            // The user's quota, from the tree asked or the first one; a
+            // mount without trees has no figures.
+            let Some(engine) = self.engine_for(ino.0) else {
+                let name_max = pdmount_core::vfs::MAX_NAME_BYTES as u32;
+                return reply.statfs(0, 0, 0, 0, 0, BLKSIZE, name_max, BLKSIZE);
+            };
+            let s = engine.statfs();
             reply.statfs(
                 s.blocks, s.bfree, s.bavail, s.files, s.ffree, s.bsize, s.namelen, s.bsize,
             );
@@ -912,9 +1354,13 @@ impl Filesystem for PdFs {
 
     fn getxattr(&self, req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         self.handle(Op::Getxattr, req, Some(ino.0), |_watch| {
-            let value = name
-                .to_str()
-                .map_or(Ok(None), |name| self.engine.xattr(ino.0, name));
+            let value = match self.target(ino.0) {
+                None => Err(CoreError::NotFound),
+                Some(Target::Top) => Ok(None),
+                Some(Target::Tree { ino, engine, .. }) => name
+                    .to_str()
+                    .map_or(Ok(None), |name| engine.xattr(ino, name)),
+            };
             match value {
                 Ok(Some(value)) => xattr_reply(reply, value.as_bytes(), size),
                 Ok(None) => reply.error(Errno::NO_XATTR),
@@ -925,7 +1371,12 @@ impl Filesystem for PdFs {
 
     fn listxattr(&self, req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
         self.handle(Op::Listxattr, req, Some(ino.0), |_watch| {
-            match self.engine.xattr_names(ino.0) {
+            let names = match self.target(ino.0) {
+                None => Err(CoreError::NotFound),
+                Some(Target::Top) => Ok(Vec::new()),
+                Some(Target::Tree { ino, engine, .. }) => engine.xattr_names(ino),
+            };
+            match names {
                 Ok(names) => {
                     let list: Vec<u8> = names
                         .iter()
@@ -941,7 +1392,14 @@ impl Filesystem for PdFs {
     fn access(&self, req: &Request, ino: INodeNo, mask: fuser::AccessFlags, reply: ReplyEmpty) {
         // Without `default_permissions` the daemon checks modes (D031).
         self.handle(Op::Access, req, Some(ino.0), |_watch| {
-            reply_empty(reply)(self.engine.access(ino.0, mask.bits() as u32))
+            let mask = mask.bits() as u32;
+            let result = match self.target(ino.0) {
+                None => Err(CoreError::NotFound),
+                Some(Target::Top) if mask & MAY_WRITE != 0 => Err(CoreError::ReadOnly),
+                Some(Target::Top) => Ok(()),
+                Some(Target::Tree { ino, engine, .. }) => engine.access(ino, mask),
+            };
+            reply_empty(reply)(result)
         });
     }
 
@@ -974,82 +1432,6 @@ impl Filesystem for PdFs {
     ) {
         // glibc's `posix_fallocate` falls back to writing (§8.7).
         reply.error(Errno::EOPNOTSUPP);
-    }
-}
-
-/// A running mount.
-pub struct Mounted {
-    session: fuser::BackgroundSession,
-}
-
-impl Mounted {
-    /// Whether the session ended, e.g. after an external `fusermount3 -u`.
-    pub fn is_finished(&self) -> bool {
-        self.session.guard.is_finished()
-    }
-
-    pub fn unmount(self) -> std::io::Result<()> {
-        self.session.umount_and_join()
-    }
-}
-
-/// Mounts `engine` at `mountpoint` and starts the notify task. Blocks until
-/// the kernel handshake is done; call from a plain thread or
-/// `spawn_blocking`, not from an async task.
-pub fn mount(
-    engine: Arc<Engine>,
-    invalidations: mpsc::UnboundedReceiver<Invalidation>,
-    mountpoint: &Path,
-) -> std::io::Result<Mounted> {
-    let uid = nix::unistd::getuid().as_raw();
-    let gid = nix::unistd::getgid().as_raw();
-    let mut config = fuser::Config::default();
-    config.mount_options = vec![
-        MountOption::FSName("pdmount".into()),
-        MountOption::Subtype("pdmount".into()),
-        // No `default_permissions`: the kernel would answer EACCES from the
-        // write bits cleared in `ro` subtrees before PdMount could answer
-        // EROFS (D019, D031); the engine checks permissions instead.
-        MountOption::NoAtime,
-        MountOption::NoDev,
-        MountOption::NoSuid,
-    ];
-    if engine.is_read_only() {
-        config.mount_options.push(MountOption::RO);
-    }
-    config.n_threads = Some(FUSER_THREADS);
-    config.clone_fd = true;
-    let session = fuser::Session::new(PdFs::new(engine, uid, gid), mountpoint, &config)?;
-    let notifier = session.notifier();
-    std::thread::Builder::new()
-        .name("pdmount-notify".into())
-        .spawn(move || notify_loop(notifier, invalidations))?;
-    Ok(Mounted {
-        session: session.spawn()?,
-    })
-}
-
-/// Sends kernel invalidations (§9.5). Runs on its own thread: never on a
-/// FUSE thread, never holding engine locks. ENOENT means the kernel had
-/// nothing cached.
-fn notify_loop(notifier: Notifier, mut invalidations: mpsc::UnboundedReceiver<Invalidation>) {
-    while let Some(invalidation) = invalidations.blocking_recv() {
-        let result = match &invalidation {
-            Invalidation::Entry { parent, name } => {
-                notifier.inval_entry(INodeNo(*parent), OsStr::new(name))
-            }
-            Invalidation::Inode { ino } => notifier.inval_inode(INodeNo(*ino), 0, 0),
-            Invalidation::Delete {
-                parent,
-                child,
-                name,
-            } => notifier.delete(INodeNo(*parent), INodeNo(*child), OsStr::new(name)),
-        };
-        match result {
-            Ok(()) => tracing::debug!(?invalidation, "kernel cache invalidated"),
-            Err(error) if error.raw_os_error() == Some(nix::libc::ENOENT) => {}
-            Err(error) => tracing::debug!(?invalidation, %error, "invalidation failed"),
-        }
     }
 }
 

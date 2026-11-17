@@ -34,12 +34,35 @@ pub enum Request {
         reset: bool,
     },
     /// Start a web login in the daemon and answer with its link (D042).
-    Login,
+    /// A daemon waiting for the keyring tries it first (D106). Without
+    /// `force`, a daemon whose session is not rejected answers that no
+    /// sign-in is needed (D108); older clients send no `force`.
+    Login {
+        #[serde(default)]
+        force: bool,
+    },
+    /// The desktop's session bus, from `session attach` (D102), and the
+    /// display variables set there (D102 amended; absent from older
+    /// clients).
+    AttachBus {
+        address: String,
+        #[serde(default)]
+        display: crate::bus::Display,
+    },
     /// Upload everything pending, then answer (`unmount --wait`).
     Drain {
         timeout_secs: u64,
     },
     Unmount,
+    /// Unmount one further root (M5.10, D110); the daemon goes on.
+    UnmountRoot {
+        mountpoint: PathBuf,
+    },
+    /// Mount a further root again, read-only with `-o ro` (M5.10, D110).
+    MountRoot {
+        mountpoint: PathBuf,
+        read_only: bool,
+    },
     /// Access rules (DESIGN.md §11.5); paths are relative to the mount root.
     AccessSet {
         path: String,
@@ -141,15 +164,118 @@ pub struct StatusReply {
     /// Why the last daemon login failed.
     pub sign_in_error: Option<String>,
     pub username: String,
-    /// Where the session is stored.
+    /// Where the session is stored, as a phrase `status` shows in brackets:
+    /// "stored in keyring", "fake backend, no stored secrets".
     pub credentials: String,
     pub quota_used: Option<u64>,
     pub quota_max: Option<u64>,
     pub inodes: u64,
+    /// My Files' disk cache.
     pub cache_bytes: u64,
     pub cache_blocks: u64,
+    /// The profile's cap and every tree's bytes against it (D110 amended);
+    /// absent from older daemons.
+    #[serde(default)]
+    pub cache_profile: Option<CacheProfileReply>,
     /// `None` without pins.
     pub pinned: Option<PinnedReply>,
+    /// Pending markers of other devices (D076); absent from older daemons.
+    #[serde(default)]
+    pub incoming: Vec<pdmount_core::engine::marker::IncomingMarker>,
+    /// Markers beyond the engine's cap, not read (D126).
+    #[serde(default)]
+    pub incoming_not_read: u64,
+    /// Why the daemon waits to finish its start (the keyring, D106) and when it
+    /// tries again, as `status` shows it.
+    #[serde(default)]
+    pub keyring_wait: Option<String>,
+    /// With the desktop's bus attached (D102): the bus the keyring and
+    /// notifications last used, as `status` shows it.
+    #[serde(default)]
+    pub desktop_bus: Option<String>,
+    /// The address of the attached desktop bus, for `doctor` (D100); `None`
+    /// when none is attached.
+    #[serde(default)]
+    pub attached_bus: Option<String>,
+    /// Why the session's current tokens are not stored yet (D106 amended).
+    #[serde(default)]
+    pub tokens_unsaved: Option<String>,
+    /// The further roots (M5.10, D110); absent from older daemons.
+    #[serde(default)]
+    pub roots: Vec<RootReply>,
+}
+
+/// One further root in `StatusReply`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootReply {
+    pub mountpoint: PathBuf,
+    pub kind: String,
+    /// "mounted", "not mounted", "unmounted from outside" or "failed: ...".
+    pub state: String,
+    pub read_only: bool,
+    pub trees: Vec<TreeReply>,
+}
+
+/// One tree of a further root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TreeReply {
+    pub name: String,
+    /// The write gate is open.
+    pub writable: bool,
+    pub pending: u64,
+    pub parked: u64,
+    pub events_last_poll_secs: Option<u64>,
+    /// Why the tree is left out of its mount.
+    pub error: Option<String>,
+    /// The tree's disk cache, counted against the profile's cap.
+    #[serde(default)]
+    pub cache_bytes: u64,
+    /// A share's role (`viewer`, `editor`, `admin`; Shared, D112).
+    #[serde(default)]
+    pub role: Option<String>,
+    /// How often its volume's poller polls now (D107).
+    #[serde(default)]
+    pub poll_interval_secs: Option<u64>,
+    /// What else the tree's line says (Photos: its stages, D113).
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// Other devices' pending markers in the tree's root (D076, D114); none
+    /// while its write gate is closed (D126).
+    #[serde(default)]
+    pub incoming: Vec<pdmount_core::engine::marker::IncomingMarker>,
+    /// Markers beyond the engine's cap, not read (D126).
+    #[serde(default)]
+    pub incoming_not_read: u64,
+    /// Why the tree's changes wait, e.g. the server refused one (D114).
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// The profile's disk cache: one cap for My Files and every further tree
+/// (D110 amended).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheProfileReply {
+    /// Unpinned bytes of every open tree together.
+    pub bytes: u64,
+    /// `cache.max_bytes`.
+    pub max_bytes: u64,
+    /// Open trees on the cap, My Files included.
+    pub trees: u64,
+}
+
+impl CacheProfileReply {
+    pub fn of(stats: &pdmount_core::cache::DiskStats) -> Self {
+        Self {
+            bytes: stats.profile_bytes,
+            max_bytes: stats.max_bytes,
+            trees: stats.caches,
+        }
+    }
+
+    /// Further trees share the cap.
+    pub fn shared(&self) -> bool {
+        self.trees > 1
+    }
 }
 
 /// All pins together, in `StatusReply`.
@@ -165,6 +291,30 @@ pub struct PinnedReply {
 pub struct LoginReply {
     pub url: String,
     pub code: String,
+    /// The daemon needs no sign-in (D106, D108): its session is not
+    /// rejected; `url` and `code` are empty.
+    #[serde(default)]
+    pub not_needed: bool,
+    /// The mount's account, with `not_needed`; absent from older daemons.
+    #[serde(default)]
+    pub account: String,
+}
+
+/// `AttachBus`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AttachReply {
+    /// The daemon's own bus is the desktop's: nothing was kept.
+    pub same: bool,
+    /// The bus each service now uses (D102 amended); absent from older
+    /// daemons.
+    #[serde(default)]
+    pub keyring: Option<crate::bus::Choice>,
+    #[serde(default)]
+    pub notifications: Option<crate::bus::Choice>,
+    /// The display variables set on the daemon's own bus (D102 amended);
+    /// empty when none were, and from older daemons.
+    #[serde(default)]
+    pub display: Vec<String>,
 }
 
 /// `Drain`.
@@ -389,9 +539,12 @@ pub struct SyncReply {
 /// `CacheStats`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CacheStatsReply {
-    /// Against `max_bytes`; pinned blocks are apart.
+    /// My Files', against `max_bytes`; pinned blocks are apart.
     pub bytes: u64,
     pub max_bytes: u64,
+    /// The profile's total; absent from older daemons.
+    #[serde(default)]
+    pub profile: Option<CacheProfileReply>,
     pub blocks: u64,
     pub pinned_bytes: u64,
     pub protected_revisions: u64,
@@ -403,8 +556,11 @@ pub struct CacheStatsReply {
 pub struct CacheFreedReply {
     pub blocks: u64,
     pub bytes: u64,
-    /// Against the cap, afterwards.
+    /// My Files', afterwards.
     pub left_bytes: u64,
+    /// The profile's total afterwards; absent from older daemons.
+    #[serde(default)]
+    pub profile: Option<CacheProfileReply>,
 }
 
 /// `Unmount`, and requests that answer only whether they worked.
@@ -593,6 +749,23 @@ pub fn remove(socket: &PathBuf) {
 mod tests {
     use super::*;
 
+    /// `force` is new in D108: an older client's `login` parses without it.
+    #[test]
+    fn login_requests_parse_with_and_without_force() {
+        let parse = |line: &str| serde_json::from_str::<Request>(line).expect("parse");
+        assert_eq!(parse(r#"{"cmd":"login"}"#), Request::Login { force: false });
+        assert_eq!(
+            parse(r#"{"cmd":"login","force":true}"#),
+            Request::Login { force: true }
+        );
+        let line = serde_json::to_string(&Request::Login { force: true }).expect("serialize");
+        assert_eq!(parse(&line), Request::Login { force: true });
+        // An older daemon's reply has no `account`.
+        let reply: LoginReply =
+            serde_json::from_str(r#"{"url":"","code":"","not_needed":true}"#).expect("reply");
+        assert!(reply.not_needed && reply.account.is_empty());
+    }
+
     #[tokio::test]
     async fn requests_round_trip() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -696,5 +869,30 @@ mod tests {
                 all: true
             }
         );
+    }
+
+    /// D102 amended: the display fields are optional both ways, so a client
+    /// and a daemon of different versions still attach.
+    #[test]
+    fn attach_without_the_display_still_parses() {
+        let old: Request =
+            serde_json::from_str(r#"{"cmd":"attach_bus","address":"unix:path=/run/user/1/bus"}"#)
+                .expect("parse");
+        assert_eq!(
+            old,
+            Request::AttachBus {
+                address: "unix:path=/run/user/1/bus".into(),
+                display: crate::bus::Display::new(),
+            }
+        );
+        let new = serde_json::to_value(Request::AttachBus {
+            address: "unix:path=/b".into(),
+            display: [("DISPLAY".to_owned(), ":0".to_owned())].into(),
+        })
+        .expect("json");
+        assert_eq!(new["display"]["DISPLAY"], ":0");
+        let reply: AttachReply =
+            serde_json::from_str(r#"{"ok":true,"same":false,"keyring":"own"}"#).expect("parse");
+        assert!(reply.display.is_empty() && reply.notifications.is_none());
     }
 }

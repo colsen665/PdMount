@@ -70,6 +70,12 @@ counters! {
     cache_pool_fallbacks,
     /// Blocks fetched by readahead or prefetch.
     prefetched_blocks,
+    /// Scans begun by an open in this tree (D111).
+    scans,
+    /// Slow-path reads served as scan reads (D111).
+    scan_reads,
+    /// Blocks evicted to keep scan blocks within `scan.cache_share`.
+    scan_evictions,
     /// Slow-path requests answered EIO because their deadline expired.
     deadline_expired,
     /// FUSE callbacks that panicked (answered EIO).
@@ -373,6 +379,14 @@ impl Backend for TimedBackend {
 
     async fn get_nodes(&self, ids: &[LinkId]) -> pdmount_backend::Result<Vec<Option<RemoteNode>>> {
         self.timed(Op::BackendGetNodes, self.inner.get_nodes(ids))
+            .await
+    }
+
+    async fn get_nodes_checked(
+        &self,
+        ids: &[LinkId],
+    ) -> pdmount_backend::Result<Vec<pdmount_backend::NodeLookup>> {
+        self.timed(Op::BackendGetNodes, self.inner.get_nodes_checked(ids))
             .await
     }
 

@@ -101,9 +101,24 @@ pub struct ProfilePaths {
     pub state_dir: PathBuf,
     /// `$XDG_RUNTIME_DIR/pdmount/`
     pub runtime_dir: Option<PathBuf>,
+    /// `~/.cache/thumbnails/`: the freedesktop thumbnail cache, where a
+    /// Photos mount writes Proton's thumbnails (M5.13b, D115). Not the
+    /// profile's: every program of the user reads it.
+    pub thumbnails_dir: PathBuf,
 }
 
 const APP_DIR: &str = "pdmount";
+
+/// The directory name of a further tree (D110): 32 hex digits of a hash of
+/// its volume and root link, so the same tree finds its state again and no
+/// server-chosen id becomes a path.
+pub fn tree_key(volume: &str, root: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(volume.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(root.as_bytes());
+    hasher.finalize().to_hex()[..32].to_owned()
+}
 
 /// A SQLite database and its WAL side files.
 pub fn sqlite_files(db: &Path) -> [PathBuf; 3] {
@@ -122,6 +137,7 @@ impl ProfilePaths {
             cache_dir: base.cache.join(APP_DIR).join(profile.as_str()),
             state_dir: base.state.join(APP_DIR),
             runtime_dir: base.runtime.as_ref().map(|dir| dir.join(APP_DIR)),
+            thumbnails_dir: base.cache.join("thumbnails"),
             profile,
         }
     }
@@ -197,6 +213,44 @@ impl ProfilePaths {
         self.data_dir.join("staging")
     }
 
+    /// The queued changes of shares that went away with them (D080, D114):
+    /// `~/.local/share/pdmount/<profile>/orphaned/`, one directory per share.
+    pub fn orphaned_dir(&self) -> PathBuf {
+        self.data_dir.join("orphaned")
+    }
+
+    /// The names the Shared mount shows its shares under (D125), so that a
+    /// remount keeps them: `~/.local/share/pdmount/<profile>/shared-names.json`.
+    pub fn shared_names_file(&self) -> PathBuf {
+        self.data_dir.join("shared-names.json")
+    }
+
+    /// The state of the further trees (D110): `~/.local/share/pdmount/<profile>/trees/`,
+    /// one directory per tree with its `state.db` and `staging/`.
+    pub fn trees_data_dir(&self) -> PathBuf {
+        self.data_dir.join("trees")
+    }
+
+    /// The block caches of the further trees: `~/.cache/pdmount/<profile>/trees/`.
+    pub fn trees_cache_dir(&self) -> PathBuf {
+        self.cache_dir.join("trees")
+    }
+
+    /// The store of a further tree ([`tree_key`]).
+    pub fn tree_state_db(&self, key: &str) -> PathBuf {
+        self.trees_data_dir().join(key).join("state.db")
+    }
+
+    /// The staging of a further tree.
+    pub fn tree_staging_dir(&self, key: &str) -> PathBuf {
+        self.trees_data_dir().join(key).join("staging")
+    }
+
+    /// The block cache of a further tree.
+    pub fn tree_blocks_dir(&self, key: &str) -> PathBuf {
+        self.trees_cache_dir().join(key).join("blocks")
+    }
+
     /// `~/.local/state/pdmount/<profile>.log`
     pub fn log_file(&self) -> PathBuf {
         self.named(&self.state_dir, ".log")
@@ -214,6 +268,17 @@ impl ProfilePaths {
     /// Process id of the running daemon, next to the control socket.
     pub fn pid_file(&self) -> PathBuf {
         self.control_socket().with_extension("pid")
+    }
+
+    /// `$XDG_RUNTIME_DIR/pdmount/<profile>.attach`: the desktop's bus kept by
+    /// the last `session attach`, read again by the next daemon's start
+    /// (D102 amended). `None` when the session has no runtime directory:
+    /// then nothing is saved, as the data directory would outlive the
+    /// session.
+    pub fn attach_file(&self) -> Option<PathBuf> {
+        self.runtime_dir
+            .as_ref()
+            .map(|dir| self.named(dir, ".attach"))
     }
 }
 
@@ -290,6 +355,10 @@ mod tests {
             paths.pid_file(),
             PathBuf::from("/run/user/1000/pdmount/work.pid")
         );
+        assert_eq!(
+            paths.attach_file(),
+            Some(PathBuf::from("/run/user/1000/pdmount/work.attach"))
+        );
     }
 
     #[test]
@@ -301,6 +370,37 @@ mod tests {
         assert_eq!(
             ProfilePaths::new(Profile::default(), &base).control_socket(),
             PathBuf::from("/home/u/.local/share/pdmount/default/control.sock")
+        );
+        assert_eq!(
+            ProfilePaths::new(Profile::default(), &base).attach_file(),
+            None,
+            "no saved attach without a runtime directory"
+        );
+    }
+
+    #[test]
+    fn further_trees_keep_their_state_apart_from_my_files() {
+        let paths = ProfilePaths::new("work".parse().expect("profile"), &base());
+        let key = tree_key("vol-1", "link-2");
+        assert_eq!(key.len(), 32);
+        assert_eq!(key, tree_key("vol-1", "link-2"));
+        assert_ne!(key, tree_key("vol-1", "link-3"));
+        assert_ne!(tree_key("ab", "c"), tree_key("a", "bc"));
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(
+            paths.tree_state_db(&key),
+            PathBuf::from(format!(
+                "/home/u/.local/share/pdmount/work/trees/{key}/state.db"
+            ))
+        );
+        assert_eq!(
+            paths.tree_blocks_dir(&key),
+            PathBuf::from(format!("/home/u/.cache/pdmount/work/trees/{key}/blocks"))
+        );
+        // My Files' paths are unchanged.
+        assert_eq!(
+            paths.state_db(),
+            PathBuf::from("/home/u/.local/share/pdmount/work/state.db")
         );
     }
 }

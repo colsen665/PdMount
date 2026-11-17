@@ -31,16 +31,41 @@
 //! direction. The cost is slept after the fault checks and before the call
 //! changes or reads the drive, outside the state lock.
 //!
+//! Several volumes and shares (M5.10, D110): the drive's own volume
+//! ([`MAIN_VOLUME`]) holds My Files; [`FakeBackend::add_root`] adds a root
+//! folder without a parent, on the drive's own volume (as a device's) or on
+//! another user's volume, optionally shared with the drive's user in a
+//! role ([`FakeRole`]). A handle made by [`FakeBackend::tree`] serves one
+//! such tree like `ProtonBackend` does: `account` and `root` name the tree's
+//! root, and `latest_event_id` and `poll_events` follow that volume's events
+//! only (event ids stay absolute over all volumes). A handle acts as the
+//! drive's user unless [`FakeClient::user`] names another; nodes on another
+//! user's volume can be read only through a share with that user as a
+//! member, and changed only as an `Editor` or `Admin`
+//! ([`BackendError::PermissionDenied`] otherwise; unreachable nodes read as
+//! not found). Moves between volumes are [`BackendError::InvalidMove`].
+//!
+//! Photos (M5.13, D113): the drive user's Photos volume ([`PHOTOS_VOLUME`])
+//! has a root folder holding the photos ([`FakeBackend::add_photo`]), each
+//! with a capture time, tags and, for a related photo, its main photo. The
+//! [`Photos`] timeline lists them newest first, 500 per page; a handle from
+//! [`FakeBackend::photos_tree`] reads them and polls their events.
+//!
 //! Growth is bounded for long runs (fsx, the scenario matrix): files keep
 //! their last revisions (`PDMOUNT_FAKE_KEEP_REVISIONS`, default 16), the
 //! most recent trashed nodes are kept, and the event and change logs are
 //! trimmed, keeping absolute sequence numbers. Injected failures,
 //! latency and the network's pipes stay per process.
 
+use crate::photos::{
+    MAX_THUMBNAIL_BYTES, Photos, PhotosVolume, RelatedPhoto, THUMBNAIL_BATCH, TIMELINE_PAGE,
+    ThumbnailRef, TimelineItem,
+};
+use crate::shared::{CorePage, DegradedShare, ShareRole, SharedEntry, SharedListing, SharedWithMe};
 use crate::{
     AccountInfo, Backend, BackendError, BlockInfo, EventId, EventKind, EventPage, FileMeta, LinkId,
-    NameHash, NodeKind, RemoteEvent, RemoteNode, Result, RevisionId, RevisionMeta, StorageInfo,
-    UploadSource,
+    NameHash, NodeKind, NodeLookup, RemoteEvent, RemoteNode, Result, RevisionId, RevisionMeta,
+    StorageInfo, UploadSource,
 };
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -50,7 +75,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 
@@ -87,12 +112,25 @@ pub enum FakeOp {
     LatestEventId,
     PollEvents,
     StorageInfo,
+    /// The shared-with-me listing ([`SharedWithMe`]).
+    SharedWithMe,
+    /// The core event stream ([`SharedWithMe`]).
+    CoreEvents,
+    /// The Photos volume and its timeline ([`Photos`]).
+    Timeline,
+    /// A photo's thumbnail: its reference or a batch of downloads
+    /// ([`Photos::thumbnail_ref`], [`Photos::fetch_thumbnails`]).
+    Thumbnails,
 }
 
 /// Who is calling: handles made by [`FakeBackend::with_client`] differ in
 /// what their uploads record, like the daemon and the official apps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FakeClient {
+    /// The account and root of an earlier online run: `account` then
+    /// answers from it without a request, like `ProtonBackend::with_root`,
+    /// so a daemon can start while the drive is unreachable (§9.6).
+    pub known_account: Option<AccountInfo>,
     /// The SDK client UID (`pdmount-<device id>`); `None` for tests that
     /// do not care.
     pub uid: Option<String>,
@@ -100,15 +138,103 @@ pub struct FakeClient {
     pub claims_sha1: bool,
     /// Uploads carry `pdmount.mode` (the official apps leave it out).
     pub claims_mode: bool,
+    /// The user the handle acts as; `None`: the drive's user.
+    pub user: Option<String>,
+    /// The tree the handle serves ([`FakeBackend::tree`]); `None`: My Files.
+    pub tree: Option<FakeTree>,
 }
 
 impl Default for FakeClient {
     fn default() -> Self {
         Self {
+            known_account: None,
             uid: None,
             claims_sha1: true,
             claims_mode: true,
+            user: None,
+            tree: None,
         }
+    }
+}
+
+/// The volume of My Files on every fake drive (`proton-root.json` records
+/// it as the volume of a fake profile).
+pub const MAIN_VOLUME: &str = "fake";
+
+/// The volume of the drive user's Photos ([`FakeBackend::add_photo`]).
+pub const PHOTOS_VOLUME: &str = "photos";
+
+/// A member's role in a share, as the server reports it on the share's root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FakeRole {
+    Viewer,
+    Editor,
+    Admin,
+}
+
+impl FakeRole {
+    /// Whether the role may change the share's content.
+    pub fn may_write(self) -> bool {
+        matches!(self, Self::Editor | Self::Admin)
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "viewer" => Some(Self::Viewer),
+            "editor" => Some(Self::Editor),
+            "admin" => Some(Self::Admin),
+            _ => None,
+        }
+    }
+}
+
+/// A tree a handle serves: a volume and a root folder on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FakeTree {
+    pub volume: String,
+    pub root: LinkId,
+}
+
+/// A volume other than [`MAIN_VOLUME`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FakeVolume {
+    owner: String,
+}
+
+/// A share: a folder or a file on a volume, with its members' roles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FakeShare {
+    volume: String,
+    root: LinkId,
+    members: BTreeMap<String, FakeRole>,
+    /// Creation order (the id counter at creation); orders the listing.
+    #[serde(default)]
+    created: u64,
+}
+
+/// What [`FakeBackend::add_root`] made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddedRoot {
+    pub volume: String,
+    pub root: LinkId,
+    /// The share with the drive's user, when the root is another user's.
+    pub share: Option<String>,
+}
+
+/// An event as kept: the volume it belongs to, `None` for [`MAIN_VOLUME`]
+/// (the only one events of older fakes have).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FakeEvent {
+    #[serde(flatten)]
+    event: RemoteEvent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    volume: Option<String>,
+}
+
+impl FakeEvent {
+    fn volume(&self) -> &str {
+        self.volume.as_deref().unwrap_or(MAIN_VOLUME)
     }
 }
 
@@ -300,6 +426,10 @@ pub fn clear_profile(dir: &Path) -> Result<()> {
 struct Links {
     up: Mutex<tokio::time::Instant>,
     down: Mutex<tokio::time::Instant>,
+    /// Block downloads and file uploads in flight over the process's
+    /// handles, for tests of the session's limits (D033, D110).
+    fetches: InFlight,
+    uploads: InFlight,
 }
 
 impl Links {
@@ -308,7 +438,39 @@ impl Links {
         Self {
             up: Mutex::new(now),
             down: Mutex::new(now),
+            fetches: InFlight::default(),
+            uploads: InFlight::default(),
         }
+    }
+}
+
+/// Calls of one kind in flight, and the most seen at once.
+#[derive(Default)]
+struct InFlight {
+    now: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl InFlight {
+    /// Counts a call until the guard drops.
+    fn enter(&self) -> InFlightGuard<'_> {
+        let now = self.now.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        InFlightGuard(self)
+    }
+
+    /// The most calls in flight at once since the last take; starts over.
+    fn take_peak(&self) -> usize {
+        self.peak
+            .swap(self.now.load(Ordering::SeqCst), Ordering::SeqCst)
+    }
+}
+
+struct InFlightGuard<'a>(&'a InFlight);
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.now.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -383,6 +545,85 @@ struct Node {
     /// Generation of the trashing, for retention.
     #[serde(default)]
     trashed_at: u64,
+    /// The volume of a root folder other than My Files'
+    /// ([`FakeBackend::add_root`]); `None` everywhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    volume: Option<String>,
+    /// A photo's timeline fields ([`FakeBackend::add_photo`]); `None`
+    /// everywhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    photo: Option<FakePhoto>,
+}
+
+/// What the timeline knows of a photo (M5.13).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FakePhoto {
+    capture_time: i64,
+    #[serde(default)]
+    tags: Vec<u8>,
+    /// The main photo of a related one (a Live Photo's video).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    main: Option<LinkId>,
+    /// Its 512 px thumbnail (M5.13b); `None`: it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thumbnail: Option<FakeThumbnail>,
+}
+
+/// A photo's thumbnail on the fake (M5.13b, D115): a lossless WebP of one
+/// colour, made from these fields when it is asked for, so the drive's
+/// files stay small. Its digest is that of the bytes as the uploader made
+/// them; the faults change what the server sends or what was signed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FakeThumbnail {
+    pub width: u32,
+    pub height: u32,
+    /// The server sends other bytes than those the manifest signs.
+    #[serde(default)]
+    pub tampered: bool,
+    /// What was signed is no WebP.
+    #[serde(default)]
+    pub not_webp: bool,
+}
+
+impl FakeThumbnail {
+    /// What `pdmount fake photo add|seed` give a photo: 512 x 384, the long
+    /// side of Proton's thumbnail.
+    pub const DEFAULT: Self = Self {
+        width: 512,
+        height: 384,
+        tampered: false,
+        not_webp: false,
+    };
+
+    /// The bytes as the uploader made and signed them; the colour comes
+    /// from `seed` (the photo's link), so photos tell apart.
+    pub fn signed_bytes(&self, seed: &str) -> Vec<u8> {
+        if self.not_webp {
+            return format!("not a WebP: {seed}").into_bytes();
+        }
+        let colour = sha2::Sha256::digest(seed.as_bytes());
+        let pixels = (self.width as usize) * (self.height as usize);
+        let rgb: Vec<u8> = std::iter::repeat_n([colour[0], colour[1], colour[2]], pixels)
+            .flatten()
+            .collect();
+        let mut out = Vec::new();
+        image_webp::WebPEncoder::new(&mut out)
+            .encode(&rgb, self.width, self.height, image_webp::ColorType::Rgb8)
+            .expect("a WebP of one colour encodes");
+        out
+    }
+
+    /// What the server sends.
+    fn served_bytes(&self, seed: &str) -> Vec<u8> {
+        let mut bytes = self.signed_bytes(seed);
+        if self.tampered {
+            match bytes.last_mut() {
+                Some(last) => *last ^= 0xff,
+                None => bytes.push(0),
+            }
+        }
+        bytes
+    }
 }
 
 impl Node {
@@ -444,6 +685,9 @@ struct Meta {
     events_base: u64,
     changes_base: u64,
     keep_revisions: usize,
+    /// The core event stream's position ([`FakeBackend::core_signal`]).
+    #[serde(default)]
+    core_events: u64,
 }
 
 /// One journaled delta.
@@ -451,9 +695,11 @@ struct Meta {
 enum Record {
     Node(Node),
     Removed(LinkId),
-    Event(RemoteEvent),
+    Event(FakeEvent),
     Change(FakeChange),
     Meta(Meta),
+    Volume(String, FakeVolume),
+    Share(String, FakeShare),
 }
 
 /// One journal line: everything one operation changed.
@@ -471,11 +717,18 @@ struct Delta {
     changes: usize,
     meta: bool,
     trashed: bool,
+    volumes: BTreeSet<String>,
+    shares: BTreeSet<String>,
 }
 
 impl Delta {
     fn is_empty(&self) -> bool {
-        self.nodes.is_empty() && self.events == 0 && self.changes == 0 && !self.meta
+        self.nodes.is_empty()
+            && self.events == 0
+            && self.changes == 0
+            && !self.meta
+            && self.volumes.is_empty()
+            && self.shares.is_empty()
     }
 }
 
@@ -497,8 +750,14 @@ struct State {
     username: String,
     root: LinkId,
     nodes: BTreeMap<LinkId, Node>,
-    events: Vec<RemoteEvent>,
+    events: Vec<FakeEvent>,
     changes: Vec<FakeChange>,
+    /// Volumes other than [`MAIN_VOLUME`], by id.
+    #[serde(default)]
+    volumes: BTreeMap<String, FakeVolume>,
+    /// Shares by id.
+    #[serde(default)]
+    shares: BTreeMap<String, FakeShare>,
     /// Absolute index of `events[0]` (event ids are absolute).
     #[serde(default)]
     events_base: u64,
@@ -510,12 +769,23 @@ struct State {
     block_size: usize,
     #[serde(default = "default_keep_revisions")]
     keep_revisions: usize,
+    /// `DriveShareRefresh` events sent on the core stream so far: each
+    /// [`FakeBackend::core_signal`] adds one (M5.12).
+    #[serde(default)]
+    core_events: u64,
     #[serde(skip, default = "default_page_size")]
     event_page_size: usize,
+    /// Volumes whose next poll answers `refresh`.
     #[serde(skip)]
-    refresh_pending: bool,
+    refresh_pending: BTreeSet<String>,
     #[serde(skip)]
     faults: VecDeque<(FakeOp, BackendError)>,
+    /// Renames that take effect and then fail ([`FakeBackend::lose_rename_reply`]).
+    #[serde(skip)]
+    lost_rename_replies: VecDeque<BackendError>,
+    /// Nodes whose metadata "cannot be decrypted" ([`FakeBackend::set_degraded`]).
+    #[serde(skip)]
+    degraded: HashSet<LinkId>,
     #[serde(skip)]
     latency: Duration,
     #[serde(skip)]
@@ -562,6 +832,8 @@ impl State {
                 folder_mtime: None,
                 revisions: Vec::new(),
                 trashed_at: 0,
+                volume: None,
+                photo: None,
             },
         );
         Self {
@@ -574,15 +846,20 @@ impl State {
             nodes,
             events: Vec::new(),
             changes: Vec::new(),
+            volumes: BTreeMap::new(),
+            shares: BTreeMap::new(),
             events_base: 0,
             changes_base: 0,
             next_id: 0,
             quota_max: 5 << 30,
             block_size: FakeBackend::DEFAULT_BLOCK_SIZE,
             keep_revisions: DEFAULT_KEEP_REVISIONS,
+            core_events: 0,
             event_page_size: default_page_size(),
-            refresh_pending: false,
+            refresh_pending: BTreeSet::new(),
             faults: VecDeque::new(),
+            lost_rename_replies: VecDeque::new(),
+            degraded: HashSet::new(),
             latency: Duration::ZERO,
             pauses: Vec::new(),
             commit_checks_revision: true,
@@ -753,14 +1030,102 @@ impl State {
     }
 
     fn push_event(&mut self, kind: EventKind, link: &LinkId) {
+        let volume = self.volume_of(link);
         let node = &self.nodes[link];
-        self.events.push(RemoteEvent {
-            kind,
-            link_id: link.clone(),
-            parent_link_id: node.parent.clone(),
-            trashed: node.trashed,
+        self.events.push(FakeEvent {
+            event: RemoteEvent {
+                kind,
+                link_id: link.clone(),
+                parent_link_id: node.parent.clone(),
+                trashed: node.trashed,
+            },
+            volume: (volume != MAIN_VOLUME).then_some(volume),
         });
         self.delta.events += 1;
+    }
+
+    /// The top folder above `link` (itself for a root).
+    fn top_of(&self, link: &LinkId) -> LinkId {
+        let mut current = link.clone();
+        // Bounded: a cycle cannot form (moves into a descendant fail).
+        for _ in 0..4096 {
+            match self
+                .nodes
+                .get(&current)
+                .and_then(|node| node.parent.clone())
+            {
+                Some(parent) => current = parent,
+                None => break,
+            }
+        }
+        current
+    }
+
+    /// The volume `link` is on: that of its top folder. My Files' root, and
+    /// a root no volume claims, are on [`MAIN_VOLUME`].
+    fn volume_of(&self, link: &LinkId) -> String {
+        let top = self.top_of(link);
+        self.nodes
+            .get(&top)
+            .and_then(|node| node.volume.clone())
+            .unwrap_or_else(|| MAIN_VOLUME.to_owned())
+    }
+
+    /// Shares `link` on `volume` with the drive's user as `role`; returns
+    /// the share's id.
+    fn add_share(&mut self, volume: &str, link: &LinkId, role: FakeRole) -> String {
+        let id = self.new_id("share-");
+        let members = BTreeMap::from([(self.username.clone(), role)]);
+        let created = self.next_id;
+        self.shares.insert(
+            id.clone(),
+            FakeShare {
+                volume: volume.to_owned(),
+                root: link.clone(),
+                members,
+                created,
+            },
+        );
+        self.delta.shares.insert(id.clone());
+        id
+    }
+
+    fn owner_of(&self, volume: &str) -> &str {
+        match self.volumes.get(volume) {
+            Some(volume) => &volume.owner,
+            None => &self.username,
+        }
+    }
+
+    /// The role `user` has on `link`: `None` for the owner of its volume
+    /// (who may do anything), the best role of the shares above it
+    /// otherwise; [`BackendError::NotFound`] when no share reaches it.
+    fn role_of(&self, user: &str, link: &LinkId) -> Result<Option<FakeRole>> {
+        let volume = self.volume_of(link);
+        if self.owner_of(&volume) == user {
+            return Ok(None);
+        }
+        self.shares
+            .values()
+            .filter(|share| share.volume == volume && self.is_descendant(link, &share.root))
+            .filter_map(|share| share.members.get(user).copied())
+            .max_by_key(|role| *role as u8)
+            .map(Some)
+            .ok_or(BackendError::NotFound)
+    }
+
+    /// Whether `user` may read `link`.
+    fn may_read(&self, user: &str, link: &LinkId) -> bool {
+        self.role_of(user, link).is_ok()
+    }
+
+    /// `PermissionDenied` unless `user` may change `link`.
+    fn check_write(&self, user: &str, link: &LinkId) -> Result<()> {
+        match self.role_of(user, link)? {
+            None => Ok(()),
+            Some(role) if role.may_write() => Ok(()),
+            Some(_) => Err(BackendError::PermissionDenied),
+        }
     }
 
     fn push_change(&mut self, change: FakeChange) {
@@ -770,6 +1135,98 @@ impl State {
 
     fn latest_event(&self) -> u64 {
         self.events_base + self.events.len() as u64
+    }
+
+    /// The Photos root, if the drive has one.
+    fn photos_root_if_any(&self) -> Option<LinkId> {
+        self.nodes
+            .values()
+            .find(|node| node.parent.is_none() && node.volume.as_deref() == Some(PHOTOS_VOLUME))
+            .map(|node| node.link.clone())
+    }
+
+    /// The thumbnail of revision `revision` of photo `link`, when that
+    /// revision is the photo's active one.
+    fn photo_thumbnail(
+        &self,
+        link: &LinkId,
+        revision: &RevisionId,
+    ) -> Result<Option<FakeThumbnail>> {
+        let node = self.node(link)?;
+        let photo = node.photo.as_ref().ok_or(BackendError::NotFound)?;
+        if node.active().map(|rev| &rev.id) != Some(revision) {
+            return Err(BackendError::NotFound);
+        }
+        Ok(photo.thumbnail)
+    }
+
+    /// The Photos root, made at the first use (named "root", as Proton's).
+    fn photos_root(&mut self) -> LinkId {
+        if let Some(root) = self.photos_root_if_any() {
+            return root;
+        }
+        let link = LinkId::new(self.new_id("photos-root-"));
+        self.put_node(Node {
+            link: link.clone(),
+            parent: None,
+            name: "root".into(),
+            kind: NodeKind::Folder,
+            trashed: false,
+            folder_mtime: Some(SystemTime::now()),
+            revisions: Vec::new(),
+            trashed_at: 0,
+            volume: Some(PHOTOS_VOLUME.to_owned()),
+            photo: None,
+        });
+        self.touch(&link);
+        link
+    }
+
+    /// The timeline: the photos that are no related photo and not trashed,
+    /// newest first (ties by link, so pages are stable), each with its
+    /// related photos.
+    fn timeline(&self) -> Vec<TimelineItem> {
+        let Some(root) = self.photos_root_if_any() else {
+            return Vec::new();
+        };
+        let in_root = |node: &&Node| {
+            node.parent.as_ref() == Some(&root) && !node.trashed && node.photo.is_some()
+        };
+        let mut related: HashMap<&LinkId, Vec<RelatedPhoto>> = HashMap::new();
+        for node in self.nodes.values().filter(in_root) {
+            let photo = node.photo.as_ref().expect("filtered");
+            if let Some(main) = &photo.main {
+                related.entry(main).or_default().push(RelatedPhoto {
+                    link: node.link.clone(),
+                    capture_time: photo.capture_time,
+                });
+            }
+        }
+        let mut items: Vec<TimelineItem> = self
+            .nodes
+            .values()
+            .filter(in_root)
+            .filter(|node| {
+                node.photo
+                    .as_ref()
+                    .is_some_and(|photo| photo.main.is_none())
+            })
+            .map(|node| {
+                let photo = node.photo.as_ref().expect("filtered");
+                TimelineItem {
+                    link: node.link.clone(),
+                    capture_time: photo.capture_time,
+                    tags: photo.tags.clone(),
+                    related: related.remove(&node.link).unwrap_or_default(),
+                }
+            })
+            .collect();
+        items.sort_by(|a, b| {
+            b.capture_time
+                .cmp(&a.capture_time)
+                .then_with(|| b.link.cmp(&a.link))
+        });
+        items
     }
 
     fn is_descendant(&self, node: &LinkId, ancestor: &LinkId) -> bool {
@@ -872,6 +1329,7 @@ impl State {
             events_base: self.events_base,
             changes_base: self.changes_base,
             keep_revisions: self.keep_revisions,
+            core_events: self.core_events,
         }
     }
 
@@ -951,6 +1409,16 @@ impl State {
                 .cloned()
                 .map(Record::Event),
         );
+        records.extend(delta.volumes.iter().filter_map(|id| {
+            self.volumes
+                .get(id)
+                .map(|volume| Record::Volume(id.clone(), volume.clone()))
+        }));
+        records.extend(delta.shares.iter().filter_map(|id| {
+            self.shares
+                .get(id)
+                .map(|share| Record::Share(id.clone(), share.clone()))
+        }));
         records.extend(
             self.changes[self.changes.len() - delta.changes..]
                 .iter()
@@ -1020,11 +1488,18 @@ impl State {
             }
             Record::Event(event) => self.events.push(event),
             Record::Change(change) => self.changes.push(change),
+            Record::Volume(id, volume) => {
+                self.volumes.insert(id, volume);
+            }
+            Record::Share(id, share) => {
+                self.shares.insert(id, share);
+            }
             Record::Meta(meta) => {
                 self.next_id = meta.next_id;
                 self.quota_max = meta.quota_max;
                 self.block_size = meta.block_size;
                 self.keep_revisions = meta.keep_revisions;
+                self.core_events = self.core_events.max(meta.core_events);
                 if meta.events_base > self.events_base {
                     let cut =
                         ((meta.events_base - self.events_base) as usize).min(self.events.len());
@@ -1105,6 +1580,8 @@ impl State {
             nodes,
             events,
             changes,
+            volumes,
+            shares,
             events_base,
             changes_base,
             next_id,
@@ -1115,6 +1592,8 @@ impl State {
             used,
             ..
         } = loaded;
+        self.volumes = volumes;
+        self.shares = shares;
         self.generation = generation;
         self.epoch = epoch;
         self.journal_offset = journal_offset;
@@ -1307,9 +1786,324 @@ impl FakeBackend {
         self.state.lock().faults.push_back((op, error));
     }
 
-    /// Makes the next event poll answer `refresh = true`.
+    /// Makes the next rename that succeeds fail afterwards with `error`, as
+    /// a request whose reply was lost: the drive has the new name, the
+    /// caller sees the error (one-shot, FIFO). In this process only.
+    pub fn lose_rename_reply(&self, error: BackendError) {
+        self.state.lock().lost_rename_replies.push_back(error);
+    }
+
+    /// Makes `link`'s metadata unreadable, as a node whose name or keys the
+    /// SDK cannot decrypt (D119): `get_nodes` answers `None` for it, as for
+    /// a node that does not exist, `get_nodes_checked` tells it apart
+    /// (`Degraded`), and the shared-with-me listing names a share whose
+    /// root it is as degraded. In this process only.
+    pub fn set_degraded(&self, link: &LinkId, degraded: bool) {
+        let mut state = self.state.lock();
+        if degraded {
+            state.degraded.insert(link.clone());
+        } else {
+            state.degraded.remove(link);
+        }
+    }
+
+    /// Makes the next event poll of My Files' volume answer `refresh = true`.
     pub fn request_refresh(&self) {
-        self.state.lock().refresh_pending = true;
+        self.request_volume_refresh(MAIN_VOLUME);
+    }
+
+    /// Makes the next event poll of `volume` answer `refresh = true`.
+    pub fn request_volume_refresh(&self, volume: &str) {
+        self.state.lock().refresh_pending.insert(volume.to_owned());
+    }
+
+    /// A handle on the same drive that serves the tree with root `root` on
+    /// `volume` (see the module doc).
+    pub fn tree(&self, volume: &str, root: LinkId) -> Self {
+        let mut client = (*self.client).clone();
+        client.tree = Some(FakeTree {
+            volume: volume.to_owned(),
+            root,
+        });
+        self.with_client(client)
+    }
+
+    /// The volume this handle's events come from.
+    fn volume(&self) -> &str {
+        self.client
+            .tree
+            .as_ref()
+            .map_or(MAIN_VOLUME, |tree| tree.volume.as_str())
+    }
+
+    /// Adds a root folder named `name` without a parent: with `owner`
+    /// `None` (or the drive's user) on the drive's own volume, like a
+    /// device's root; otherwise on `owner`'s volume, made at its first use,
+    /// and shared with the drive's user as `role` when one is given.
+    pub fn add_root(
+        &self,
+        name: &str,
+        owner: Option<&str>,
+        role: Option<FakeRole>,
+    ) -> Result<AddedRoot> {
+        self.with_state(|s| {
+            let owner = owner
+                .filter(|owner| *owner != s.username)
+                .map(str::to_owned);
+            let volume = match &owner {
+                None => MAIN_VOLUME.to_owned(),
+                Some(owner) => match s.volumes.iter().find(|(_, v)| &v.owner == owner) {
+                    Some((id, _)) => id.clone(),
+                    None => {
+                        let id = s.new_id("vol-");
+                        s.volumes.insert(
+                            id.clone(),
+                            FakeVolume {
+                                owner: owner.clone(),
+                            },
+                        );
+                        s.delta.volumes.insert(id.clone());
+                        id
+                    }
+                },
+            };
+            let link = LinkId::new(s.new_id("link-"));
+            s.put_node(Node {
+                link: link.clone(),
+                parent: None,
+                name: name.to_owned(),
+                kind: NodeKind::Folder,
+                trashed: false,
+                folder_mtime: Some(SystemTime::now()),
+                revisions: Vec::new(),
+                trashed_at: 0,
+                volume: (volume != MAIN_VOLUME).then(|| volume.clone()),
+                photo: None,
+            });
+            s.touch(&link);
+            s.push_event(EventKind::Create, &link);
+            let share = role.map(|role| s.add_share(&volume, &link, role));
+            Ok(AddedRoot {
+                volume,
+                root: link,
+                share,
+            })
+        })
+    }
+
+    /// Adds a file named `name` with `content` on `owner`'s volume, in a
+    /// folder of its own that is not shared, and shares the file alone with
+    /// the drive's user as `role` (a shared single file, M5.12).
+    pub async fn add_shared_file(
+        &self,
+        name: &str,
+        content: &[u8],
+        owner: &str,
+        role: FakeRole,
+    ) -> Result<AddedRoot> {
+        let holder = self.add_root(&format!("holder of {name}"), Some(owner), None)?;
+        let as_owner = self.with_client(FakeClient {
+            user: Some(owner.to_owned()),
+            ..FakeClient::default()
+        });
+        let meta = FileMeta {
+            mtime: SystemTime::now(),
+            mode: Some(0o644),
+            media_type: "application/octet-stream".into(),
+            sha1: None,
+        };
+        let source = UploadSource::Bytes(Bytes::copy_from_slice(content));
+        let (link, _) = as_owner
+            .upload_new(&holder.root, name, source, meta)
+            .await?;
+        let volume = holder.volume;
+        let share = self.with_state(|s| Ok(s.add_share(&volume, &link, role)))?;
+        Ok(AddedRoot {
+            volume,
+            root: link,
+            share: Some(share),
+        })
+    }
+
+    /// Sends one `DriveShareRefresh` on the core event stream: a Shared
+    /// mount polling it reads the listing again (M5.12). Changes to shares
+    /// send none by themselves, so a test decides when the signal comes.
+    pub fn core_signal(&self) -> Result<()> {
+        self.with_state(|s| {
+            s.core_events += 1;
+            s.delta.meta = true;
+            Ok(())
+        })
+    }
+
+    /// Gives `user` the role `role` in `share`, or with `None` removes the
+    /// membership.
+    pub fn set_member_role(&self, share: &str, user: &str, role: Option<FakeRole>) -> Result<()> {
+        self.with_state(|s| {
+            let entry = s.shares.get_mut(share).ok_or(BackendError::NotFound)?;
+            match role {
+                Some(role) => entry.members.insert(user.to_owned(), role),
+                None => entry.members.remove(user),
+            };
+            s.delta.shares.insert(share.to_owned());
+            Ok(())
+        })
+    }
+
+    /// Gives the drive's user the role `role` in `share`; `None` revokes
+    /// the share for them.
+    pub fn set_own_role(&self, share: &str, role: Option<FakeRole>) -> Result<()> {
+        let user = self.with_state(|s| Ok(s.username.clone()))?;
+        self.set_member_role(share, &user, role)
+    }
+
+    /// Adds a photo named `name` to the drive user's Photos (M5.13): a file
+    /// in the Photos root, on [`PHOTOS_VOLUME`] (made at the first photo),
+    /// with its timeline fields; with `main`, a related photo of that one
+    /// (a Live Photo's video). Sends a `Create` event on the Photos volume.
+    /// Returns the photo's link.
+    pub async fn add_photo(
+        &self,
+        name: &str,
+        source: UploadSource,
+        capture_time: i64,
+        tags: Vec<u8>,
+        main: Option<LinkId>,
+    ) -> Result<LinkId> {
+        let staged = self.stage(source).await?;
+        let meta = FileMeta {
+            mtime: UNIX_EPOCH + Duration::from_secs(capture_time.max(0) as u64),
+            mode: None,
+            media_type: "image/jpeg".into(),
+            sha1: None,
+        };
+        self.with_state(|s| {
+            let root = s.photos_root();
+            s.ensure_name_free(&root, name, None)?;
+            if let Some(main) = &main {
+                let node = s.node(main)?;
+                if node.photo.is_none() || node.parent.as_ref() != Some(&root) {
+                    return Err(BackendError::Other(format!("{main} is not a photo")));
+                }
+            }
+            s.ensure_quota(staged.size)?;
+            let link = LinkId::new(s.new_id("photo-"));
+            let (_, rev) = s.new_revision(staged, &meta, &self.client)?;
+            s.put_node(Node {
+                link: link.clone(),
+                parent: Some(root),
+                name: name.to_owned(),
+                kind: NodeKind::File,
+                trashed: false,
+                folder_mtime: None,
+                revisions: vec![rev],
+                trashed_at: 0,
+                volume: None,
+                photo: Some(FakePhoto {
+                    capture_time,
+                    tags,
+                    main,
+                    thumbnail: Some(FakeThumbnail::DEFAULT),
+                }),
+            });
+            s.touch(&link);
+            s.push_event(EventKind::Create, &link);
+            s.push_change(FakeChange::CreatedFile {
+                link: link.clone(),
+                name: name.to_owned(),
+            });
+            Ok(link)
+        })
+    }
+
+    /// Sets or removes the thumbnail of photo `link` (M5.13b);
+    /// [`FakeBackend::add_photo`] gives every photo
+    /// [`FakeThumbnail::DEFAULT`].
+    pub fn set_photo_thumbnail(
+        &self,
+        link: &LinkId,
+        thumbnail: Option<FakeThumbnail>,
+    ) -> Result<()> {
+        self.with_state(|s| {
+            let node = s.nodes.get_mut(link).ok_or(BackendError::NotFound)?;
+            let photo = node
+                .photo
+                .as_mut()
+                .ok_or_else(|| BackendError::Other(format!("{link} is not a photo")))?;
+            photo.thumbnail = thumbnail;
+            s.touch(link);
+            Ok(())
+        })
+    }
+
+    /// Makes the file `link` in the Photos root a photo of the timeline,
+    /// as a draft whose upload finishes: the timeline lists it from now on,
+    /// and an `UpdateMetadata` event of the Photos volume says so (D119).
+    pub fn commit_photo(&self, link: &LinkId, capture_time: i64, tags: Vec<u8>) -> Result<()> {
+        self.with_state(|s| {
+            let root = s.photos_root();
+            let node = s.nodes.get_mut(link).ok_or(BackendError::NotFound)?;
+            if node.parent.as_ref() != Some(&root) || node.kind != NodeKind::File {
+                return Err(BackendError::Other(format!(
+                    "{link} is not a file in the Photos root"
+                )));
+            }
+            node.photo = Some(FakePhoto {
+                capture_time,
+                tags,
+                main: None,
+                thumbnail: Some(FakeThumbnail::DEFAULT),
+            });
+            s.touch(link);
+            s.push_event(EventKind::UpdateMetadata, link);
+            Ok(())
+        })
+    }
+
+    /// The photo named `name` in the Photos root, if any.
+    pub fn photo_named(&self, name: &str) -> Option<LinkId> {
+        self.with_state(|s| {
+            let root = s.photos_root_if_any();
+            Ok(root.and_then(|root| s.child_named(&root, name).map(|node| node.link.clone())))
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// The Photos volume and root, if the drive has photos (no request).
+    pub fn photos_volume_now(&self) -> Option<PhotosVolume> {
+        let root = self.with_state(|s| Ok(s.photos_root_if_any())).ok()??;
+        Some(PhotosVolume {
+            volume: PHOTOS_VOLUME.to_owned(),
+            root,
+        })
+    }
+
+    /// A handle on the Photos tree (made if missing): its volume and root.
+    pub fn photos_tree(&self) -> Result<Self> {
+        let root = self.with_state(|s| Ok(s.photos_root()))?;
+        Ok(self.tree(PHOTOS_VOLUME, root))
+    }
+
+    /// The user calls of this handle act as.
+    fn user(&self, s: &State) -> String {
+        self.client
+            .user
+            .clone()
+            .unwrap_or_else(|| s.username.clone())
+    }
+
+    /// Whether this handle's user may read `link`.
+    fn may_read(&self, s: &State, link: &LinkId) -> bool {
+        s.may_read(&self.user(s), link)
+    }
+
+    /// The root this handle serves.
+    fn tree_root(&self, s: &State) -> LinkId {
+        self.client
+            .tree
+            .as_ref()
+            .map_or_else(|| s.root.clone(), |tree| tree.root.clone())
     }
 
     pub fn set_quota(&self, max: u64) {
@@ -1403,6 +2197,17 @@ impl FakeBackend {
     /// Delays every read call (root, listings, blocks) by `latency`.
     pub fn set_latency(&self, latency: Duration) {
         self.state.lock().latency = latency;
+    }
+
+    /// The most block downloads in flight at once over this process's
+    /// handles since the last call (or the start); then starts over.
+    pub fn take_peak_block_fetches(&self) -> usize {
+        self.links.fetches.take_peak()
+    }
+
+    /// [`FakeBackend::take_peak_block_fetches`] for file uploads.
+    pub fn take_peak_uploads(&self) -> usize {
+        self.links.uploads.take_peak()
     }
 
     async fn delay(&self) {
@@ -1606,11 +2411,18 @@ impl Backend for FakeBackend {
     }
 
     async fn account(&self) -> Result<AccountInfo> {
+        if let Some(known) = &self.client.known_account {
+            return Ok(known.clone());
+        }
         self.enter(FakeOp::Account, 1).await?;
         self.with_state(|s| {
+            let root = self.tree_root(s);
+            if !self.may_read(s, &root) {
+                return Err(BackendError::NotFound);
+            }
             Ok(AccountInfo {
-                username: s.username.clone(),
-                root: s.root.clone(),
+                username: self.user(s),
+                root,
             })
         })
     }
@@ -1618,7 +2430,13 @@ impl Backend for FakeBackend {
     async fn root(&self) -> Result<RemoteNode> {
         self.delay().await;
         self.enter(FakeOp::Root, 1).await?;
-        self.with_state(|s| Ok(s.nodes[&s.root].to_remote()))
+        self.with_state(|s| {
+            let root = self.tree_root(s);
+            if !self.may_read(s, &root) {
+                return Err(BackendError::NotFound);
+            }
+            Ok(s.node(&root)?.to_remote())
+        })
     }
 
     async fn list_children(&self, folder: &LinkId) -> Result<Vec<RemoteNode>> {
@@ -1627,6 +2445,9 @@ impl Backend for FakeBackend {
         let profile = self.enter(FakeOp::ListChildren, 1).await?;
         let children = self.with_state(|s| {
             s.folder(folder)?;
+            if !self.may_read(s, folder) {
+                return Err(BackendError::NotFound);
+            }
             // By name, as the index keeps them.
             Ok(s.children.get(folder).map_or_else(Vec::new, |children| {
                 children
@@ -1641,12 +2462,27 @@ impl Backend for FakeBackend {
     }
 
     async fn get_nodes(&self, ids: &[LinkId]) -> Result<Vec<Option<RemoteNode>>> {
+        Ok(self
+            .get_nodes_checked(ids)
+            .await?
+            .into_iter()
+            .map(NodeLookup::found)
+            .collect())
+    }
+
+    async fn get_nodes_checked(&self, ids: &[LinkId]) -> Result<Vec<NodeLookup>> {
         self.delay().await;
         self.enter(FakeOp::GetNodes, pages(ids.len())).await?;
         self.with_state(|s| {
             Ok(ids
                 .iter()
-                .map(|id| s.nodes.get(id).map(Node::to_remote))
+                .map(
+                    |id| match s.nodes.get(id).filter(|_| self.may_read(s, id)) {
+                        None => NodeLookup::Absent,
+                        Some(_) if s.degraded.contains(id) => NodeLookup::Degraded,
+                        Some(node) => NodeLookup::Found(node.to_remote()),
+                    },
+                )
                 .collect())
         })
     }
@@ -1655,7 +2491,11 @@ impl Backend for FakeBackend {
         self.delay().await;
         self.enter(FakeOp::Blocks, 1).await?;
         self.with_state(|s| {
-            let node = s.nodes.get(file).ok_or(BackendError::NotFound)?;
+            let node = s
+                .nodes
+                .get(file)
+                .filter(|_| self.may_read(s, file))
+                .ok_or(BackendError::NotFound)?;
             let rev = node.revision(revision)?;
             let block = s.block_size as u64;
             Ok((0..rev.size.div_ceil(block))
@@ -1668,9 +2508,15 @@ impl Backend for FakeBackend {
     }
 
     async fn fetch_block(&self, file: &LinkId, revision: &RevisionId, index: u32) -> Result<Bytes> {
+        let _in_flight = self.links.fetches.enter();
         self.delay().await;
         let profile = self.enter(FakeOp::FetchBlock, 1).await?;
-        let block = self.with_state(|s| s.block(file, revision, index))?;
+        let block = self.with_state(|s| {
+            if !self.may_read(s, file) {
+                return Err(BackendError::NotFound);
+            }
+            s.block(file, revision, index)
+        })?;
         self.read_block(block, &profile).await
     }
 
@@ -1681,9 +2527,15 @@ impl Backend for FakeBackend {
         index: u32,
         buf: &mut [u8],
     ) -> Result<usize> {
+        let _in_flight = self.links.fetches.enter();
         self.delay().await;
         let profile = self.enter(FakeOp::FetchBlock, 1).await?;
-        let block = self.with_state(|s| s.block(file, revision, index))?;
+        let block = self.with_state(|s| {
+            if !self.may_read(s, file) {
+                return Err(BackendError::NotFound);
+            }
+            s.block(file, revision, index)
+        })?;
         let (len, capacity) = (block.len(), buf.len());
         let target = buf.get_mut(..len as usize).ok_or_else(|| {
             BackendError::Integrity(format!(
@@ -1719,11 +2571,13 @@ impl Backend for FakeBackend {
         source: UploadSource,
         meta: FileMeta,
     ) -> Result<(LinkId, RevisionId)> {
+        let _in_flight = self.links.uploads.enter();
         let staged = self.stage(source).await?;
         let profile = self.enter(FakeOp::UploadNew, 1).await?;
         // Draft: the server checks the name when the draft is created ...
         self.with_state(|s| {
             s.folder(parent)?;
+            s.check_write(&self.user(s), parent)?;
             s.ensure_name_free(parent, name, None)
         })?;
         self.send_blocks(&profile, staged.size).await;
@@ -1744,6 +2598,8 @@ impl Backend for FakeBackend {
                 folder_mtime: None,
                 revisions: vec![rev],
                 trashed_at: 0,
+                volume: None,
+                photo: None,
             });
             s.touch(&link);
             s.push_event(EventKind::Create, &link);
@@ -1762,6 +2618,7 @@ impl Backend for FakeBackend {
         source: UploadSource,
         meta: FileMeta,
     ) -> Result<RevisionId> {
+        let _in_flight = self.links.uploads.enter();
         let staged = self.stage(source).await?;
         let profile = self.enter(FakeOp::UploadRevision, 1).await?;
         // Draft: the base must be the active revision.
@@ -1770,6 +2627,7 @@ impl Backend for FakeBackend {
             if node.kind != NodeKind::File {
                 return Err(BackendError::Other(format!("{file} is not a file")));
             }
+            s.check_write(&self.user(s), file)?;
             let current = node.active().map(|r| r.id.clone());
             if current.as_ref() != Some(base) {
                 return Err(BackendError::RevisionConflict { current });
@@ -1806,6 +2664,7 @@ impl Backend for FakeBackend {
         self.enter(FakeOp::CreateFolder, 1).await?;
         self.with_state(|s| {
             s.folder(parent)?;
+            s.check_write(&self.user(s), parent)?;
             s.ensure_name_free(parent, name, None)?;
             let link = LinkId::new(s.new_id("link-"));
             s.put_node(Node {
@@ -1817,6 +2676,8 @@ impl Backend for FakeBackend {
                 folder_mtime: Some(mtime),
                 revisions: Vec::new(),
                 trashed_at: 0,
+                volume: None,
+                photo: None,
             });
             s.touch(&link);
             s.push_event(EventKind::Create, &link);
@@ -1855,7 +2716,10 @@ impl Backend for FakeBackend {
                     .ok_or(BackendError::PermissionDenied)?,
             };
             s.folder(&parent)?;
-            if s.is_descendant(&parent, node) {
+            let user = self.user(s);
+            s.check_write(&user, node)?;
+            s.check_write(&user, &parent)?;
+            if s.is_descendant(&parent, node) || s.volume_of(&parent) != s.volume_of(node) {
                 return Err(BackendError::InvalidMove);
             }
             s.ensure_name_free(&parent, new_name, Some(node))?;
@@ -1870,7 +2734,11 @@ impl Backend for FakeBackend {
                 name: new_name.to_owned(),
             });
             Ok(())
-        })
+        })?;
+        match self.state.lock().lost_rename_replies.pop_front() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     async fn trash(&self, nodes: &[LinkId]) -> Result<Vec<Result<()>>> {
@@ -1880,10 +2748,10 @@ impl Backend for FakeBackend {
             Ok(nodes
                 .iter()
                 .map(|link| {
-                    if link == &s.root {
+                    if link == &s.root || s.node(link)?.parent.is_none() {
                         return Err(BackendError::PermissionDenied);
                     }
-                    s.node(link)?;
+                    s.check_write(&self.user(s), link)?;
                     let at = s.generation + 1;
                     s.update_node(link, |entry| {
                         entry.trashed = true;
@@ -1902,7 +2770,11 @@ impl Backend for FakeBackend {
     async fn revisions(&self, file: &LinkId) -> Result<Vec<RevisionMeta>> {
         self.enter(FakeOp::Revisions, 1).await?;
         self.with_state(|s| {
-            let node = s.nodes.get(file).ok_or(BackendError::NotFound)?;
+            let node = s
+                .nodes
+                .get(file)
+                .filter(|_| self.may_read(s, file))
+                .ok_or(BackendError::NotFound)?;
             if node.kind != NodeKind::File {
                 return Err(BackendError::Other(format!("{file} is not a file")));
             }
@@ -1938,8 +2810,9 @@ impl Backend for FakeBackend {
                 .ok()
                 .filter(|&i| i <= latest)
                 .ok_or_else(|| BackendError::Other(format!("unknown event id {since}")))?;
+            let volume = self.volume();
             // A cursor older than the kept events: the client must refresh.
-            if std::mem::take(&mut s.refresh_pending) || since < s.events_base {
+            if s.refresh_pending.remove(volume) || since < s.events_base {
                 return Ok(EventPage {
                     next: EventId::new(latest.to_string()),
                     more: false,
@@ -1947,13 +2820,20 @@ impl Backend for FakeBackend {
                     events: Vec::new(),
                 });
             }
-            let start = (since - s.events_base) as usize;
-            let end = (start + s.event_page_size).min(s.events.len());
+            // Only this volume's events; the ids count every volume's.
+            let mut end = (since - s.events_base) as usize;
+            let mut events = Vec::new();
+            while end < s.events.len() && events.len() < s.event_page_size {
+                if s.events[end].volume() == volume {
+                    events.push(s.events[end].event.clone());
+                }
+                end += 1;
+            }
             Ok(EventPage {
                 next: EventId::new((s.events_base + end as u64).to_string()),
-                more: end < s.events.len(),
+                more: s.events[end..].iter().any(|event| event.volume() == volume),
                 refresh: false,
-                events: s.events[start..end].to_vec(),
+                events,
             })
         })
     }
@@ -1969,10 +2849,288 @@ impl Backend for FakeBackend {
     }
 }
 
+/// The fake's shared-with-me (M5.12): the shares of other users' volumes
+/// with this handle's user as a member, oldest first; the core stream
+/// carries one `DriveShareRefresh` per [`FakeBackend::core_signal`].
+#[async_trait::async_trait]
+impl SharedWithMe for FakeBackend {
+    async fn shared_with_me(&self) -> Result<Vec<SharedEntry>> {
+        Ok(self.shared_listing().await?.entries)
+    }
+
+    /// A share whose root is degraded ([`FakeBackend::set_degraded`]) is
+    /// listed as degraded, as Proton's (D119).
+    async fn shared_listing(&self) -> Result<SharedListing> {
+        self.enter(FakeOp::SharedWithMe, 1).await?;
+        self.with_state(|s| {
+            let user = self.user(s);
+            let mut shares: Vec<(&String, &FakeShare)> = s
+                .shares
+                .iter()
+                .filter(|(_, share)| s.owner_of(&share.volume) != user)
+                .collect();
+            shares.sort_by_key(|(id, share)| (share.created, (*id).clone()));
+            let mut degraded = Vec::new();
+            let entries = shares
+                .into_iter()
+                .filter_map(|(id, share)| {
+                    let role = share.members.get(&user)?;
+                    let node = s.node(&share.root).ok()?;
+                    if s.degraded.contains(&share.root) {
+                        degraded.push(DegradedShare {
+                            share: id.clone(),
+                            volume: share.volume.clone(),
+                            root: share.root.clone(),
+                        });
+                        return None;
+                    }
+                    Some(SharedEntry {
+                        share: id.clone(),
+                        volume: share.volume.clone(),
+                        root: share.root.clone(),
+                        kind: node.kind,
+                        name: node.name.clone(),
+                        owner: s.owner_of(&share.volume).to_owned(),
+                        role: match role {
+                            FakeRole::Viewer => ShareRole::Viewer,
+                            FakeRole::Editor => ShareRole::Editor,
+                            FakeRole::Admin => ShareRole::Admin,
+                        },
+                        created: Some(UNIX_EPOCH + Duration::from_secs(share.created)),
+                    })
+                })
+                .collect();
+            Ok(SharedListing { entries, degraded })
+        })
+    }
+
+    async fn latest_core_event_id(&self) -> Result<EventId> {
+        self.enter(FakeOp::CoreEvents, 1).await?;
+        self.with_state(|s| Ok(EventId::new(format!("core-{}", s.core_events))))
+    }
+
+    async fn poll_core_events(&self, since: &EventId) -> Result<CorePage> {
+        self.enter(FakeOp::CoreEvents, 1).await?;
+        self.with_state(|s| {
+            let since: u64 = since
+                .as_str()
+                .strip_prefix("core-")
+                .and_then(|n| n.parse().ok())
+                .filter(|&n| n <= s.core_events)
+                .ok_or_else(|| BackendError::Other(format!("unknown core event id {since}")))?;
+            Ok(CorePage {
+                next: EventId::new(format!("core-{}", s.core_events)),
+                more: false,
+                refresh: false,
+                shares_changed: since < s.core_events,
+            })
+        })
+    }
+}
+
+/// Photos as the server keeps them (M5.13): [`PHOTOS_VOLUME`] and its
+/// timeline, a page of [`TIMELINE_PAGE`] per call.
+#[async_trait::async_trait]
+impl Photos for FakeBackend {
+    async fn photos_volume(&self) -> Result<Option<PhotosVolume>> {
+        self.enter(FakeOp::Timeline, 1).await?;
+        self.with_state(|s| {
+            Ok(s.photos_root_if_any().map(|root| PhotosVolume {
+                volume: PHOTOS_VOLUME.to_owned(),
+                root,
+            }))
+        })
+    }
+
+    async fn timeline_page(
+        &self,
+        volume: &str,
+        after: Option<&LinkId>,
+    ) -> Result<Vec<TimelineItem>> {
+        self.delay().await;
+        self.enter(FakeOp::Timeline, 1).await?;
+        if volume != PHOTOS_VOLUME {
+            return Err(BackendError::NotFound);
+        }
+        self.with_state(|s| {
+            let items = s.timeline();
+            let start = match after {
+                None => 0,
+                Some(after) => match items.iter().position(|item| &item.link == after) {
+                    Some(at) => at + 1,
+                    // The anchor is gone: as the server, an empty page.
+                    None => return Ok(Vec::new()),
+                },
+            };
+            Ok(items.into_iter().skip(start).take(TIMELINE_PAGE).collect())
+        })
+    }
+
+    async fn thumbnail_ref(
+        &self,
+        volume: &str,
+        link: &LinkId,
+        revision: &RevisionId,
+    ) -> Result<Option<ThumbnailRef>> {
+        self.delay().await;
+        self.enter(FakeOp::Thumbnails, 1).await?;
+        if volume != PHOTOS_VOLUME {
+            return Err(BackendError::NotFound);
+        }
+        self.with_state(|s| {
+            let thumbnail = s.photo_thumbnail(link, revision)?;
+            Ok(thumbnail.map(|thumbnail| {
+                let signed = thumbnail.signed_bytes(link.as_str());
+                ThumbnailRef {
+                    link: link.clone(),
+                    revision: revision.clone(),
+                    id: format!("thumb-{revision}"),
+                    digest: sha2::Sha256::digest(&signed).to_vec(),
+                    size: signed.len() as u64,
+                }
+            }))
+        })
+    }
+
+    async fn fetch_thumbnails(
+        &self,
+        volume: &str,
+        thumbnails: &[ThumbnailRef],
+    ) -> Result<Vec<Result<Bytes>>> {
+        self.delay().await;
+        self.enter(FakeOp::Thumbnails, 1).await?;
+        if volume != PHOTOS_VOLUME {
+            return Err(BackendError::NotFound);
+        }
+        if thumbnails.len() > THUMBNAIL_BATCH {
+            return Err(BackendError::Other(format!(
+                "{} thumbnails in one request, more than {THUMBNAIL_BATCH}",
+                thumbnails.len()
+            )));
+        }
+        self.with_state(|s| {
+            Ok(thumbnails
+                .iter()
+                .map(|wanted| {
+                    let thumbnail = s
+                        .photo_thumbnail(&wanted.link, &wanted.revision)?
+                        .ok_or(BackendError::NotFound)?;
+                    let served = thumbnail.served_bytes(wanted.link.as_str());
+                    // As `ProtonBackend`: the size, then the digest that
+                    // the verified manifest gave.
+                    if served.len() > MAX_THUMBNAIL_BYTES {
+                        return Err(BackendError::Integrity(format!(
+                            "the thumbnail of {} has {} bytes",
+                            wanted.link,
+                            served.len()
+                        )));
+                    }
+                    if sha2::Sha256::digest(&served).as_slice() != wanted.digest.as_slice() {
+                        return Err(BackendError::Integrity(format!(
+                            "the thumbnail of {} is not the one its revision's manifest signs",
+                            wanted.link
+                        )));
+                    }
+                    Ok(Bytes::from(served))
+                })
+                .collect())
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn the_timeline_pages_newest_first_with_related_photos() {
+        let fake = FakeBackend::new();
+        assert_eq!(fake.photos_volume().await.expect("volume"), None);
+        let photo = |n: usize| UploadSource::Bytes(Bytes::from(format!("photo {n}")));
+        let count = TIMELINE_PAGE * 2 + 10;
+        for n in 0..count {
+            fake.add_photo(
+                &format!("P{n}.jpg"),
+                photo(n),
+                n as i64 * 60,
+                Vec::new(),
+                None,
+            )
+            .await
+            .expect("add");
+        }
+        let still = fake
+            .add_photo("L.HEIC", photo(9999), 1_000_000, vec![3], None)
+            .await
+            .expect("still");
+        let video = fake
+            .add_photo(
+                "L.MOV",
+                photo(9998),
+                1_000_001,
+                vec![2],
+                Some(still.clone()),
+            )
+            .await
+            .expect("video");
+        let volume = fake.photos_volume().await.expect("volume").expect("some");
+        assert_eq!(volume.volume, PHOTOS_VOLUME);
+        let mut pages = Vec::new();
+        let mut after = None;
+        loop {
+            let page = fake
+                .timeline_page(&volume.volume, after.as_ref())
+                .await
+                .expect("page");
+            let last = page.last().map(|item| item.link.clone());
+            let full = page.len() == TIMELINE_PAGE;
+            pages.push(page);
+            if !full {
+                break;
+            }
+            after = last;
+        }
+        assert_eq!(
+            pages.iter().map(Vec::len).collect::<Vec<_>>(),
+            [TIMELINE_PAGE, TIMELINE_PAGE, 11],
+            "the video is no item of its own"
+        );
+        let first = &pages[0][0];
+        assert_eq!(first.link, still);
+        assert_eq!(first.tags, [3]);
+        assert_eq!(first.related.len(), 1);
+        assert_eq!(first.related[0].link, video);
+        let times: Vec<i64> = pages
+            .iter()
+            .flatten()
+            .map(|item| item.capture_time)
+            .collect();
+        assert!(
+            times.windows(2).all(|pair| pair[0] >= pair[1]),
+            "newest first"
+        );
+        // Photos live on their own volume: the tree handle sees their
+        // events and nodes, My Files' does not.
+        let tree = fake.photos_tree().expect("tree");
+        let nodes = tree
+            .get_nodes(std::slice::from_ref(&video))
+            .await
+            .expect("nodes");
+        assert_eq!(
+            nodes[0].as_ref().map(|node| node.name.as_str()),
+            Some("L.MOV")
+        );
+        let page = tree.poll_events(&EventId::new("0")).await.expect("events");
+        assert!(page.more && !page.events.is_empty());
+        assert!(
+            page.events
+                .iter()
+                .all(|event| event.kind == EventKind::Create)
+        );
+        let mine = fake.poll_events(&EventId::new("0")).await.expect("events");
+        assert!(mine.events.is_empty());
+    }
 
     fn meta() -> FileMeta {
         FileMeta {
@@ -2237,6 +3395,31 @@ mod tests {
             Err(BackendError::Transient("503".into()))
         );
         assert!(fake.list_children(&root).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_lost_rename_reply_fails_a_rename_that_took_effect() {
+        let fake = FakeBackend::new();
+        let root = root(&fake).await;
+        let (file, _) = fake
+            .upload_new(&root, "a", bytes(b"x"), meta())
+            .await
+            .expect("upload");
+        fake.lose_rename_reply(BackendError::Transient("timeout".into()));
+        assert_eq!(
+            fake.rename(&file, None, "b", None).await,
+            Err(BackendError::Transient("timeout".into()))
+        );
+        let node = fake
+            .get_nodes(std::slice::from_ref(&file))
+            .await
+            .expect("get")[0]
+            .clone()
+            .expect("node");
+        assert_eq!(node.name, "b");
+        fake.rename(&file, None, "c", None)
+            .await
+            .expect("once only");
     }
 
     #[tokio::test]
@@ -2668,6 +3851,7 @@ mod tests {
             uid: Some("web".into()),
             claims_sha1: false,
             claims_mode: false,
+            ..FakeClient::default()
         });
         let half = fake.with_client(FakeClient {
             claims_sha1: true,
@@ -3058,5 +4242,206 @@ mod tests {
             "the steps did something"
         );
         assert_index_consistent(&FakeBackend::open(dir.path()).expect("reopen"));
+    }
+
+    /// Volumes and shares (M5.10): each tree's handle sees its own root and
+    /// its own volume's events; roles decide what a member may change.
+    #[tokio::test]
+    async fn trees_on_other_volumes_have_their_own_events_and_roles() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = FakeBackend::open(dir.path()).expect("open");
+        let main_root = root(&fake).await;
+        let added = fake
+            .add_root("Team", Some("owner@example.test"), Some(FakeRole::Editor))
+            .expect("add root");
+        assert_ne!(added.volume, MAIN_VOLUME);
+        let share = added.share.clone().expect("shared");
+        let tree = fake.tree(&added.volume, added.root.clone());
+        assert_eq!(tree.account().await.expect("account").root, added.root);
+        assert_eq!(tree.root().await.expect("root").name, "Team");
+        // A device-like root on the drive's own volume.
+        let device = fake.add_root("Laptop", None, None).expect("device root");
+        assert_eq!(device.volume, MAIN_VOLUME);
+        assert_eq!(device.share, None);
+
+        let main_since = fake.latest_event_id().await.expect("cursor");
+        let tree_since = tree.latest_event_id().await.expect("cursor");
+        let folder = tree
+            .create_folder(&added.root, "docs", SystemTime::UNIX_EPOCH)
+            .await
+            .expect("an editor creates a folder");
+        let (file, _) = fake
+            .upload_new(&main_root, "mine", bytes(b"x"), meta())
+            .await
+            .expect("upload");
+        let main_page = fake.poll_events(&main_since).await.expect("poll");
+        let tree_page = tree.poll_events(&tree_since).await.expect("poll");
+        let links = |page: &EventPage| -> Vec<LinkId> {
+            page.events.iter().map(|e| e.link_id.clone()).collect()
+        };
+        assert_eq!(links(&main_page), std::slice::from_ref(&file));
+        assert_eq!(links(&tree_page), std::slice::from_ref(&folder));
+        assert!(!main_page.more && !tree_page.more);
+        // Both cursors reach the end of the log, past the other's events.
+        assert_eq!(main_page.next, tree_page.next);
+
+        // A move between volumes is refused.
+        assert_eq!(
+            fake.rename(&file, Some(&folder), "mine", None).await,
+            Err(BackendError::InvalidMove)
+        );
+        // A viewer reads but cannot change.
+        fake.set_member_role(&share, "fake@example.test", Some(FakeRole::Viewer))
+            .expect("role");
+        assert_eq!(
+            tree.create_folder(&added.root, "more", SystemTime::UNIX_EPOCH)
+                .await,
+            Err(BackendError::PermissionDenied)
+        );
+        assert_eq!(
+            tree.list_children(&added.root).await.expect("list").len(),
+            1
+        );
+        // A volume's root cannot be trashed.
+        assert_eq!(
+            tree.trash(std::slice::from_ref(&added.root))
+                .await
+                .expect("trash")[0],
+            Err(BackendError::PermissionDenied)
+        );
+        // The owner may do anything on their volume.
+        let owner = tree.with_client(FakeClient {
+            user: Some("owner@example.test".into()),
+            ..(*tree.client).clone()
+        });
+        owner
+            .create_folder(&added.root, "more", SystemTime::UNIX_EPOCH)
+            .await
+            .expect("the owner writes");
+
+        // Volumes, shares and roles survive reopening.
+        let reopened = FakeBackend::open(dir.path()).expect("reopen");
+        let tree = reopened.tree(&added.volume, added.root.clone());
+        assert_eq!(
+            tree.create_folder(&added.root, "again", SystemTime::UNIX_EPOCH)
+                .await,
+            Err(BackendError::PermissionDenied)
+        );
+        // Without the membership the share is gone for the member.
+        reopened
+            .set_member_role(&share, "fake@example.test", None)
+            .expect("remove");
+        assert_eq!(
+            tree.list_children(&added.root).await,
+            Err(BackendError::NotFound)
+        );
+        assert_eq!(tree.get_nodes(&[folder]).await.expect("get"), [None]);
+        assert_eq!(tree.account().await, Err(BackendError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn a_refresh_is_asked_per_volume() {
+        let fake = FakeBackend::new();
+        let added = fake
+            .add_root("Team", Some("owner@example.test"), Some(FakeRole::Admin))
+            .expect("add root");
+        let tree = fake.tree(&added.volume, added.root.clone());
+        let since = fake.latest_event_id().await.expect("cursor");
+        fake.request_volume_refresh(&added.volume);
+        assert!(!fake.poll_events(&since).await.expect("poll").refresh);
+        assert!(tree.poll_events(&since).await.expect("poll").refresh);
+        assert!(!tree.poll_events(&since).await.expect("poll").refresh);
+    }
+
+    /// M5.12: the listing holds the shares of other users with the drive's
+    /// user as a member, oldest first, files and folders; a revoked share
+    /// leaves it; the core stream signals only when told to, and keeps its
+    /// position in a persisted fake.
+    #[tokio::test]
+    async fn shared_with_me_lists_the_members_shares_and_the_core_stream_signals() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = FakeBackend::open(dir.path()).expect("open");
+        fake.add_root("Laptop", None, None).expect("own root");
+        let team = fake
+            .add_root("Team", Some("alice@example.test"), Some(FakeRole::Viewer))
+            .expect("share");
+        fake.add_root("Private", Some("alice@example.test"), None)
+            .expect("not shared");
+        let file = fake
+            .add_shared_file("plan.txt", b"plan", "bob@example.test", FakeRole::Editor)
+            .await
+            .expect("file share");
+        let listing = fake.shared_with_me().await.expect("listing");
+        let names: Vec<(&str, NodeKind, &str, ShareRole)> = listing
+            .iter()
+            .map(|e| (e.name.as_str(), e.kind, e.owner.as_str(), e.role))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                (
+                    "Team",
+                    NodeKind::Folder,
+                    "alice@example.test",
+                    ShareRole::Viewer
+                ),
+                (
+                    "plan.txt",
+                    NodeKind::File,
+                    "bob@example.test",
+                    ShareRole::Editor
+                ),
+            ]
+        );
+        assert_eq!(listing[0].share, team.share.clone().expect("id"));
+        assert_eq!(listing[1].root, file.root);
+        assert_eq!(listing[1].volume, file.volume);
+        assert!(listing[0].created < listing[1].created);
+        // The owner sees none of them as shared with them.
+        let alice = fake.with_client(FakeClient {
+            user: Some("alice@example.test".into()),
+            ..FakeClient::default()
+        });
+        assert!(
+            alice
+                .shared_with_me()
+                .await
+                .expect("listing")
+                .iter()
+                .all(|e| e.owner != "alice@example.test")
+        );
+
+        let since = fake.latest_core_event_id().await.expect("core id");
+        let page = fake.poll_core_events(&since).await.expect("core");
+        assert!(!page.shares_changed && !page.more && page.next == since);
+        // A revocation changes the listing, not the core stream ...
+        fake.set_own_role(team.share.as_deref().expect("id"), None)
+            .expect("revoke");
+        assert_eq!(fake.shared_with_me().await.expect("listing").len(), 1);
+        assert!(
+            !fake
+                .poll_core_events(&since)
+                .await
+                .expect("core")
+                .shares_changed
+        );
+        // ... until the signal, which a reopened fake keeps.
+        fake.core_signal().expect("signal");
+        let reopened = FakeBackend::open(dir.path()).expect("reopen");
+        let page = reopened.poll_core_events(&since).await.expect("core");
+        assert!(page.shares_changed);
+        assert!(
+            !reopened
+                .poll_core_events(&page.next)
+                .await
+                .expect("core")
+                .shares_changed
+        );
+        assert!(
+            reopened
+                .poll_core_events(&EventId::new("core-99"))
+                .await
+                .is_err()
+        );
     }
 }

@@ -1,0 +1,7 @@
+# Extra steps of the release build job (dist-workspace.toml, `github-build-setup`).
+# The Go toolchain builds proton-crypto's Go library through cgo; its minimum is Go 1.23.
+- name: Install Go
+  uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+  with:
+    go-version: "1.25.x"
+    cache: false
