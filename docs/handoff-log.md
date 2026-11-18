@@ -6,6 +6,13 @@ entry. At the end of a session, add its entry at the top of "Session entries" (A
 
 ## Session entries
 
+- **v0.5.0 released (2026-11-18, Opus):** full CI green on `42e3436`; the pre-push scan blocked 57 generic paths: exempted
+  by pattern in `.betterleaks.toml` (standard files, made-up homes, placeholders) or inline `betterleaks:allow` where the
+  scan matched whole tokens; a shared file's name dropped from `docs/plans/m5.md`. Pushed `318c015` and tag `v0.5.0`; the
+  Release build passed: archive with binary, LICENSE, README, user guide and licences, `sha256sum -c` OK, `--version`
+  0.5.0. GitHub's first quick CI failed: `protobuf-compiler` with `--no-install-recommends` has no well-known types
+  (`google/protobuf/any.proto`); `ci.yml` and the user guide now install `libprotobuf-dev`, and `build-doctor.sh`
+  checks that protoc finds `any.proto`. That fix is a local commit, not pushed.
 - **M5 squashed, decisions consolidated (2026-11-17, Opus orchestrating, four Opus agents):** at the user's request the
   103 outgoing commits became one `M5:` commit (D090) and M5's decisions were consolidated (D129, user): amendments
   folded in, 37 entries merged into 20 (D091←D092; D093←D127; D094←D109; D096←D095, D126; D102←D100;

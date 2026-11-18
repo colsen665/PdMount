@@ -32,7 +32,7 @@ PdMount automatically, run `pdmount autostart enable` or `pdmount service instal
 
 You need Rust 1.89 or newer (rustup), Go 1.23 or newer, a C compiler, clang with libclang, protoc, pkg-config, the
 `libdbus-1` development files and `fusermount3` (FUSE 3). On Debian or Ubuntu: `apt install build-essential git clang
-libclang-dev protobuf-compiler pkg-config libdbus-1-dev fuse3`, plus Rust from rustup and a Go that is new enough.
+libclang-dev protobuf-compiler libprotobuf-dev pkg-config libdbus-1-dev fuse3`, plus Rust from rustup and a Go that is new enough.
 `scripts/build-doctor.sh` checks each of them and says what is missing.
 
 ```sh

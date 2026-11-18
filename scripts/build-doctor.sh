@@ -118,6 +118,15 @@ if have protoc; then
     else
         fail protoc "protoc $protoc_version is older than $min_protoc"
     fi
+    # The SDK's proto file imports google/protobuf/any.proto, which protoc finds in its include folder.
+    proto_dir=$(mktemp -d)
+    printf 'syntax = "proto3";\nimport "google/protobuf/any.proto";\n' >"$proto_dir/check.proto"
+    if protoc -I "$proto_dir" --descriptor_set_out=/dev/null "$proto_dir/check.proto" >/dev/null 2>&1; then
+        ok protobuf-incl "protoc finds google/protobuf/any.proto"
+    else
+        fail protobuf-incl "protoc does not find google/protobuf/any.proto: apt install libprotobuf-dev"
+    fi
+    rm -rf "$proto_dir"
 else
     fail protoc "protoc not found: apt install protobuf-compiler"
 fi
