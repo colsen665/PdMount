@@ -100,10 +100,12 @@ pub trait Photos: Send + Sync + 'static {
     ) -> Result<Vec<TimelineItem>>;
 
     /// The 512 px thumbnail of revision `revision` of photo `link` on
-    /// `volume`: from the revision's block listing, after the listing's
-    /// manifest signature is verified as for a block map (one request, plus
-    /// the signer's keys once). `None` when the revision has none;
-    /// `Integrity` when the manifest does not verify.
+    /// `volume`: from the first page of the revision's block listing (one
+    /// request, plus the signer's keys once), its manifest signature
+    /// verified as a block read's when that page is the whole listing; a
+    /// larger revision's thumbnail is checked by decryption alone (D135).
+    /// `None` when the revision has none; `Integrity` when the manifest
+    /// does not verify.
     async fn thumbnail_ref(
         &self,
         volume: &str,

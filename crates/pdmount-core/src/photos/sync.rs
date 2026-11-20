@@ -2,13 +2,13 @@
 //! of the Photos volume, and the names of the months asked for (see the
 //! module doc of [`super`]).
 
-use super::model::{Month, Node, PhotoMeta, month_name, year_name};
+use super::model::{Month, Node, Photo, PhotoMeta, month_name, year_name};
 use super::{NAME_BATCH, PhotosTree, rows};
 use crate::errors::{CoreError, Result};
 use crate::gate::Turn;
 use crate::health::Connectivity;
 use crate::metrics::check_not_hot;
-use crate::poller::backoff;
+use crate::poller::{backoff, pass_wait};
 use crate::vfs::{Invalidation, ROOT_INO};
 use futures::FutureExt;
 use pdmount_backend::photos::{TIMELINE_PAGE, TimelineItem};
@@ -107,7 +107,8 @@ impl PhotosTree {
     }
 
     /// The timeline read, until one finishes, then the event stream at
-    /// `sync.poll_interval`, with the pollers' back-off (D107, D110).
+    /// `sync.poll_interval`, with the pollers' jitter and back-off (D107,
+    /// D110).
     pub(super) async fn run_timeline_and_events(self: Arc<Self>) {
         let mut failures = 0;
         loop {
@@ -130,7 +131,8 @@ impl PhotosTree {
                     // The blocks' access times, for the cache's LRU after a
                     // restart, as the engine's background task does.
                     self.cache.flush_access();
-                    interval
+                    // The pollers' jitter (parity E1).
+                    pass_wait(interval, rand::random::<f64>())
                 }
                 Err(_) if self.health.state() != Connectivity::Online => {
                     failures = 0;
@@ -282,8 +284,29 @@ impl PhotosTree {
                 .filter_map(|link| Some((link.clone(), model.photo(&link)?.clone())))
                 .collect::<Vec<_>>()
         };
-        rows::put(&self.store, rows);
+        self.put_rows(rows);
         self.folders_changed(&months);
+    }
+
+    /// Queues the rows of `photos`, and keeps the found nodes in step with
+    /// the decoded ones (D132).
+    fn put_rows(&self, photos: Vec<(LinkId, Photo)>) {
+        let mut found = 0;
+        for (link, photo) in &photos {
+            if let Some(meta) = &photo.meta
+                && self.signatures.observe(link, meta.unverified.as_ref())
+            {
+                found += 1;
+            }
+        }
+        if found > 0 {
+            tracing::info!(
+                found,
+                "photos whose signatures do not verify; see `pdmount signatures list`"
+            );
+            self.signatures.announce(found);
+        }
+        rows::put(&self.store, photos);
     }
 
     /// After the model changed in `months`: the kernel's views of the
@@ -337,6 +360,9 @@ impl PhotosTree {
                 months.extend(removed.months);
                 removed_links.extend(removed.links);
             }
+        }
+        for link in &removed_links {
+            self.signatures.observe(link, None);
         }
         rows::remove(&self.store, removed_links);
         self.folders_changed(&months);
@@ -431,7 +457,7 @@ impl PhotosTree {
             }
             rows
         };
-        rows::put(&self.store, rows);
+        self.put_rows(rows);
         self.folders_changed(&months);
     }
 
@@ -806,5 +832,6 @@ fn meta_of(node: &RemoteNode) -> Option<PhotoMeta> {
         name: node.name.clone(),
         size: node.size.unwrap_or(0),
         revision: node.active_revision.clone()?,
+        unverified: node.unverified.clone(),
     })
 }

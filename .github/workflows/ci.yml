@@ -22,7 +22,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # The pinned toolchain; the same stable release as the local CI. Raise it deliberately.
+  # The pinned toolchain; the same stable release as the local CI. Raise it deliberately, together with
+  # .github/build-setup.yml (the release build; checked below) and `dist generate`.
   RUST_TOOLCHAIN: "1.98.1"
   # Minimum of proton-crypto's Go library is 1.23 (.github/build-setup.yml uses the same).
   GO_VERSION: "1.25.x"
@@ -50,6 +51,8 @@ jobs:
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt,clippy
           rustup default "$RUST_TOOLCHAIN"
+      - name: Check the release build uses the same toolchain
+        run: grep -qxF "    rustup toolchain install $RUST_TOOLCHAIN --profile minimal" .github/build-setup.yml
       - name: Check THIRD-PARTY-LICENSES.html is current
         run: |
           cargo install --locked "cargo-about@${CARGO_ABOUT_VERSION}" --features cli

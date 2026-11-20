@@ -62,8 +62,10 @@ pub(super) fn request_handler(
     unmount_tx: tokio::sync::mpsc::Sender<()>,
     roots: Option<Arc<crate::roots::Roots>>,
 ) -> control::Handler {
+    let checks = Arc::new(crate::signatures::Checks::default());
     Arc::new(move |request| {
         let roots = roots.clone();
+        let checks = Arc::clone(&checks);
         let engine = Arc::clone(&engine);
         let mountpoint = mountpoint.clone();
         let username = username.clone();
@@ -125,6 +127,9 @@ pub(super) fn request_handler(
                         desktop_bus: crate::bus::status_text(),
                         attached_bus: crate::bus::attached(),
                         tokens_unsaved: auth.and_then(|auth| auth.unsaved()),
+                        server_time_offset: pdmount_backend::proton::server_time_offset(),
+                        signatures_found: engine.signature_counts().0,
+                        signatures_refused: engine.signature_counts().1,
                     })
                 }
                 Request::Login { force } => {
@@ -277,16 +282,21 @@ pub(super) fn request_handler(
                         bytes: freed.bytes,
                         left_bytes: engine.cache_stats().bytes,
                         profile: Some(control::CacheProfileReply::of(&engine.cache_stats())),
+                        trees: Vec::new(),
                     }))
                 }
-                Request::CacheWipe { path } => {
-                    let freed = engine.cache_wipe(path.as_deref()).await;
-                    control::reply(freed.map(|freed| control::CacheFreedReply {
-                        blocks: freed.blocks,
-                        bytes: freed.bytes,
-                        left_bytes: engine.cache_stats().bytes,
-                        profile: Some(control::CacheProfileReply::of(&engine.cache_stats())),
-                    }))
+                Request::CacheWipe { path, absolute } => {
+                    crate::cache::wipe_reply(&engine, &mountpoint, roots.as_deref(), path, absolute)
+                        .await
+                }
+                Request::SignaturesList => {
+                    crate::signatures::list_reply(&engine, roots.as_deref()).await
+                }
+                Request::SignaturesAccept { id } => {
+                    crate::signatures::accept_reply(&engine, roots.as_deref(), &id).await
+                }
+                Request::SignaturesCheck { path, start } => {
+                    crate::signatures::check_reply(&engine, roots.as_deref(), &checks, path, start)
                 }
                 Request::UnmountRoot { mountpoint } => match &roots {
                     Some(roots) => control::reply(

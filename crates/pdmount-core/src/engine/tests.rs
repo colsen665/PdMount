@@ -386,20 +386,39 @@ async fn prefetch_is_paced_instead_of_bursting() {
     assert_eq!(calls, 6, "backend calls in 1.2 s");
 }
 
+/// Readahead waits until the handle's reads in order cross into the next
+/// block (D135): reads in order within the first block, and a jump to the
+/// end, fetch nothing ahead; the crossing read fetches the next two.
 #[tokio::test]
-async fn sequential_reads_trigger_readahead() {
+async fn readahead_starts_when_reads_in_order_cross_a_block() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let backend = seeded().await;
+    let backend = FakeBackend::new();
+    backend.set_block_size(1000);
+    let root = backend.root().await.expect("root").link_id;
+    let content = Bytes::from(vec![7u8; 6000]);
+    backend
+        .upload_new(&root, "six.bin", UploadSource::Bytes(content), meta())
+        .await
+        .expect("upload");
     let (engine, _inval) = open(&backend, dir.path()).await;
     engine.ensure_listed(ROOT_INO).await.expect("list");
-    let file = found(engine.lookup(ROOT_INO, b"top.bin").expect("lookup"));
+    let file = found(engine.lookup(ROOT_INO, b"six.bin").expect("lookup"));
     let (handle, _) = engine.open_file(file.ino, READ).expect("open");
-    engine.read(handle, 0, 2).await.expect("read");
-    engine.read(handle, 2, 2).await.expect("read");
-    eventually("readahead", || {
-        engine.metrics().prefetched_blocks.load(Ordering::Relaxed) > 0
-    })
-    .await;
+    let prefetched = || engine.metrics().prefetched_blocks.load(Ordering::Relaxed);
+    engine.read(handle, 0, 400).await.expect("read");
+    engine.read(handle, 400, 400).await.expect("read");
+    engine.read(handle, 5500, 500).await.expect("read the end");
+    engine
+        .read(handle, 6000, 100)
+        .await
+        .expect("read past the end");
+    engine.read(handle, 800, 100).await.expect("read");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(prefetched(), 0, "nothing ahead before a block is crossed");
+    engine.read(handle, 900, 200).await.expect("read across");
+    eventually("readahead of blocks 3 and 4", || prefetched() == 2).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(prefetched(), 2);
 }
 
 /// Backend calls per method since the last reset (the latency counts).
@@ -946,6 +965,28 @@ async fn quota_errors_park_the_upload_and_are_reported_once() {
     ));
     assert!(engine.flush(handle).is_ok(), "reported once");
     engine.release_file(handle);
+}
+
+/// An upload that fails an integrity check (the SDK's check of each block
+/// before upload, P20; a size mismatch at the commit) is retried after a
+/// backoff, as other permanent errors, and is parked only after
+/// `PARK_AFTER` attempts.
+#[tokio::test]
+async fn an_upload_that_fails_its_integrity_check_is_uploaded_again() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let failure = || BackendError::Integrity("block failed verification".into());
+    backend.inject_failure(pdmount_backend::fake::FakeOp::UploadNew, failure());
+    backend.inject_failure(pdmount_backend::fake::FakeOp::UploadRevision, failure());
+    let engine = running(&backend, dir.path()).await;
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    let ino = write_file(&engine, ROOT_INO, "checked.txt", b"first");
+    settle(&engine).await;
+    let link = remote_of(&engine, ino).expect("uploaded").link;
+    assert_eq!(backend.content(&link).as_deref(), Some(&b"first"[..]));
+    overwrite(&engine, ino, b"second");
+    settle(&engine).await;
+    assert_eq!(backend.content(&link).as_deref(), Some(&b"second"[..]));
 }
 
 /// fsync reports a deferred error once, and the cleared error is on disk
@@ -1540,7 +1581,7 @@ async fn local_only_files_are_exported_with_the_queued_changes() {
     settle(&engine).await;
     let counts = engine.queue_counts();
     assert_eq!(counts.pending + counts.parked, 0, "nothing queued");
-    assert_eq!(engine.local_only_staged().len(), 2);
+    assert_eq!(engine.unqueued_staged().len(), 2);
 
     engine.withdraw_write_access();
     let entries = engine.export_queued(out.path()).await.expect("export");
@@ -1567,6 +1608,121 @@ async fn local_only_files_are_exported_with_the_queued_changes() {
     assert_eq!(manifest.entries.len(), 2, "{:?}", manifest.entries);
     assert!(!fake_tree(&backend).await.contains_key("/secret.env"));
     engine.shutdown().await.expect("shutdown");
+}
+
+/// An uploaded file moved into a local-only folder of a share tree and
+/// edited there: the edit stays local (§7.7), so it is neither in the
+/// journal nor `local_only`.
+async fn edited_in_a_local_only_folder(
+    backend: &FakeBackend,
+    dir: &std::path::Path,
+) -> Arc<Engine> {
+    let engine = share_engine(backend, dir, config(), b"build/\n").await;
+    engine.start_background();
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    let docs = found(engine.lookup(ROOT_INO, b"docs").expect("lookup")).ino;
+    engine.ensure_listed(docs).await.expect("list docs");
+    let build = engine.mkdir(ROOT_INO, b"build", 0o755).expect("mkdir").ino;
+    engine
+        .rename(docs, b"a.txt", build, b"a.txt", RenameMode::NoReplace)
+        .expect("into the local-only folder");
+    let a = found(engine.lookup(build, b"a.txt").expect("lookup")).ino;
+    settle(&engine).await;
+    let state = |ino| engine.xattr(ino, "user.pdmount.state").expect("state");
+    assert_eq!(state(a).as_deref(), Some("clean"), "moved, not edited");
+    let truncate = OpenMode {
+        truncate: true,
+        ..WRITE
+    };
+    let (handle, _) = engine.open_file(a, truncate).expect("open");
+    engine
+        .write_local(handle, 0, b"edited locally")
+        .expect("write");
+    engine.release_file(handle);
+    settle(&engine).await;
+    {
+        let tree = engine.tree.read();
+        let node = tree.get(a).expect("a.txt");
+        assert!(!node.local_only && node.remote.is_some());
+        assert!(node.content_pending());
+    }
+    // Not uploaded, not queued: shown as `pending` for as long (§7.7).
+    assert_eq!(state(a).as_deref(), Some("pending"));
+    engine
+}
+
+/// M6.0.3 V-1: a gone tree exports the staged edit of an uploaded file in a
+/// local-only folder, listed as `not-uploaded`; the drive keeps the old
+/// revision at the old place.
+#[tokio::test]
+async fn an_edit_in_a_local_only_folder_is_exported_as_not_uploaded() {
+    use crate::engine::orphan::{FILES_DIR, NOT_UPLOADED, OrphanManifest};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let engine = edited_in_a_local_only_folder(&backend, dir.path()).await;
+
+    engine.withdraw_write_access();
+    let entries = engine.export_queued(out.path()).await.expect("export");
+    let manifest = OrphanManifest::new("Team", "the share was revoked", entries);
+    assert_eq!(manifest.incomplete(), 0, "{:?}", manifest.entries);
+    assert_eq!(manifest.entries.len(), 1, "{:?}", manifest.entries);
+    let entry = &manifest.entries[0];
+    assert_eq!(entry.path, "/build/a.txt");
+    assert_eq!(entry.change, NOT_UPLOADED);
+    assert_eq!(entry.file.as_deref(), Some("files/build/a.txt"));
+    assert_eq!(
+        std::fs::read(out.path().join(FILES_DIR).join("build/a.txt")).expect("a.txt"),
+        b"edited locally"
+    );
+    let tree = fake_tree(&backend).await;
+    assert_eq!(tree["/docs/a.txt"].content, b"hello world");
+    assert!(!tree.contains_key("/build"));
+    engine.shutdown().await.expect("shutdown");
+}
+
+/// M6.0.3 V-1: with nothing queued, that edit still counts as a change to
+/// keep, so a gone share exports instead of deleting its state.
+#[tokio::test]
+async fn an_edit_in_a_local_only_folder_counts_as_a_change_to_keep() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let engine = edited_in_a_local_only_folder(&backend, dir.path()).await;
+    let counts = engine.queue_counts();
+    assert_eq!(counts.pending + counts.parked, 0, "nothing queued");
+    assert_eq!(engine.unqueued_staged().len(), 1);
+    assert_eq!(engine.changes_to_keep(), 1);
+    engine.shutdown().await.expect("shutdown");
+}
+
+/// A file both queued and staged is exported once, as its queued change;
+/// it is not counted twice.
+#[tokio::test]
+async fn a_queued_staged_file_is_exported_once() {
+    use crate::engine::orphan::OrphanManifest;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let mut config = config();
+    // Nothing uploads: no executor runs.
+    config.upload.debounce = HumanDuration(Duration::from_secs(3600));
+    let engine = share_engine(&backend, dir.path(), config, b"").await;
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    write_file(&engine, ROOT_INO, "new.txt", b"queued");
+    assert_eq!(engine.queue_counts().pending, 1);
+    assert!(engine.unqueued_staged().is_empty());
+    assert_eq!(engine.changes_to_keep(), 1);
+
+    engine.withdraw_write_access();
+    let entries = engine.export_queued(out.path()).await.expect("export");
+    let manifest = OrphanManifest::new("Team", "the share was revoked", entries);
+    assert_eq!(manifest.entries.len(), 1, "{:?}", manifest.entries);
+    assert_eq!(manifest.entries[0].path, "/new.txt");
+    assert_eq!(manifest.entries[0].change, "upload");
+    assert_eq!(
+        std::fs::read(out.path().join("files/new.txt")).expect("new.txt"),
+        b"queued"
+    );
 }
 
 #[tokio::test]
@@ -2310,6 +2466,40 @@ async fn conflicts_round_trip_and_ids_never_repeat() {
     assert_eq!(all[1].detail.as_deref(), Some("why"));
     let third = engine.record_conflict(note(ConflictKind::NameTaken, ino, "a.txt"));
     assert_eq!(third, 3);
+}
+
+/// M6.3: a shown conflict stays marked across a restart and a later write
+/// of its row (the other copy turning up) does not unmark it; a resolved
+/// one is not listed.
+#[tokio::test]
+async fn conflicts_remember_that_they_were_shown() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let (engine, _inval) = open_device(&backend, dir.path(), config(), "laptop").await;
+    engine.ensure_listed(ROOT_INO).await.expect("list");
+    let ino = write_file(&engine, ROOT_INO, "a.txt", b"x");
+    let first = engine.record_conflict(note(ConflictKind::EditEdit, ino, "a.txt"));
+    let second = engine.record_conflict(note(ConflictKind::CreateCreate, ino, "a.txt"));
+    let third = engine.record_conflict(note(ConflictKind::EditEdit, ino, "a.txt"));
+    // A notice never waits to be shown.
+    let notice = engine.record_conflict(note(ConflictKind::RenameRename, ino, "a.txt"));
+    assert_eq!(engine.unnotified_conflicts(), [first, second, third]);
+    engine.mark_conflicts_notified(&[first]);
+    engine.set_conflict_other(first, ino + 1);
+    assert!(engine.set_conflict_state(second, ConflictState::Resolved));
+    assert_eq!(engine.unnotified_conflicts(), [third]);
+    engine.shutdown().await.expect("shutdown");
+    drop(engine);
+
+    let (engine, _inval) = open_device(&backend, dir.path(), config(), "laptop").await;
+    assert_eq!(engine.unnotified_conflicts(), [third]);
+    let all = engine.conflicts();
+    assert_eq!(all[0].notified_at, Some(CLOCK_SECS as i64));
+    assert_eq!(all[0].other_ino, Some(ino + 1));
+    assert_eq!(all[notice as usize - 1].notified_at, None);
+    // Marked again: the first time stays.
+    engine.mark_conflicts_notified(&[first, third]);
+    assert!(engine.unnotified_conflicts().is_empty());
 }
 
 /// §10.8: the xattrs mark both copies, also the other copy that the conflict
@@ -3564,6 +3754,45 @@ async fn a_local_folder_delete_keeps_what_is_new_in_a_nested_folder() {
             ConflictKind::LocalDeleteRemoteChildren
         ]
     );
+    engine.tree.read().check_invariants().expect("consistent");
+}
+
+/// D132: a remote child that does not decrypt cannot be checked, so a
+/// local delete of its folder keeps the folder instead of trashing the
+/// child along with it.
+#[tokio::test]
+async fn a_local_folder_delete_keeps_a_remote_child_that_does_not_decrypt() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = seeded().await;
+    let root = backend.root().await.expect("root").link_id;
+    let docs_link = remote_child(&backend, &root, "docs").await.link_id;
+    let sub_link = backend
+        .create_folder(&docs_link, "sub", UNIX_EPOCH)
+        .await
+        .expect("sub");
+    let (engine, docs, _) = listed_lazy(&backend, dir.path()).await;
+    let sub = found(hot(|| engine.lookup(docs, b"sub")).expect("lookup")).ino;
+    engine.ensure_listed(sub).await.expect("list sub");
+    engine.rmdir(docs, b"sub").expect("rmdir");
+    // B adds a file this device cannot decrypt.
+    let (unreadable, _) = backend
+        .upload_new(
+            &sub_link,
+            "unreadable.txt",
+            UploadSource::Bytes(Bytes::from_static(b"secret")),
+            meta(),
+        )
+        .await
+        .expect("unreadable");
+    backend.set_degraded(&unreadable, true);
+
+    start_journal(&engine);
+    settle(&engine).await;
+    assert!(!is_trashed(&backend, &sub_link).await);
+    assert!(!is_trashed(&backend, &unreadable).await);
+    let all = engine.conflicts();
+    assert_eq!(kinds(&engine), [ConflictKind::LocalDeleteRemoteChildren]);
+    assert_eq!(all[0].detail.as_deref(), Some("1"));
     engine.tree.read().check_invariants().expect("consistent");
 }
 
@@ -6128,4 +6357,5 @@ mod brought_back;
 mod lifecycle;
 mod markers;
 mod scan;
+mod signatures;
 mod swap;

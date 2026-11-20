@@ -31,6 +31,7 @@ fn meta(name: &str) -> Option<PhotoMeta> {
         name: name.into(),
         size: 10,
         revision: RevisionId::new(format!("rev-{name}")),
+        unverified: None,
     })
 }
 
@@ -1222,3 +1223,110 @@ async fn a_task_that_panics_runs_again() {
 }
 
 mod session;
+
+/// D132: a photo whose signatures do not verify is shown and stats, its
+/// open answers EACCES in `refuse` mode until accepted, and it is listed
+/// with its path; the store keeps it across a reopen. `check` reads every
+/// photo's node again.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unverified_photo_is_refused_until_accepted() {
+    use pdmount_backend::SignaturePart;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = FakeBackend::new();
+    let link = add(&fake, "IMG_0.jpg", MARCH_2023).await;
+    add(&fake, "IMG_1.jpg", MARCH_2023 + DAY).await;
+    fake.set_unverified(&link, SignaturePart::ContentKey, true, None)
+        .expect("mark");
+    let id = {
+        let setup = open_tree(&fake, dir.path()).await;
+        let tree = &setup.tree;
+        let mut notices = tree.subscribe_signatures();
+        tree.read_timeline().await.expect("timeline");
+        fetch_all(tree, (2023, 3)).await;
+        assert_eq!(notices.try_recv().expect("a notice"), 1);
+        let month = ino_of(tree, ino_of(tree, ROOT_INO, "2023"), "03");
+        let photo = ino_of(tree, month, "IMG_0.jpg");
+        tree.getattr(photo).expect("stat works");
+        assert!(matches!(tree.open(photo), Err(CoreError::AccessDenied)));
+        let other = ino_of(tree, month, "IMG_1.jpg");
+        let (handle, _) = tree.open(other).expect("open");
+        tree.release(handle);
+        let list = tree.signatures_list().await.expect("list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].path.as_deref(), Some("/2023/03/IMG_0.jpg"));
+        assert_eq!(list[0].parts, ["content key"]);
+        assert!(list[0].refused);
+        assert_eq!(tree.signature_counts(), (1, 1));
+        let progress = crate::engine::CheckProgress::default();
+        let counts = tree.signatures_check(&progress).await.expect("check");
+        assert_eq!((counts.folders, counts.nodes, counts.unverified), (1, 2, 1));
+        tree.shutdown().await.expect("shutdown");
+        list[0].id.clone()
+    };
+    let setup = open_tree(&fake, dir.path()).await;
+    let tree = &setup.tree;
+    let month = ino_of(tree, ino_of(tree, ROOT_INO, "2023"), "03");
+    let photo = ino_of(tree, month, "IMG_0.jpg");
+    assert!(
+        matches!(tree.open(photo), Err(CoreError::AccessDenied)),
+        "kept across a reopen"
+    );
+    let accepted = tree
+        .signature_accept(&id)
+        .await
+        .expect("accept")
+        .expect("found");
+    assert!(accepted.accepted && !accepted.refused);
+    let (handle, _) = tree.open(photo).expect("open after the accept");
+    tree.release(handle);
+}
+
+/// Photos' reads get the engine's readahead (D135): nothing ahead while
+/// the reads in order stay in one block or jump to the end, the next two
+/// blocks once they cross into the next one.
+#[tokio::test(flavor = "multi_thread")]
+async fn reads_in_order_across_a_block_read_ahead() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = FakeBackend::new();
+    fake.set_block_size(1000);
+    let content = Bytes::from(vec![5u8; 6000]);
+    fake.add_photo(
+        "VID_0.mp4",
+        UploadSource::Bytes(content),
+        MARCH_2023,
+        Vec::new(),
+        None,
+    )
+    .await
+    .expect("add photo");
+    let setup = open_tree(&fake, dir.path()).await;
+    let tree = &setup.tree;
+    tree.read_timeline().await.expect("timeline");
+    fetch_all(tree, (2023, 3)).await;
+    let year = ino_of(tree, ROOT_INO, "2023");
+    let month = ino_of(tree, year, "03");
+    let photo = ino_of(tree, month, "VID_0.mp4");
+    let (handle, _) = tree.open(photo).expect("open");
+    let prefetched = || tree.metrics().prefetched_blocks.load(Ordering::Relaxed);
+    tree.read(handle, 0, 400).await.expect("read");
+    tree.read(handle, 400, 400).await.expect("read");
+    tree.read(handle, 5500, 500).await.expect("read the end");
+    tree.read(handle, 800, 400)
+        .await
+        .expect("read back at the head");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        prefetched(),
+        0,
+        "nothing ahead before reads in order cross a block"
+    );
+    tree.read(handle, 1200, 100).await.expect("read on");
+    for _ in 0..50 {
+        if prefetched() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(prefetched(), 2, "blocks 3 and 4");
+    tree.release(handle);
+}

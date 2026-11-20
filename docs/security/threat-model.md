@@ -6,7 +6,11 @@ PdMount is a single-user Linux FUSE daemon (Rust, fuser 0.18) that mounts Proton
 the community Proton SDK through a patched fork. A CLI (`pdmount`) talks to the per-profile daemon over a Unix socket.
 Reviews: 2026-10-27 (M4.0.1) at commit 8c5eda9 (`m4-start`), SDK fork `pdmount` c837e03 (diff from `base/0.4.0`);
 reports in `docs/security/2026-10-27-review/`. 2026-10-31 (M4.16), the M4 changes: `m4-start..686ded8`, SDK fork `pdmount`
-`c837e03..caafaea`; reports in `docs/security/2026-10-31-review/`.
+`c837e03..caafaea`; reports in `docs/security/2026-10-31-review/`. 2026-11-15 (M5.8), the M5 changes:
+`8b01e65..976ea61`, SDK fork `pdmount` `caafaea`; reports in `docs/security/2026-11-15-review/`. 2026-11-18 (M6.0.3), PdMount `976ea61..9818aa1` and,
+for the first time, the release pipeline; SDK fork `pdmount-0.5` `70f10ff` on upstream v0.5.1; reports in
+`docs/security/2026-11-18-review/`. 2026-11-20 (M6.5), the M6 notifications: `6456097..7faae80`; reports in
+`docs/security/2026-11-20-review/`.
 
 ## Assets
 - A1 Proton session: access/refresh tokens, key passphrase, SDK secret cache and key store (`sdk-secrets.db`, `sdk-keys.db`, encrypted with a key
@@ -24,6 +28,11 @@ reports in `docs/security/2026-10-27-review/`. 2026-10-31 (M4.16), the M4 change
   writes into the freedesktop thumbnail cache, shared with every program of the user; remote input chooses neither
   the file name (MD5 of a URI under the mountpoint) nor its bytes beyond pixels (a re-encoded PNG), and writes never
   follow a link or leave the size folders.
+- A6 The published Releases: the archive and checksum of every version, and their binding to a tag and commit.
+- A7 The repository: `master`, the tags and the workflow files, and the SDK fork repository at the pinned commit.
+- A8 The development machine as far as the project's scripts touch it: the push credentials (kept outside the
+  repository, D090) and the files that `scripts/ci.sh`, `scripts/build-doctor.sh` and the scenario scripts create or
+  remove.
 
 ## Actors and entry points
 - T1 Other local users (different uid, not root): the control socket (`$XDG_RUNTIME_DIR/pdmount/<p>.sock` 0600 with a
@@ -55,12 +64,27 @@ reports in `docs/security/2026-10-27-review/`. 2026-10-31 (M4.16), the M4 change
   never disabled), redirects, responses that the SDK passes through unchecked, retry/backoff abuse.
 - T4 Local processes of the same uid are NOT generally in scope (they can read the user's files anyway), EXCEPT where
   the design promises more: secrets never printed or logged (tokens, passphrase: the SDK logs the passphrase at debug,
-  PdMount filters `proton_sdk_rs2::secret`; the 2026-10-27 review found this incomplete, S-1, fixed in M4.0.2.1), secrets only in files when a flag allows it (D029), the sign-in link
-  shown only to the user, `notify-send`/`xdg-open` invoked without shell interpretation of remote-controlled text.
+  PdMount filters `proton_sdk_rs2::secret`; the 2026-10-27 review found this incomplete, S-1, fixed in M4.0.2.1; and the
+  session-fork selector of a web sign-in, which alone authorises collecting the new session's tokens: it reaches the log
+  and `status` when a sign-in poll fails, M6.0.3 V-2), secrets only in files when a flag allows it (D029), the sign-in link
+  shown only to the user, notifications sent over D-Bus (no program since M6, D138) and `xdg-open` invoked without
+  shell interpretation of remote-controlled text.
 - T1 for Photos: the modes of the thumbnail cache's folders (the specification asks for 0700; an existing looser folder
   is kept, V-13, and `doctor` warns) and the guessability of its file names.
 - T5 Configuration and CLI input from the user: mostly trusted, but parsing must not panic into undefined state, and
   paths from config (mountpoint, globs) must not cause writes outside intended places.
+- Release pipeline actors (M6.0.3):
+  - S1 A contributor without write access (a pull request from a fork): runs their own code in `ci.yml` and in the
+    `plan` job of `release.yml`, with a read-only token and no secrets. Controls: no `pull_request_target`, no cache
+    shared with tag builds, the `publishing` condition of the build and host jobs, approval for pull requests from
+    all external contributors (a GitHub setting, set 2026-11-19).
+  - S2 A compromised build input: the runner image and its apt packages, an action, the dist installer, a crate's build
+    script or proc-macro, the Go toolchain, the fork repository. It can alter the archive it builds; the controls limit
+    what else it reaches (A6's earlier Releases, A7).
+  - S3 A holder of push rights: the maintainer's account, the push key on the development machine, a mistaken tag.
+    Any tag matching `**[0-9]+.[0-9]+.[0-9]+*` starts a release, not only `v*`; the release does not wait for CI, and the
+    tagged commit need not be on `master`.
+  - S4 Someone between the Release and the user: a replaced asset, a mirror.
 
 - M4 surfaces, under the actors above: the control requests `queue drop`, `queue retry`/`park`, `cache wipe`/`gc`, `pin`/`unpin`, `sync` and
   `stats --reset` (T1 through the socket; T5); the autostart entry (`~/.config/autostart`: Exec quoting, file mode, the secret-storage
@@ -93,6 +117,22 @@ reports in `docs/security/2026-10-27-review/`. 2026-10-31 (M4.16), the M4 change
   answers (A1: nothing cached is deleted for being unreadable without the key, and a running daemon never makes a
   new cache key, which would delete its caches; D106).
 
+- M6 surfaces (M6.1–M6.4, D137–D140; reviewed 2026-11-20): `notify-send` is gone; the daemon is a client of
+  `org.freedesktop.Notifications` itself, over zbus connections made only through `bus::connect` (the peer uid, and
+  zbus refuses a server whose GUID differs from `guid=`), one per bus address, kept and reused. Remote text reaches
+  the notification server as summaries and bodies: every name is cleaned by `notify::clean_name` (control, separator,
+  bidirectional, invisible and blank characters and slash look-alikes become U+FFFD) and escaped when the server has
+  `body-markup`; the capabilities are asked again when the service changes owner (M6.5 V-4). What the server does
+  with plain text is its own: GNOME Shell and dunst make links of address-like text in a body (M6.5 V-5). Inbound:
+  `ActionInvoked` and `NotificationClosed` (passed on only for ids this process sent; any process of the session can
+  forge them, T4, so **Show** acts once per notification), and `NameOwnerChanged` of the service (the announcer's
+  catch-up of conflicts shown while no service ran). **Show** calls `org.freedesktop.FileManager1.ShowItems` on the
+  notification's bus; only when that bus answers with an error does it start `xdg-open <folder>` (from an absolute
+  `PATH` directory, in `/`, the bus address and the attach's display in its environment); a bus that does not answer
+  gets nothing (M6.5 V-6). The child's GDBus does not check `guid=`, so V-28's window applies to it. The store's
+  `conflicts.notified_at` (schema 6) and the slow-download report (`pdmount_core::slow`: file names, debug log only)
+  carry no secret. Test-only: `pdmount fake notifications` and `notify_stub.rs` (built with `fake-backend` only).
+
 ## Dependencies
 
 Reviewed when a dependency is added; advisories are out of scope (below).
@@ -113,10 +153,11 @@ Reviewed when a dependency is added; advisories are out of scope (below).
   written, no secrets pass through it. Rated: no finding above Low.
 
 - **WebP and PNG (M5.13b, D115).** `image-webp` 0.2.4 (the exposed parser: every frame's size is read from its header
-  and bounded before it decodes, V-5), `image` 0.25.10 without formats (scaling only), `png` 0.18.1 (encoder, and the
-  decoder for text chunks of local thumbnails), `md-5` 0.10.6 (cache file names, not a security use). Decoding runs in
-  a blocking task under `catch_unwind`; an allocation failure would still abort. Reviewed in M5.8: one Medium (V-5),
-  fixed.
+  and bounded before it decodes, V-5), `image` 0.25.10, asked for without formats and used for scaling only; the SDK's
+  default `thumbnail-generation` feature builds its decoders into the binary, and no PdMount code calls them (M6.0.3
+  V-19), `png` 0.18.1 (encoder, and the decoder for text chunks of local thumbnails), `md-5` 0.10.6 (cache file names,
+  not a security use). Decoding runs in a blocking task under `catch_unwind`; an allocation failure would still abort.
+  Reviewed in M5.8: one Medium (V-5), fixed.
 
 ## Build-time supply chain (D097, M5.15)
 
@@ -127,27 +168,44 @@ how much it is trusted:
   `clang`, `libdbus-1-dev`, `pkg-config` and `protobuf-compiler` come from Ubuntu's archive without version pins. Trusted as
   the OS vendor's; a compromise would change the binary without a change in the repository.
 - **dist (cargo-dist 0.32.0).** `release.yml` is generated by dist and checked against `dist-workspace.toml`, so it is not
-  hand-edited and not pinned by commit: its actions (`actions/checkout`, `upload-artifact`, `download-artifact`) are referenced
-  by major tag, and it installs the `dist` binary at the pinned version with the installer script from dist's GitHub release,
-  with no hash check. Accepted: pinning would need `allow-dirty = ["ci"]` and hand edits that dist's docs discourage. Reviewed
-  when dist is upgraded (`dist init`, then read the diff of `release.yml`). The workflow has `contents: write` (to create the
-  Release) and uses only `GITHUB_TOKEN`; no other secrets exist. Pull requests run `dist plan` only (`pr-run-mode = "plan"`):
-  nothing is built or uploaded for them, and a pull request cannot reach a release.
+  hand-edited. Its actions (`actions/checkout`, `upload-artifact`, `download-artifact`, `attest`) are pinned by commit through
+  `github-action-commits` in `dist-workspace.toml` (M6.0.4.20, M6.0.3 V-6), updated together by hand. It installs the `dist`
+  binary at the pinned version with the installer script from dist's GitHub release, with no hash check (dist offers none).
+  Reviewed when dist is upgraded (`dist init`, then read the diff of `release.yml`). The workflow grants `contents: write`
+  workflow-wide and uses only `GITHUB_TOKEN`; no other secrets exist. Since M6.0.4.4 (`github-attestations = true`) the
+  build job, where every build script and proc-macro runs, has a permissions block of its own: `contents: read`, and
+  `attestations: write` and `id-token: write` for the attestation, so a malicious build input can at most attest the
+  archive it already controls (M6.0.3 V-4). Residue: the `plan` job, which pipes the dist installer into `sh` and creates
+  the draft Release, and the `build-global-artifacts` (checksums only, no cargo build), `host` and `announce` jobs keep the write token. Pull requests run `dist plan`
+  only (`pr-run-mode = "plan"`). A pull request from a fork runs the workflow of its own merge commit, so what keeps it
+  from a release is the read-only token GitHub gives such runs and the `publishing` condition, not the run mode.
 - **Hand-written workflows and steps** (`ci.yml`, `.github/build-setup.yml`): actions pinned by full commit (`actions/checkout`,
   `actions/setup-go`), `permissions: contents: read`, `persist-credentials: false`, no `pull_request_target`, no secrets.
-  The Rust toolchain comes from rustup at a pinned version; Go from `actions/setup-go` at `1.25.x` (the newest patch release
-  of a pinned minor, so that the Go standard library in the binary has its security fixes).
-- **Rust and Go dependencies.** `Cargo.lock` is checked in and built with `--locked`; the SDK fork at a pinned commit. The Go
-  library of proton-crypto is built from modules vendored in the `gopenpgp-sys` crate (no download at build time).
+  The Rust toolchain comes from rustup at a pinned version, in `ci.yml` and, through `.github/build-setup.yml`, in the
+  release build, which `ci.yml` checks to agree (M6.0.4.21, M6.0.3 V-7); Go from `actions/setup-go` at `1.25.x` (the newest patch release of a pinned minor, so that the
+  Go standard library in the binary has its security fixes).
+- **Rust and Go dependencies.** `Cargo.lock` is checked in. `scripts/ci.sh` builds with `--locked`; dist's build does not
+  pass it, so the release job first runs `cargo metadata --locked`, which fails when the lock file would change
+  (M6.0.4.21, M6.0.3 V-7); the SDK fork at a pinned commit. The Go library of proton-crypto is built from modules vendored in the `gopenpgp-sys` crate (no download
+  at build time).
 - **cargo-about (0.9.3).** Generates `THIRD-PARTY-LICENSES.html` from `Cargo.lock`, locally; the result is checked in and
   `ci.yml` regenerates it and fails on a difference. It runs no part of the release build. A licence outside the accepted
   list in `about.toml` fails the generation.
-- **What a tag push does.** A `v*` tag pushed to the repository starts the release build, so whoever can push tags can publish
-  a Release: tag protection or a restricted push right is the control (GitHub settings, for the user). The archive's
-  `.sha256` is produced in the same run, so it proves integrity of the download, not provenance.
+- **What a tag push does.** A pushed tag matching `**[0-9]+.[0-9]+.[0-9]+*` starts the release build (`v0.6.0`, but also
+  `0.6.0` or `x-0.6.0`), from whatever commit it names. Whoever can push tags can publish a Release, and the tag name is
+  expanded in the workflow's shell commands. The controls are GitHub settings: a ruleset restricting the creation,
+  update and deletion of all tags to the maintainer, a ruleset for `master`, immutable releases, and read-only default
+  workflow permissions, with no bypass for GitHub Actions; Actions are disabled on the SDK fork. The user set or checked
+  all of them on 2026-11-19 (M6.0.3 V-4, V-5), so the write token of the remaining release jobs reaches neither published
+  Releases nor tags nor `master`. The archive's `.sha256` is produced in the same
+  run, so it proves integrity of the download, not provenance. Since M6.0.4.4 the build job attests the archive (GitHub's
+  build provenance, `gh attestation verify`), which binds it to the repository, the workflow and the commit; it does not
+  prove that the build inputs were sound (M6.0.3 V-15).
 - **Local archive check.** `dist build` on the maintainer's machine embeds local build paths in the binary and is never
-  published.
-- **Not done:** reproducible builds, signed archives or build attestations, hash-pinned apt packages.
+  published. The hosted build embeds only paths under the runner's home, among them the directories OpenSSL would load
+  engines and providers from, which nothing in PdMount asks for (M6.0.3 V-16).
+- **Not done:** reproducible builds, signed archives, hash-pinned apt packages, a hash check of the
+  dist installer.
 
 ## Out of scope
 - root; a compromised Proton server or Proton's crypto design; the upstream SDK and third-party crates except how
@@ -163,3 +221,9 @@ how much it is trusted:
 - Medium: DoS of the daemon or memory exhaustion from remote input; integrity check gaps without a shown exploit;
   weaker-than-designed file modes on non-secret data.
 - Low / Info: hardening, defence in depth, unclear but plausible issues.
+- Release pipeline (A6–A8). Critical: someone without write access publishes or changes a Release, or changes
+  `master` or a tag. High: the same by a holder of a narrower right than the maintainer's (a restricted tag or branch
+  right, a pull request).
+  Medium: a compromised build input (S2) reaches beyond the build it runs in (earlier Releases, `master`, tags) where a
+  stated or cheap control would have contained it. Low / Info: hardening, a stated control that a normal release does
+  not depend on.

@@ -23,7 +23,8 @@
 //! upload, folder creation, rename or trash of a client just before its
 //! commit ([`FakeBackend::pause_at`]) and switch the server's commit-time
 //! checks off. For a daemon running in another process, `faults.json` in
-//! the fake's directory makes calls fail as if offline or signed out.
+//! the fake's directory makes calls fail as if offline or signed out, or
+//! makes node fetches fail as if a node could not be decrypted.
 //!
 //! A network profile ([`NetProfile`]; `profile.json` in the fake's
 //! directory for running daemons, [`FakeBackend::set_profile`] in memory)
@@ -57,6 +58,7 @@
 //! trimmed, keeping absolute sequence numbers. Injected failures,
 //! latency and the network's pipes stay per process.
 
+use crate::block_lists::{BlockLists, Listed, Page, PageSource, Revision as ListedRevision};
 use crate::photos::{
     MAX_THUMBNAIL_BYTES, Photos, PhotosVolume, RelatedPhoto, THUMBNAIL_BATCH, TIMELINE_PAGE,
     ThumbnailRef, TimelineItem,
@@ -64,8 +66,8 @@ use crate::photos::{
 use crate::shared::{CorePage, DegradedShare, ShareRole, SharedEntry, SharedListing, SharedWithMe};
 use crate::{
     AccountInfo, Backend, BackendError, BlockInfo, EventId, EventKind, EventPage, FileMeta, LinkId,
-    NameHash, NodeKind, NodeLookup, RemoteEvent, RemoteNode, Result, RevisionId, RevisionMeta,
-    StorageInfo, UploadSource,
+    Listing, NameHash, NodeKind, NodeLookup, RemoteEvent, RemoteNode, Result, RevisionId,
+    RevisionMeta, SignaturePart, StorageInfo, Unverified, UploadSource,
 };
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -287,6 +289,10 @@ pub enum FaultKind {
     Offline,
     /// Every call fails with `Unauthorized`.
     Unauthorized,
+    /// Every node fetch (`get_nodes`) fails with an error that is not
+    /// transient, as the SDK's batch did for a node under a folder that
+    /// cannot be decrypted (M6.0.3 V-3); other calls go through.
+    BrokenNodes,
 }
 
 /// One rule of `faults.json`, for daemons in other processes.
@@ -429,6 +435,9 @@ struct Links {
     /// Block downloads and file uploads in flight over the process's
     /// handles, for tests of the session's limits (D033, D110).
     fetches: InFlight,
+    /// The revisions' block lists, read by range as the adapter reads them
+    /// (D135): each page listed costs a round trip.
+    block_lists: BlockLists<(), ()>,
     uploads: InFlight,
 }
 
@@ -439,6 +448,7 @@ impl Links {
             up: Mutex::new(now),
             down: Mutex::new(now),
             fetches: InFlight::default(),
+            block_lists: BlockLists::default(),
             uploads: InFlight::default(),
         }
     }
@@ -501,6 +511,48 @@ fn pages(entries: usize) -> u32 {
     entries.div_ceil(NET_PAGE).max(1) as u32
 }
 
+/// The block pages of one revision of the fake (D135): a round trip per
+/// page, the blocks' hashes made up, nothing to verify.
+struct FakePages<'a> {
+    fake: &'a FakeBackend,
+    file: &'a LinkId,
+    revision: &'a RevisionId,
+}
+
+#[async_trait::async_trait]
+impl PageSource for FakePages<'_> {
+    type Target = ();
+    type Meta = ();
+
+    async fn page(&self, from: u32, size: u32) -> Result<Page<(), ()>> {
+        self.fake.delay().await;
+        self.fake.enter(FakeOp::Blocks, 1).await?;
+        let count = self.fake.with_state(|s| {
+            if !self.fake.may_read(s, self.file) {
+                return Err(BackendError::NotFound);
+            }
+            let node = s.nodes.get(self.file).ok_or(BackendError::NotFound)?;
+            let rev = node.revision(self.revision)?;
+            Ok(rev.size.div_ceil(s.block_size as u64) as u32)
+        })?;
+        let end = from.saturating_add(size).min(count + 1);
+        Ok(Page {
+            blocks: (from..end.max(from))
+                .map(|index| Listed {
+                    index,
+                    hash: index.to_le_bytes().to_vec(),
+                    target: (),
+                })
+                .collect(),
+            meta: (),
+        })
+    }
+
+    async fn verify(&self, _: &(), _: &[&[u8]]) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// A remote change applied by the fake, in order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FakeChange {
@@ -553,6 +605,10 @@ struct Node {
     /// everywhere else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     photo: Option<FakePhoto>,
+    /// Signatures that "do not verify" ([`FakeBackend::set_unverified`]):
+    /// the part (`name`, `key`, `content key`) and its claimed signer.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    unverified: BTreeMap<String, Option<String>>,
 }
 
 /// What the timeline knows of a photo (M5.13).
@@ -652,7 +708,18 @@ impl Node {
             sha1: active.filter(|r| r.sha1_claimed).map(|r| r.sha1),
             name_hash: Some(name_hash(&self.name)),
             trashed: self.trashed,
+            unverified: self.unverified(),
         }
+    }
+
+    /// The failed signatures as the adapter reports them (D132).
+    fn unverified(&self) -> Option<Unverified> {
+        let failed: Vec<(SignaturePart, Option<&str>)> = self
+            .unverified
+            .iter()
+            .filter_map(|(part, signer)| Some((SignaturePart::parse(part)?, signer.as_deref())))
+            .collect();
+        Unverified::of(&self.link, &self.name, &failed)
     }
 }
 
@@ -834,6 +901,7 @@ impl State {
                 trashed_at: 0,
                 volume: None,
                 photo: None,
+                unverified: BTreeMap::new(),
             },
         );
         Self {
@@ -887,8 +955,9 @@ impl State {
         }
     }
 
-    /// Fails like the rules of `faults.json` say, for the calling client.
-    fn check_fault_file(&mut self, client: Option<&str>) -> Result<()> {
+    /// Fails like the rules of `faults.json` say, for the calling client
+    /// and a call of `op`.
+    fn check_fault_file(&mut self, client: Option<&str>, op: FakeOp) -> Result<()> {
         let Some(dir) = &self.dir else {
             return Ok(());
         };
@@ -908,11 +977,15 @@ impl State {
         let rules = self.fault_cache.iter().flat_map(|(_, rules)| rules);
         for rule in rules {
             let applies = rule.until_ms.is_none_or(|until| until > now)
-                && rule.client.as_deref().is_none_or(|uid| Some(uid) == client);
+                && rule.client.as_deref().is_none_or(|uid| Some(uid) == client)
+                && (rule.kind != FaultKind::BrokenNodes || op == FakeOp::GetNodes);
             if applies {
                 return Err(match rule.kind {
                     FaultKind::Offline => BackendError::Offline("injected".into()),
                     FaultKind::Unauthorized => BackendError::Unauthorized,
+                    FaultKind::BrokenNodes => {
+                        BackendError::Other("injected: a node cannot be decrypted".into())
+                    }
                 });
             }
         }
@@ -1177,6 +1250,7 @@ impl State {
             trashed_at: 0,
             volume: Some(PHOTOS_VOLUME.to_owned()),
             photo: None,
+            unverified: BTreeMap::new(),
         });
         self.touch(&link);
         link
@@ -1796,8 +1870,10 @@ impl FakeBackend {
     /// Makes `link`'s metadata unreadable, as a node whose name or keys the
     /// SDK cannot decrypt (D119): `get_nodes` answers `None` for it, as for
     /// a node that does not exist, `get_nodes_checked` tells it apart
-    /// (`Degraded`), and the shared-with-me listing names a share whose
-    /// root it is as degraded. In this process only.
+    /// (`Degraded`), a folder listing leaves it out and
+    /// `list_children_checked` names it degraded (D132), and the
+    /// shared-with-me listing names a share whose root it is as degraded.
+    /// In this process only.
     pub fn set_degraded(&self, link: &LinkId, degraded: bool) {
         let mut state = self.state.lock();
         if degraded {
@@ -1805,6 +1881,35 @@ impl FakeBackend {
         } else {
             state.degraded.remove(link);
         }
+    }
+
+    /// Marks one signature of `link` as one that does not verify (fork
+    /// P27, D132), claimed by `signer` (`None`: anonymous), or with
+    /// `failed = false` as one that does; persisted, and announced with an
+    /// event as a change of the node's metadata. A rename by a client signs
+    /// the new name, which then verifies.
+    pub fn set_unverified(
+        &self,
+        link: &LinkId,
+        part: SignaturePart,
+        failed: bool,
+        signer: Option<&str>,
+    ) -> Result<()> {
+        self.with_state(|s| {
+            s.node(link)?;
+            s.update_node(link, |entry| {
+                if failed {
+                    entry
+                        .unverified
+                        .insert(part.as_str().to_owned(), signer.map(str::to_owned));
+                } else {
+                    entry.unverified.remove(part.as_str());
+                }
+            });
+            s.touch(link);
+            s.push_event(EventKind::UpdateMetadata, link);
+            Ok(())
+        })
     }
 
     /// Makes the next event poll of My Files' volume answer `refresh = true`.
@@ -1879,6 +1984,7 @@ impl FakeBackend {
                 trashed_at: 0,
                 volume: (volume != MAIN_VOLUME).then(|| volume.clone()),
                 photo: None,
+                unverified: BTreeMap::new(),
             });
             s.touch(&link);
             s.push_event(EventKind::Create, &link);
@@ -2005,6 +2111,7 @@ impl FakeBackend {
                     main,
                     thumbnail: Some(FakeThumbnail::DEFAULT),
                 }),
+                unverified: BTreeMap::new(),
             });
             s.touch(&link);
             s.push_event(EventKind::Create, &link);
@@ -2309,7 +2416,7 @@ impl FakeBackend {
     async fn enter(&self, op: FakeOp, rtts: u32) -> Result<NetProfile> {
         let profile = {
             let mut state = self.state.lock();
-            state.check_fault_file(self.client.uid.as_deref())?;
+            state.check_fault_file(self.client.uid.as_deref(), op)?;
             state.take_fault(op)?;
             state.check_profile_file();
             state.profile
@@ -2404,123 +2511,26 @@ fn stage_blocking(source: UploadSource, blobs: Option<PathBuf>) -> Result<Staged
     Ok(staged)
 }
 
-#[async_trait::async_trait]
-impl Backend for FakeBackend {
-    fn upload_block_size(&self) -> u64 {
-        self.state.lock().block_size as u64
+impl FakeBackend {
+    /// A revision's block list and its pages on this drive.
+    fn block_pages<'a>(
+        &'a self,
+        file: &'a LinkId,
+        revision: &'a RevisionId,
+    ) -> (Arc<ListedRevision<(), ()>>, FakePages<'a>) {
+        let kept = self.links.block_lists.revision(file, revision);
+        (
+            kept,
+            FakePages {
+                fake: self,
+                file,
+                revision,
+            },
+        )
     }
 
-    async fn account(&self) -> Result<AccountInfo> {
-        if let Some(known) = &self.client.known_account {
-            return Ok(known.clone());
-        }
-        self.enter(FakeOp::Account, 1).await?;
-        self.with_state(|s| {
-            let root = self.tree_root(s);
-            if !self.may_read(s, &root) {
-                return Err(BackendError::NotFound);
-            }
-            Ok(AccountInfo {
-                username: self.user(s),
-                root,
-            })
-        })
-    }
-
-    async fn root(&self) -> Result<RemoteNode> {
-        self.delay().await;
-        self.enter(FakeOp::Root, 1).await?;
-        self.with_state(|s| {
-            let root = self.tree_root(s);
-            if !self.may_read(s, &root) {
-                return Err(BackendError::NotFound);
-            }
-            Ok(s.node(&root)?.to_remote())
-        })
-    }
-
-    async fn list_children(&self, folder: &LinkId) -> Result<Vec<RemoteNode>> {
-        self.delay().await;
-        self.checkpoint(FakePoint::ListBeforeRead).await;
-        let profile = self.enter(FakeOp::ListChildren, 1).await?;
-        let children = self.with_state(|s| {
-            s.folder(folder)?;
-            if !self.may_read(s, folder) {
-                return Err(BackendError::NotFound);
-            }
-            // By name, as the index keeps them.
-            Ok(s.children.get(folder).map_or_else(Vec::new, |children| {
-                children
-                    .values()
-                    .map(|link| s.nodes[link].to_remote())
-                    .collect()
-            }))
-        })?;
-        // The pages after the first.
-        round_trips(&profile, pages(children.len()) - 1).await;
-        Ok(children)
-    }
-
-    async fn get_nodes(&self, ids: &[LinkId]) -> Result<Vec<Option<RemoteNode>>> {
-        Ok(self
-            .get_nodes_checked(ids)
-            .await?
-            .into_iter()
-            .map(NodeLookup::found)
-            .collect())
-    }
-
-    async fn get_nodes_checked(&self, ids: &[LinkId]) -> Result<Vec<NodeLookup>> {
-        self.delay().await;
-        self.enter(FakeOp::GetNodes, pages(ids.len())).await?;
-        self.with_state(|s| {
-            Ok(ids
-                .iter()
-                .map(
-                    |id| match s.nodes.get(id).filter(|_| self.may_read(s, id)) {
-                        None => NodeLookup::Absent,
-                        Some(_) if s.degraded.contains(id) => NodeLookup::Degraded,
-                        Some(node) => NodeLookup::Found(node.to_remote()),
-                    },
-                )
-                .collect())
-        })
-    }
-
-    async fn blocks(&self, file: &LinkId, revision: &RevisionId) -> Result<Vec<BlockInfo>> {
-        self.delay().await;
-        self.enter(FakeOp::Blocks, 1).await?;
-        self.with_state(|s| {
-            let node = s
-                .nodes
-                .get(file)
-                .filter(|_| self.may_read(s, file))
-                .ok_or(BackendError::NotFound)?;
-            let rev = node.revision(revision)?;
-            let block = s.block_size as u64;
-            Ok((0..rev.size.div_ceil(block))
-                .map(|i| BlockInfo {
-                    index: i as u32 + 1,
-                    plain_size: Some((rev.size - i * block).min(block) as u32),
-                })
-                .collect())
-        })
-    }
-
-    async fn fetch_block(&self, file: &LinkId, revision: &RevisionId, index: u32) -> Result<Bytes> {
-        let _in_flight = self.links.fetches.enter();
-        self.delay().await;
-        let profile = self.enter(FakeOp::FetchBlock, 1).await?;
-        let block = self.with_state(|s| {
-            if !self.may_read(s, file) {
-                return Err(BackendError::NotFound);
-            }
-            s.block(file, revision, index)
-        })?;
-        self.read_block(block, &profile).await
-    }
-
-    async fn fetch_block_into(
+    /// One listed block into `buf`: a round trip and its transfer.
+    async fn fetch_listed_into(
         &self,
         file: &LinkId,
         revision: &RevisionId,
@@ -2563,6 +2573,166 @@ impl Backend for FakeBackend {
         }
         Ok(len as usize)
     }
+}
+
+#[async_trait::async_trait]
+impl Backend for FakeBackend {
+    fn upload_block_size(&self) -> u64 {
+        self.state.lock().block_size as u64
+    }
+
+    async fn account(&self) -> Result<AccountInfo> {
+        if let Some(known) = &self.client.known_account {
+            return Ok(known.clone());
+        }
+        self.enter(FakeOp::Account, 1).await?;
+        self.with_state(|s| {
+            let root = self.tree_root(s);
+            if !self.may_read(s, &root) {
+                return Err(BackendError::NotFound);
+            }
+            Ok(AccountInfo {
+                username: self.user(s),
+                root,
+            })
+        })
+    }
+
+    async fn root(&self) -> Result<RemoteNode> {
+        self.delay().await;
+        self.enter(FakeOp::Root, 1).await?;
+        self.with_state(|s| {
+            let root = self.tree_root(s);
+            if !self.may_read(s, &root) {
+                return Err(BackendError::NotFound);
+            }
+            Ok(s.node(&root)?.to_remote())
+        })
+    }
+
+    async fn list_children(&self, folder: &LinkId) -> Result<Vec<RemoteNode>> {
+        Ok(self.list_children_checked(folder).await?.children)
+    }
+
+    /// A degraded child ([`FakeBackend::set_degraded`]) is named in
+    /// [`Listing::degraded`] instead of listed, as Proton's (fork P26).
+    async fn list_children_checked(&self, folder: &LinkId) -> Result<Listing> {
+        self.delay().await;
+        self.checkpoint(FakePoint::ListBeforeRead).await;
+        let profile = self.enter(FakeOp::ListChildren, 1).await?;
+        let listing = self.with_state(|s| {
+            s.folder(folder)?;
+            if !self.may_read(s, folder) {
+                return Err(BackendError::NotFound);
+            }
+            // By name, as the index keeps them.
+            let mut listing = Listing::default();
+            for link in s.children.get(folder).into_iter().flat_map(|c| c.values()) {
+                if s.degraded.contains(link) {
+                    listing.degraded.push(link.clone());
+                } else {
+                    listing.children.push(s.nodes[link].to_remote());
+                }
+            }
+            Ok(listing)
+        })?;
+        // The pages after the first.
+        let count = listing.children.len() + listing.degraded.len();
+        round_trips(&profile, pages(count) - 1).await;
+        Ok(listing)
+    }
+
+    async fn get_nodes(&self, ids: &[LinkId]) -> Result<Vec<Option<RemoteNode>>> {
+        Ok(self
+            .get_nodes_checked(ids)
+            .await?
+            .into_iter()
+            .map(NodeLookup::found)
+            .collect())
+    }
+
+    async fn get_nodes_checked(&self, ids: &[LinkId]) -> Result<Vec<NodeLookup>> {
+        self.delay().await;
+        self.enter(FakeOp::GetNodes, pages(ids.len())).await?;
+        self.with_state(|s| {
+            Ok(ids
+                .iter()
+                .map(
+                    |id| match s.nodes.get(id).filter(|_| self.may_read(s, id)) {
+                        None => NodeLookup::Absent,
+                        Some(_) if s.degraded.contains(id) => NodeLookup::Degraded,
+                        Some(node) => NodeLookup::Found(node.to_remote()),
+                    },
+                )
+                .collect())
+        })
+    }
+
+    /// The layout from the revision's claimed block sizes, as the adapter
+    /// takes it from the node (D135): no listing, no round trip.
+    async fn blocks(&self, file: &LinkId, revision: &RevisionId) -> Result<Vec<BlockInfo>> {
+        self.delay().await;
+        self.enter(FakeOp::Blocks, 0).await?;
+        let blocks: Vec<BlockInfo> = self.with_state(|s| {
+            let node = s
+                .nodes
+                .get(file)
+                .filter(|_| self.may_read(s, file))
+                .ok_or(BackendError::NotFound)?;
+            let rev = node.revision(revision)?;
+            let block = s.block_size as u64;
+            Ok((0..rev.size.div_ceil(block))
+                .map(|i| BlockInfo {
+                    index: i as u32 + 1,
+                    plain_size: Some((rev.size - i * block).min(block) as u32),
+                })
+                .collect())
+        })?;
+        self.links
+            .block_lists
+            .revision(file, revision)
+            .set_count(blocks.len() as u32);
+        Ok(blocks)
+    }
+
+    async fn fetch_block(&self, file: &LinkId, revision: &RevisionId, index: u32) -> Result<Bytes> {
+        let (kept, pages) = self.block_pages(file, revision);
+        let download = |_| async move {
+            let _in_flight = self.links.fetches.enter();
+            self.delay().await;
+            let profile = self.enter(FakeOp::FetchBlock, 1).await?;
+            let block = self.with_state(|s| {
+                if !self.may_read(s, file) {
+                    return Err(BackendError::NotFound);
+                }
+                s.block(file, revision, index)
+            })?;
+            self.read_block(block, &profile).await
+        };
+        self.links
+            .block_lists
+            .fetch(&kept, &pages, index, download)
+            .await
+    }
+
+    /// Through the block lists, as the adapter (D135): the block's page
+    /// when it is not listed, and the rest of the listing beside the first
+    /// download of a revision, each page a round trip.
+    async fn fetch_block_into(
+        &self,
+        file: &LinkId,
+        revision: &RevisionId,
+        index: u32,
+        buf: &mut [u8],
+    ) -> Result<usize> {
+        let (kept, pages) = self.block_pages(file, revision);
+        self.links
+            .block_lists
+            .fetch(&kept, &pages, index, |_| {
+                self.fetch_listed_into(file, revision, index, buf)
+            })
+            .await
+    }
 
     async fn upload_new(
         &self,
@@ -2600,6 +2770,7 @@ impl Backend for FakeBackend {
                 trashed_at: 0,
                 volume: None,
                 photo: None,
+                unverified: BTreeMap::new(),
             });
             s.touch(&link);
             s.push_event(EventKind::Create, &link);
@@ -2678,6 +2849,7 @@ impl Backend for FakeBackend {
                 trashed_at: 0,
                 volume: None,
                 photo: None,
+                unverified: BTreeMap::new(),
             });
             s.touch(&link);
             s.push_event(EventKind::Create, &link);
@@ -2725,6 +2897,10 @@ impl Backend for FakeBackend {
             s.ensure_name_free(&parent, new_name, Some(node))?;
             s.update_node(node, |entry| {
                 entry.parent = Some(parent);
+                if entry.name != new_name {
+                    // The client signs the new name (D132).
+                    entry.unverified.remove(SignaturePart::Name.as_str());
+                }
                 entry.name = new_name.to_owned();
             });
             s.touch(node);
@@ -2973,6 +3149,7 @@ impl Photos for FakeBackend {
         revision: &RevisionId,
     ) -> Result<Option<ThumbnailRef>> {
         self.delay().await;
+        // One request: the first page of the revision (D135).
         self.enter(FakeOp::Thumbnails, 1).await?;
         if volume != PHOTOS_VOLUME {
             return Err(BackendError::NotFound);
@@ -3913,6 +4090,57 @@ mod tests {
         }
     }
 
+    /// D132: a signature marked as failing is reported on the node (each
+    /// part), announced by an event, kept across a reopen, and a rename
+    /// signs the new name.
+    #[tokio::test]
+    async fn an_unverified_signature_is_reported_until_the_name_is_signed_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = {
+            let fake = FakeBackend::open(dir.path()).expect("open");
+            let root = root(&fake).await;
+            let (file, _) = fake
+                .upload_new(&root, "f", bytes(b"v1"), meta())
+                .await
+                .expect("upload");
+            let cursor = fake.latest_event_id().await.expect("cursor");
+            for part in SignaturePart::ALL {
+                fake.set_unverified(&file, part, true, Some("x@example.test"))
+                    .expect("mark");
+            }
+            let page = fake.poll_events(&cursor).await.expect("events");
+            assert!(
+                page.events
+                    .iter()
+                    .any(|e| e.link_id == file && e.kind == EventKind::UpdateMetadata)
+            );
+            file
+        };
+        let fake = FakeBackend::open(dir.path()).expect("reopen");
+        let root = root(&fake).await;
+        let listed = fake.list_children(&root).await.expect("list");
+        let found = listed[0].unverified.clone().expect("unverified");
+        assert_eq!(found.parts(), SignaturePart::ALL);
+        assert_eq!(found.signer, "x@example.test");
+        fake.rename(&file, None, "g", None).await.expect("rename");
+        let node = fake
+            .get_nodes(std::slice::from_ref(&file))
+            .await
+            .expect("get")
+            .remove(0);
+        let found = node.expect("node").unverified.expect("still unverified");
+        assert_eq!(
+            found.parts(),
+            [SignaturePart::Key, SignaturePart::ContentKey]
+        );
+        for part in [SignaturePart::Key, SignaturePart::ContentKey] {
+            fake.set_unverified(&file, part, false, None)
+                .expect("clear");
+        }
+        let node = fake.get_nodes(&[file]).await.expect("get").remove(0);
+        assert_eq!(node.expect("node").unverified, None);
+    }
+
     #[tokio::test]
     async fn persisted_revisions_without_new_fields_still_load() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4014,6 +4242,13 @@ mod tests {
         daemon.root().await.expect("cleared");
         add_fault(dir.path(), rule(FaultKind::Unauthorized)).expect("rule");
         assert_eq!(daemon.root().await.unwrap_err(), BackendError::Unauthorized);
+        clear_faults(dir.path(), None).expect("clear");
+        // Broken nodes: only node fetches fail, with an error that is not
+        // transient.
+        add_fault(dir.path(), rule(FaultKind::BrokenNodes)).expect("rule");
+        let root = daemon.root().await.expect("other calls go through").link_id;
+        let error = daemon.get_nodes(&[root]).await.unwrap_err();
+        assert!(matches!(error, BackendError::Other(_)) && error.is_permanent());
         std::fs::remove_file(dir.path().join("faults.json")).expect("remove");
         daemon.root().await.expect("a missing file is no faults");
         std::fs::write(dir.path().join("faults.json"), b"not json").expect("write");
@@ -4059,6 +4294,47 @@ mod tests {
         let start = std::time::Instant::now();
         assert_eq!(fake.list_children(&root).await.expect("list").len(), 301);
         assert!(start.elapsed() >= Duration::from_millis(150), "3 pages");
+    }
+
+    /// The layout costs nothing (the claimed sizes); a read lists its
+    /// block's page, a round trip, then downloads it beside the listing of
+    /// the other pages for the manifest; a later read in a listed page
+    /// costs its download only (D135).
+    #[tokio::test]
+    async fn a_read_lists_its_block_page_and_the_rest_beside_it() {
+        let fake = FakeBackend::new();
+        fake.set_block_size(1000);
+        let root = root(&fake).await;
+        let large = Bytes::from(vec![1u8; 25 * 1000]);
+        let (file, rev) = fake
+            .upload_new(&root, "large", UploadSource::Bytes(large), meta())
+            .await
+            .expect("upload");
+        fake.set_profile(rtt(40));
+        let timed = |index| {
+            let (fake, file, rev) = (&fake, &file, &rev);
+            async move {
+                let start = std::time::Instant::now();
+                let mut buf = vec![0; 1000];
+                fake.fetch_block_into(file, rev, index, &mut buf)
+                    .await
+                    .expect("block");
+                start.elapsed()
+            }
+        };
+        let start = std::time::Instant::now();
+        assert_eq!(fake.blocks(&file, &rev).await.expect("blocks").len(), 25);
+        assert!(start.elapsed() < Duration::from_millis(40), "no listing");
+        let first = timed(25).await;
+        assert!(
+            first >= Duration::from_millis(80) && first < Duration::from_millis(120),
+            "its page, then the download beside page 1: {first:?}"
+        );
+        let later = timed(3).await;
+        assert!(
+            later >= Duration::from_millis(40) && later < Duration::from_millis(80),
+            "the download alone: {later:?}"
+        );
     }
 
     #[tokio::test]

@@ -20,6 +20,7 @@ checksum. The binary is for x86-64 Linux with glibc 2.35 or newer (Ubuntu 22.04,
 
 ```sh
 sha256sum -c pdmount-x86_64-unknown-linux-gnu.tar.gz.sha256
+gh attestation verify pdmount-x86_64-unknown-linux-gnu.tar.gz --repo colsen665/PdMount   # optional, needs the GitHub CLI
 tar -xzf pdmount-x86_64-unknown-linux-gnu.tar.gz
 install -m 0755 pdmount-x86_64-unknown-linux-gnu/pdmount ~/.local/bin/
 pdmount doctor
@@ -47,7 +48,9 @@ pinned commit (`docs/sdk-patches.md`).
 
 `doctor` checks FUSE, the configuration, the keyring, the login, disk space and the clock. Its keyring line says whether a Secret
 Service runs on the session bus, is only started by D-Bus on demand, or is missing, and whether the default collection is locked
-(it never opens an unlock dialog). With a user service installed, a `desktop bus` line compares your terminal's session bus with
+(it never opens an unlock dialog). A `notifications` line says whether a notification server runs on your session bus, is
+started by D-Bus at the first notification, or is missing (then sign-in prompts are only logged, and conflicts are shown
+once a notification server appears); PdMount talks to the server over D-Bus itself and needs no `notify-send`. With a user service installed, a `desktop bus` line compares your terminal's session bus with
 the service's: it says "same as the service's", "attached" (the service has your desktop's bus, see "Running as a service"),
 or warns "not attached" (log in again or run `pdmount session attach`). The `mountpoint` line warns when another
 profile's config uses one of this profile's mountpoints. With further mounts (`[[roots]]`), a `root` line per mount says
@@ -140,7 +143,7 @@ pdmount mount ~/ProtonDrive-Shared        # again, through the running daemon; -
 ```
 
 `status` shows a `Root:` line per further mount with its state, and a line per share. Path commands (`access`, `pin`,
-`queue`, `conflicts`, `sync`, `cache wipe`) work in My Files only.
+`queue`, `conflicts`, `sync`) work in My Files only. `cache wipe` works in every mount (see "Pins and the cache").
 
 `--force` also stops a daemon that is still running. Pending changes are safe: a change that was acknowledged survives a crash of the
 daemon (a power loss or kernel crash, only what was fsync'd). If the kernel's connection cannot be ended without root, the command prints the root command to run.
@@ -171,7 +174,8 @@ mountpoint = "~/ProtonDrive-Shared"
 - Uploads to a share count against its owner's storage. `df` on the mount shows your own quota, so a full share shows
   only as "No space left on device" when a file is closed or synced.
 - Conflict copies (`… (conflict …)`) made in a share are visible to all its members and its owner. A conflict there is
-  written to the daemon's log and announced on the desktop; `pdmount conflicts` covers My Files only.
+  written to the daemon's log and announced on the desktop, with the share's name (see "Conflicts"); `pdmount
+  conflicts` covers My Files only.
 - Only your own local-only rules (`~/.config/pdmount/<profile>.pdignore`, see "Local-only files") apply in a share. A
   `.pdignore` in the share's folder is an ordinary file for you: what the owner or other members write into it never
   keeps your files from uploading, nor uploads files your own rules keep local.
@@ -181,10 +185,11 @@ mountpoint = "~/ProtonDrive-Shared"
   editor again, or are tried again at the next mount.
 - A new share shows within about 30 s of Proton announcing it, as does a share that was taken back. One taken back also
   goes as soon as PdMount finds its folder gone. A file of it that is still open then answers "Input/output error", and
-  its local copy and cache are deleted. Changes that were still waiting, and files your rules kept local-only there,
-  are not deleted: they go to `~/.local/share/pdmount/<profile>/orphaned/<share> (<date-time>)/`, the files under
-  `files/` at their paths in the share, with `pdmount-orphaned.json` listing every change (renames and deletions
-  included; a local-only file as `local-only`). A notification says so,
+  its local copy and cache are deleted. Changes that were still waiting, files your rules kept local-only there, and
+  edits that stayed local in a local-only folder are not deleted: they go to
+  `~/.local/share/pdmount/<profile>/orphaned/<share> (<date-time>)/`, the files under `files/` at their paths in the
+  share, with `pdmount-orphaned.json` listing every change (renames and deletions included; a local-only file as
+  `local-only`, an edit of an uploaded file in a local-only folder as `not-uploaded`). A notification says so,
   and `pdmount status` shows an `Orphaned:` line for each such folder until you delete it. A file whose earlier
   content could no longer be read is listed with the reason, and the share's raw local state is kept beside it in
   `state/`.
@@ -420,6 +425,9 @@ In a share from another user only the second applies (see "Files others shared w
 
 Such a file survives remounts but exists nowhere else, so it has no copy on the server.
 
+A file that is already on the server and that you move into a local-only folder stays where it was on the server, and
+your later edits to it are not uploaded: its `user.pdmount.state` says `pending`, but `pdmount status` does not count it.
+
 ## Working with git and rsync
 
 git and rsync work on the mount. `fsync` makes a change safe on this machine without waiting for the upload, which
@@ -444,7 +452,23 @@ keeps the name; the other becomes a copy beside it, named after the device whose
 report (conflict laptop 2026-10-19 14-03-27 UTC).odt
 ```
 
-`status` shows `Conflicts:  N open`, and a desktop notification appears when a session bus is available.
+`status` shows `Conflicts:  N open`. A conflict you have to look at (state `open` in `conflicts list`) also gets a desktop
+notification, when a session bus with a notification server is available: "PdMount: conflict", the file's path (with "My
+Files:" or the share's name in front when the profile mounts further roots) and what happened, for example "Changed here and on
+another device; both copies kept." Its **Show** button opens the folder with the conflict copy selected, in the file manager of
+your desktop (or through `xdg-open` when no file manager offers that). At most three come in 30 seconds; the rest are summed in
+one, "2 more conflicts". A conflict that came up while no notification service was running (you were logged out, or the
+desktop had not started its notifications yet) is shown once the service is there, again once only; if there are more than
+three, in one notification "N conflicts were recorded while no desktop was listening". One you resolved in the meantime is
+not shown. A notification the desktop did not take (it did not answer in time) is tried again a minute later. Conflicts that PdMount settled by itself (state `notice`, such as a rename that lost to another
+device's) are only logged and listed. To keep file names off a lock screen, or to turn these notifications off (more in
+"Desktop notifications"):
+
+```toml
+[notify]
+conflict_names = false   # the notification says what happened, but not to which file
+conflicts = false        # no conflict notifications at all, and none later for the conflicts of that time
+```
 
 ```console
 $ pdmount conflicts list
@@ -471,6 +495,44 @@ the notice and the other two choices are refused.
 
 The state of a file is also visible as an extended attribute: `getfattr -d <file>` shows `user.pdmount.state` (such as `clean`, `pending`,
 `uploading`, `parked`, `conflict`), `user.pdmount.access` and, in a conflict, `user.pdmount.conflict`.
+
+## Files whose signatures do not verify
+
+Every file and folder on Proton Drive carries signatures: of its name, of its key and, for a file, of its content key. They
+are checked whenever PdMount reads a folder's listing or a changed node from the server. One that does not verify was
+signed by someone else than the address it names, or changed on the way; the official apps show such a node with a
+warning.
+
+In My Files and Photos, PdMount refuses such a node until you accept it: it is listed under its name and `ls -l` shows
+it, but opening, renaming, moving or deleting it fails with `Permission denied`, and so does creating anything in, or
+moving anything into, a folder whose key did not verify. In shared folders it is only reported, since other members'
+keys come from the server and a former member's deleted keys can make harmless failures. `status` shows
+`Signatures: N unverified, M refused`, and a desktop notification gives the number of newly found ones, at most every
+10 minutes per tree.
+
+```console
+$ pdmount signatures list
+8af5e319  refused   /docs/report.odt
+  root: My Files
+  parts: content key
+  claimed signer: someone@example.com
+  first seen: 2026-11-19
+$ pdmount signatures accept 8af5e319
+accepted 8af5e319 in My Files: /docs/report.odt
+```
+
+Accept a node only when you know where it comes from, for example a file a colleague uploaded from a device whose keys
+were reset. The accept holds on this device and profile while the node's signatures stay as they are now; if they change
+(another signer, another name), it is refused again. A name marked `[name unverified]` in the list is text whose author
+is not proven; it can still be read.
+
+A node is checked when PdMount reads it, so a folder you never opened here is not checked. `pdmount signatures check`
+lists every folder from the server and checks every node in it, of a path in My Files (`pdmount signatures check
+~/ProtonDrive/docs`) or of every mount; it takes one request per folder, paced like a refresh, so on a large drive it runs
+a long time. It prints its progress every 10 seconds and a summary; what it finds appears in `signatures list`.
+
+To change the handling, set `signatures = "warn"` (or `"refuse"`) at the top of the profile's configuration for My Files,
+or in a `[[roots]]` entry for that root.
 
 ## The upload queue and `sync`
 
@@ -511,6 +573,19 @@ a large file being copied, are read at full speed. The thresholds are in `[scan]
 turns this off, for instance for a cold copy of many small files that should run unthrottled. `pdmount stats` counts `scans` and
 `scan_reads`.
 
+**Large files on a slow link.** A file that is not in the cache opens as its blocks arrive, which for a large video on a
+slow link can take a while with nothing on screen. When a read you wait for has waited 5 seconds, in any mount, a notification
+says so: "PdMount: downloading", "clip.mp4 (633 MiB) is downloading; it opens as its blocks arrive." It names the file, not
+its folder, and goes away once the read has its data. A file gets at most one such notification in 10 minutes, and at most three
+show in 30 seconds: when more files are slow, the rest are counted in one ("2 more files downloading"), which is one of the
+three. Names from other devices are shown with characters that could reorder the text replaced by "�". Reads of a scan (thumbnails,
+`grep`) never notify. The file's name can show on a lock screen that shows notifications; to turn them off:
+
+```toml
+[notify]
+downloads = false
+```
+
 A *pin* keeps a file or folder available offline, including new revisions as they appear:
 
 ```console
@@ -539,6 +614,20 @@ $ pdmount cache wipe [<path>]         # evict everything allowed, or only under 
 
 Pinned blocks and the base versions of files you have changed are never evicted by these commands.
 
+`cache wipe` reaches the cache of every mount. Without a path it empties the cache of My Files, Photos and each share, and
+says what each freed and what is left. With a path it empties only the files at or below it, in the mount the path is in:
+give an absolute path to a Photos or Shared mount (a relative one is taken from My Files' root, as in other commands). In
+Photos a year or month folder empties every photo below it; in a Shared mount a share folder, a file in it, or the
+`Shared files` folder works the same way. A path outside every mount, or one that does not exist, is refused. To time a cold
+read of a video, wipe its path and read it again.
+
+```console
+$ pdmount cache wipe ~/ProtonDrive-Photos/2024/06
+Freed 390.1 KiB in 3 blocks.
+  /home/<user>/ProtonDrive-Photos: 390.1 KiB in 3 blocks
+1.2 MiB left of 10.0 GiB in all 3 trees.
+```
+
 `pdmount reset --keep-login` rebuilds all local state and the cache, keeping the login and device identity. It is refused while
 mounted or with changes pending. Changes left in a further root's tree name its directory in the refusal; when they cannot be
 uploaded any more (a share that is gone), `--orphan-trees` moves that tree's state to `orphaned/` instead (see `pdmount status`).
@@ -558,6 +647,55 @@ writes go on, and what needs the network answers an I/O error, and a notificatio
 `pdmount login`; the running daemon takes over the sign-in, keeps the mount and drains the queue. Signing in as a different
 account than the mounted one is refused. A sign-in you start yourself with `pdmount login --force` is announced only as
 "PdMount: sign-in link ready".
+
+## Desktop notifications
+
+PdMount tells the desktop about things you may need to act on. It talks to the desktop's notification server over
+D-Bus itself (nothing else to install): on the session bus it runs on, or, for a user service, on the desktop's bus that
+the login entry hands over (see "Running as a service"). Without a session bus or a notification server nothing is shown
+and nothing waits; `pdmount doctor`'s `notifications` line says whether this terminal's bus has a server (`ok`: running
+or started by D-Bus on demand; `WARN`: none, or no bus).
+
+| Notification | What it means | What to do |
+|---|---|---|
+| "PdMount: conflict" | A file was changed here and on another device (or created on both, or deleted here and changed there); both versions are kept. The text gives the file's path (with "My Files:" or the share's name in front when the profile mounts further roots) and what happened | Look at the copy (**Show**), then `pdmount conflicts resolve` ("Conflicts") |
+| "PdMount: conflicts" | More conflicts than three in 30 seconds, or more than three recorded while no desktop was listening, summed in one | `pdmount conflicts list` |
+| "PdMount: downloading" | A file you opened has waited 5 seconds for its data from the drive; it names the file (not its folder) and its size, and goes away when the data is there | Wait, or work on; see "Large files on a slow link" |
+| "PdMount: sign in needed", "PdMount: sign-in link ready" | The session is no longer accepted, or the link of `pdmount login` is ready | `pdmount login` ("Offline and sign-in needed") |
+| "PdMount: keyring needed" | The mount runs but waits for the keyring to be unlocked | Unlock the keyring, or `pdmount login` |
+| "PdMount: uploading N changes before shutdown" | The system shuts down, and PdMount uploads what is queued first | Nothing; it waits for the grace at most |
+| "PdMount: N changes from the last session are still uploading", then "… uploaded" | The last stop left changes queued; they upload now | Nothing |
+| "PdMount: changes on their way from <device>" | Another device left changes that will reach this one when it runs again ("Telling other devices that changes are coming") | Avoid editing those files until then |
+| "PdMount: N changes to <share> wait", "… kept" | A share no longer lets you write, or is gone; your changes are kept ("Files others shared with you") | `pdmount status` |
+| "PdMount: unverified signatures" | Newly found files or folders whose signatures do not verify ("Files whose signatures do not verify") | `pdmount signatures list` |
+
+**Show.** A conflict notification has a **Show** button when the desktop offers buttons: your file manager opens the
+folder with the conflict copy selected (the file that came back, for a file deleted here). A file manager that does not
+offer that (`org.freedesktop.FileManager1`) gets the folder through `xdg-open` instead. **Show** works once per
+notification; when the desktop is just logging out, or the file manager is slow to start, it may open nothing.
+
+**Missed conflicts.** A conflict that came up while no notification server was running (you were logged out, or the
+desktop had not started its notifications yet) is shown once the server is there: at the next start of the mount, at the
+next login, or when the server starts. Each conflict is shown once; one you resolved in the meantime is not; more than
+three come in one notification.
+
+**Names from other devices** are shown with the characters that could split, reorder or hide the text, or make a name look
+like a path, replaced by "�"; markup in them is shown as text. A name can still look like a web address, and some
+desktops make that a link: do not follow a link in a notification.
+
+**Settings** (`[notify]` in the configuration):
+
+```toml
+[notify]
+conflicts = false        # no conflict notifications, and none later for the conflicts of that time
+conflict_names = false   # conflict notifications say what happened, but not to which file or share
+downloads = false        # no "downloading" notifications
+```
+
+`conflict_names = false` covers conflict notifications only: the "downloading" notification names its file, and the
+notifications about a share (changes kept or waiting, changes on their way, unverified signatures) name the share. To
+keep every name off a lock screen, set `downloads = false` too, and hide notification contents on the lock screen in
+the desktop's settings.
 
 ## `stats` and logs
 

@@ -14,8 +14,9 @@
 //! revocation shows before the core event does (M5.9).
 
 use crate::{
-    AccountInfo, Backend, BackendError, BlockInfo, EventId, EventPage, FileMeta, LinkId, NameHash,
-    NodeKind, NodeLookup, RemoteNode, Result, RevisionId, RevisionMeta, StorageInfo, UploadSource,
+    AccountInfo, Backend, BackendError, BlockInfo, EventId, EventPage, FileMeta, LinkId, Listing,
+    NameHash, NodeKind, NodeLookup, RemoteNode, Result, RevisionId, RevisionMeta, StorageInfo,
+    UploadSource,
 };
 use bytes::Bytes;
 use std::sync::Arc;
@@ -197,6 +198,7 @@ impl ShareTree {
             sha1: None,
             name_hash: None,
             trashed: false,
+            unverified: None,
         }
     }
 
@@ -297,6 +299,21 @@ impl Backend for ShareTree {
             self.watch(children)
         } else {
             children
+        }
+    }
+
+    async fn list_children_checked(&self, folder: &LinkId) -> Result<Listing> {
+        if self.file {
+            return Ok(Listing {
+                children: self.list_children(folder).await?,
+                degraded: Vec::new(),
+            });
+        }
+        let listing = self.inner.list_children_checked(folder).await;
+        if *folder == self.root {
+            self.watch(listing)
+        } else {
+            listing
         }
     }
 

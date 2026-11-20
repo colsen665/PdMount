@@ -24,6 +24,8 @@ pub struct PhotoMeta {
     pub name: String,
     pub size: u64,
     pub revision: RevisionId,
+    /// Signatures that did not verify (D132).
+    pub unverified: Option<pdmount_backend::Unverified>,
 }
 
 /// One photo as the tree keeps it.

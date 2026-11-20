@@ -3,7 +3,7 @@
 #
 # Usage: tests/scenarios/run-all.sh [scenario ...]
 #   SCENARIOS  default when no arguments: every scenario (the M scenarios m1..m7, e2 and the X
-#              scenarios x1..x4, x11..x17 run in live mode only and skip the others)
+#              scenarios x1..x4, x6, x11..x20 run in live mode only and skip the others)
 #   MODES      verify modes (default: live remount crash fresh; `second` adds device B, lib.sh)
 #   STOP_ON    comma-separated stop conditions (default: 429,fail for the real account, none
 #              for BACKEND=fake): 429 stops the matrix after a run whose daemon log lines
@@ -24,7 +24,7 @@ if [[ -n "${LOG_DIR:-}" ]]; then
     LOG_DIR=$(cd "$LOG_DIR" && pwd)
 fi
 cd "$(dirname "$0")"
-default="r1 r2 r3 r4 r5 r6 r7 g1 g2 g3 g4 g5 g6 g6_read g7 n1 a1 a2 a3 a4 a5 a6 e1 e2 m1 m3 m4 m5 m6 m7 queue ops sha svc x1 x2 x3 x4 x11 x12 x13 x14 x15 x16 x17"
+default="r1 r2 r3 r4 r5 r6 r7 g1 g2 g3 g4 g5 g6 g6_read g7 n1 a1 a2 a3 a4 a5 a6 e1 e2 m1 m3 m4 m5 m6 m7 queue ops sha svc x1 x2 x3 x4 x6 x11 x12 x13 x14 x15 x16 x17 x18 x19 x20"
 scenarios=("$@")
 ((${#scenarios[@]})) || read -ra scenarios <<<"${SCENARIOS:-$default}"
 read -ra modes <<<"${MODES:-live remount crash fresh}"

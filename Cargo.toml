@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 publish = false
 license = "MIT"
@@ -44,7 +44,7 @@ parking_lot = "0.12"
 # A thumbnail's PNG with its text chunks (M5.13b); the version `image` uses.
 png = "0.18"
 proptest = "1"
-proton-drive-sdk = "0.4"
+proton-drive-sdk = "0.5"
 rand = "0.10"
 reqwest = { version = "0.13", features = ["json"] }
 # Same version as the SDK: its middleware errors hide the reqwest error (M3.2).
@@ -78,8 +78,8 @@ unwrap_used = "warn"
 # The community SDK is used through a patched fork (decisions D002, D089).
 # Patches and their status: docs/sdk-patches.md.
 [patch.crates-io]
-proton-drive-sdk = { git = "https://github.com/colsen665/proton-sdk-rs2", rev = "caafaea683116e71957d8e6b86de1450afc97ac1" }
-proton-sdk-rs2 = { git = "https://github.com/colsen665/proton-sdk-rs2", rev = "caafaea683116e71957d8e6b86de1450afc97ac1" }
+proton-drive-sdk = { git = "https://github.com/colsen665/proton-sdk-rs2", rev = "19cc34de6b519d630b6f01750b93d47e3aa863a5" }
+proton-sdk-rs2 = { git = "https://github.com/colsen665/proton-sdk-rs2", rev = "19cc34de6b519d630b6f01750b93d47e3aa863a5" }
 
 [profile.dev]
 panic = "unwind"

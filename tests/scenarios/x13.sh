@@ -4,7 +4,8 @@
 # buses: A is the daemon's own (as the OpenRC user bus), without a Secret
 # Service or a notification server; B is the desktop's, where gnome-keyring
 # starts later and a notification server can be started (an activation
-# file). A notify-send stub on PATH records the bus it was given.
+# file that starts the notification stub, `pdmount fake notifications`, which
+# records the bus it serves on).
 # The keyring part: B's keyring first lacks the cache key (the daemon waits
 # and deletes nothing), then has it; then a daemon started as a service on B
 # with the collection locked (ready at once, no unlock dialog, a quick stop
@@ -106,15 +107,17 @@ printf 'printf %%s "$DISPLAY $XAUTHORITY" >"%s.tmp" && mv "%s.tmp" "%s"\n' \
 activatable "$work/busA-services" org.pdmount.X13.DisplayProbe "$(command -v sh) $work/display-probe"
 start_bus busA "$work/busA-services"
 bus_a=$bus_address
-# B: a notification server that D-Bus would start (the stub notify-send
-# does not call it); without one, no notification goes to B (D102 amended).
-activatable "$work/busB-services" org.freedesktop.Notifications "$(command -v false)"
+# B: a notification server that D-Bus starts at the first notification (the
+# stub, which logs the bus it serves on); without one, no notification goes
+# to B (D102 amended).
+notify_log=$work/notify.log
+: >"$notify_log"
+stub_command() { # <bus socket>: the activation file's command
+    echo "$PDMOUNT fake notifications serve --bus unix:path=$1 --log $notify_log"
+}
+activatable "$work/busB-services" org.freedesktop.Notifications "$(stub_command "$work/busB")"
 start_bus busB "$work/busB-services"
 bus_b=$bus_address
-
-touch "$work/notify.log" "$work/notify-bus.log"
-export X11_NOTIFY_LOG=$work/notify.log X13_NOTIFY_BUS_LOG=$work/notify-bus.log
-stub_path=$repo/tests/scenarios/stubs:$PATH
 
 wait_for() { # <what> <seconds> <command...>
     local what=$1 limit=$2 start=$SECONDS
@@ -132,7 +135,7 @@ attach_from() { # <bus address> [<env arguments>...]
     env "${@:2}" DBUS_SESSION_BUS_ADDRESS="$1" "$PDMOUNT" --profile "$PROFILE" session attach
 }
 launch_on_a() { # a daemon with A as its own bus
-    PATH=$stub_path DBUS_SESSION_BUS_ADDRESS=$bus_a PDMOUNT_KEYRING_RETRY_SECS=2 PDMOUNT_KEYRING_TIMEOUT_SECS=10 \
+    DBUS_SESSION_BUS_ADDRESS=$bus_a PDMOUNT_KEYRING_RETRY_SECS=2 PDMOUNT_KEYRING_TIMEOUT_SECS=10 \
         "$PDMOUNT" --profile "$PROFILE" -v mount --foreground "${backend_flag[@]}" "$MNT" >>"$work/daemon.log" 2>&1 &
     daemon=$!
     wait_for "the mount" 60 mount_answers
@@ -146,11 +149,13 @@ stop_daemon() {
     wait "$daemon" || fail "the daemon exited with an error"
     daemon=
 }
-notified() { wc -l <"$work/notify.log"; }
+notified() { notify_count "$notify_log"; }
+# The bus of each notification, one line per notification.
+notify_buses() { notify_lines "$notify_log" | sed -n 's/.*"bus":"\([^"]*\)".*/\1/p'; }
 more_notified() { (($(notified) > $1)); }
 # The wait's own notification, one per daemon; a restarted daemon also says
 # that the last session's changes are still uploading (M5.2).
-keyring_notices() { grep -c 'keyring needed' "$work/notify.log" || true; }
+keyring_notices() { grep -c 'keyring needed' "$notify_log" || true; }
 more_keyring_notices() { (($(keyring_notices) > $1)); }
 
 step "the profile mounts once with its secrets in files, so it has mounted before"
@@ -170,7 +175,7 @@ blocks_before=$(disk_blocks)
 [[ -f $XDG_DATA_HOME/pdmount/$PROFILE/cache.key ]] || fail "the cache key is not in a file"
 
 step "a start in keyring mode on bus A, which has no Secret Service: the daemon mounts and waits"
-PATH=$stub_path DBUS_SESSION_BUS_ADDRESS=$bus_a PDMOUNT_KEYRING_RETRY_SECS=2 PDMOUNT_KEYRING_TIMEOUT_SECS=10 \
+DBUS_SESSION_BUS_ADDRESS=$bus_a PDMOUNT_KEYRING_RETRY_SECS=2 PDMOUNT_KEYRING_TIMEOUT_SECS=10 \
     "$PDMOUNT" --profile "$PROFILE" -v mount --foreground "${backend_flag[@]}" "$MNT" >>"$work/daemon.log" 2>&1 &
 daemon=$!
 wait_for "the mount" 60 mount_answers
@@ -186,7 +191,7 @@ expect_eq "a stored size" "$(stat -c %s "$area/before")" 6
 if timeout 30 cat "$area/before" >/dev/null 2>&1; then fail "clean content was read without the cache key"; fi
 printf during >"$area/during"
 status_text | grep -qE '^Queue: +[1-9]' || fail "the write is not queued: $(status_text)"
-expect_eq "notifications without a notification server" "$(wc -l <"$work/notify.log")" 0
+expect_eq "notifications without a notification server" "$(notified)" 0
 
 step "pdmount login asks the daemon to try the keyring, and says that it still cannot"
 if out=$(DBUS_SESSION_BUS_ADDRESS=$bus_a PDMOUNT_KEYRING_TIMEOUT_SECS=10 "$PDMOUNT" --profile "$PROFILE" login 2>&1); then
@@ -200,16 +205,16 @@ grep -q 'already uses this session' <<<"$out" || fail "own bus: $out"
 if out=$(attach_from "unix:path=$work/no-bus" 2>&1); then fail "an unreachable bus was attached: $out"; fi
 grep -q 'cannot use that bus' <<<"$out" || fail "unreachable bus: $out"
 if out=$(attach_from "tcp:host=localhost,port=1" 2>&1); then fail "a tcp address was accepted: $out"; fi
-expect_eq "notifications" "$(wc -l <"$work/notify.log")" 0
+expect_eq "notifications" "$(notified)" 0
 
 step "session attach from bus B: kept, and the one notification lands on B"
 out=$(attach_from "$bus_b") || fail "attach failed: $out"
 grep -q 'now has this session.s bus (keyring: none found; notifications: this session.s bus)' <<<"$out" ||
     fail "attach: $out"
-wait_for "the notification" 20 test -s "$work/notify-bus.log"
+wait_for "the notification" 20 more_notified 0
 daemon_says 'attached the desktop.s session bus' || fail "no log line about the attach"
-expect_eq "the bus of the notification" "$(cat "$work/notify-bus.log")" "$bus_b"
-grep -q 'keyring needed' "$work/notify.log" || fail "notification: $(cat "$work/notify.log")"
+expect_eq "the bus of the notification" "$(notify_buses)" "$bus_b"
+grep -q 'keyring needed' "$notify_log" || fail "notification: $(cat "$notify_log")"
 kill -0 "$daemon" || fail "the daemon exited"
 waits_for_keyring || fail "B has no keyring yet, but the daemon stopped waiting"
 
@@ -229,7 +234,7 @@ grep -q "^Bus: .*desktop's bus attached; keyring: none found, notifications: the
 # The new wait's notification, and the one about the queued write, go to B.
 wait_for "the keyring notification after the restart" 20 more_keyring_notices "$notices"
 expect_eq "the bus of the notifications after the restart" \
-    "$(tail -n "+$((before + 1))" "$work/notify-bus.log" | sort -u)" "$bus_b"
+    "$(notify_buses | tail -n "+$((before + 1))" | sort -u)" "$bus_b"
 [[ -f $attach_file ]] || fail "the used saved attach was removed"
 
 step "a saved attach of a bus that is gone is removed at the start; the next attach saves B again"
@@ -244,7 +249,7 @@ if grep -q '^Bus:' <<<"$st"; then fail "a bus is attached after a gone one: $st"
 # A has no notification server: the wait's notification waits for the attach.
 out=$(attach_from "$bus_b") || fail "attach failed: $out"
 wait_for "the keyring notification" 20 more_keyring_notices "$notices"
-expect_eq "the bus of the notification" "$(tail -1 "$work/notify-bus.log")" "$bus_b"
+expect_eq "the bus of the notification" "$(notify_buses | tail -1)" "$bus_b"
 [[ -f $attach_file ]] || fail "the attach from B is not saved"
 
 step "session attach before the daemon starts: saved by the client, taken by the start (D102 amended)"
@@ -281,7 +286,7 @@ expect_eq "the further root while waiting" "$(root_state)" "waits for the keyrin
 if out=$(pd mount "$ROOT_MNT" 2>&1); then fail "a further root mounted while waiting: $out"; fi
 grep -q 'the daemon waits for the keyring' <<<"$out" || fail "mount <root> while waiting: $out"
 wait_for "the keyring notification" 20 more_keyring_notices "$notices"
-expect_eq "the bus of the notification" "$(tail -1 "$work/notify-bus.log")" "$bus_b"
+expect_eq "the bus of the notification" "$(notify_buses | tail -1)" "$bus_b"
 
 if command -v gnome-keyring-daemon >/dev/null; then
     gk=
@@ -355,7 +360,7 @@ if command -v gnome-keyring-daemon >/dev/null; then
             --method org.freedesktop.Secret.Service.Lock "['/org/freedesktop/secrets/collection/login']" >/dev/null ||
             fail "cannot lock B's login collection"
         service_start() { # a daemon as the service runs it, on bus B as its own
-            PATH=$stub_path DBUS_SESSION_BUS_ADDRESS=$bus_b PDMOUNT_KEYRING_RETRY_SECS=2 PDMOUNT_KEYRING_TIMEOUT_SECS=60 \
+            DBUS_SESSION_BUS_ADDRESS=$bus_b PDMOUNT_KEYRING_RETRY_SECS=2 PDMOUNT_KEYRING_TIMEOUT_SECS=60 \
                 "$PDMOUNT" --profile "$PROFILE" -v mount --foreground --service openrc "${backend_flag[@]}" "$MNT" \
                 >>"$work/daemon.log" 2>&1 &
             daemon=$!
@@ -409,7 +414,7 @@ if command -v gnome-keyring-daemon >/dev/null; then
     wait "$daemon" || fail "the daemon exited with an error"
     daemon=
     stop_gk
-    activatable "$work/busC-services" org.freedesktop.Notifications "$(command -v false)"
+    activatable "$work/busC-services" org.freedesktop.Notifications "$(stub_command "$work/busC")"
     activatable "$work/busC-services" org.freedesktop.secrets "$(command -v sleep) 20"
     start_bus busC "$work/busC-services"
     bus_c=$bus_address
@@ -425,7 +430,7 @@ if command -v gnome-keyring-daemon >/dev/null; then
         out=$(attach_from "$bus_c") || fail "attach of C failed: $out"
         grep -q '(keyring: this session.s bus; notifications: this session.s bus)' <<<"$out" || fail "attach of C: $out"
         wait_for "the notification on C" 20 more_notified "$before"
-        expect_eq "the bus of the notification" "$(tail -1 "$work/notify-bus.log")" "$bus_c"
+        expect_eq "the bus of the notification" "$(notify_buses | tail -1)" "$bus_c"
         status_text | grep -q "^Bus: .*keyring: the desktop's bus, notifications: the desktop's bus" ||
             fail "status: $(status_text)"
     }
@@ -478,7 +483,7 @@ if command -v gnome-keyring-daemon >/dev/null; then
     [[ ! -e $key_file ]] || fail "a cache key file appeared"
     expect_eq "content read with the key from A" "$(cat "$area/before")" before
     # One notification per wait, both on C.
-    expect_eq "notifications on C" "$(grep -c "^$bus_c\$" "$work/notify-bus.log")" 2
+    expect_eq "notifications on C" "$(notify_buses | grep -c "^$bus_c\$")" 2
 else
     echo "x13: no gnome-keyring-daemon; the keyring part is skipped"
 fi

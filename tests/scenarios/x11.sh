@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # X11 (DESIGN.md §15.3, D091): logind's delay lock and PrepareForShutdown,
 # against a stub logind (`pdmount fake logind`) on a private bus exported as
-# DBUS_SYSTEM_BUS_ADDRESS, and a notify-send stub on PATH. Fake with the
+# DBUS_SYSTEM_BUS_ADDRESS, and a notification stub on a private session bus. Fake with the
 # network profile. Skipped when dbus-daemon is not installed.
 source "$(dirname "$0")/lib.sh"
 [[ $BACKEND == fake ]] || { echo "x11 needs the fake and a stub logind; skipped for BACKEND=$BACKEND"; exit 0; }
@@ -60,11 +60,11 @@ x11_cleanup() {
 trap x11_cleanup EXIT
 export DBUS_SYSTEM_BUS_ADDRESS=unix:path=$bus
 
-# notify-send records its arguments (the stub lives in the repository, since
-# SCENARIO_ROOT may be noexec); a session bus address only has to be set.
-touch "$work/notify.log"
-export PATH=$repo/tests/scenarios/stubs:$PATH X11_NOTIFY_LOG=$work/notify.log \
-    DBUS_SESSION_BUS_ADDRESS=unix:path=$work/no-session-bus
+# The notification stub (`pdmount fake notifications`) on a session bus of its own.
+notify_log=$work/notify.log
+start_session_bus x11-session
+start_notify_stub "$bus_address" "$notify_log"
+export DBUS_SESSION_BUS_ADDRESS=$bus_address
 
 stub_log=$work/logind.log
 start_stub() { # [--refuse]
@@ -93,7 +93,7 @@ prepare() { # true|false
     prepare_ms=$stub_ms
 }
 # The shutdown ones; a mount after a stop with entries left sends its own (M5.2).
-notifications() { grep -c 'before shutdown' "$work/notify.log" || true; }
+notifications() { grep -c 'before shutdown' "$notify_log" || true; }
 
 step "the lock is taken at mount"
 start_stub
@@ -114,7 +114,7 @@ wait_stub 'released 1' "$grace"
 ((stub_ms - prepare_ms >= 2000)) || fail "the lock was released $((stub_ms - prepare_ms)) ms after PrepareForShutdown; 8 MiB at 2 MB/s take 4 s"
 expect_log 'flushed 8 entries in' "the flush"
 expect_eq "notifications" "$(notifications)" 1
-grep -q 'uploading 8 changes before shutdown' "$work/notify.log" || fail "notification: $(cat "$work/notify.log")"
+grep -q 'uploading 8 changes before shutdown' "$notify_log" || fail "notification: $(cat "$notify_log")"
 expect_eq "queue after the flush" "$(pd queue list "$area")" "Nothing is queued."
 is_mounted || fail "the daemon stopped after PrepareForShutdown"
 

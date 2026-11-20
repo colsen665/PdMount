@@ -13,9 +13,11 @@
 //! 2. **Its reference**, one request per photo and one background turn of
 //!    the session's gate each (the pacing of the names, D027, D110; one
 //!    turn queued at a time, so it neither starves the other trees'
-//!    background work nor is starved by it): the revision's
-//!    block listing, whose manifest signature covers the thumbnails'
-//!    digests, verified as a block map is ([`Photos::thumbnail_ref`]). Only
+//!    background work nor is starved by it): the first page of the
+//!    revision's block listing, whose manifest signature covers the
+//!    thumbnails' digests, verified when the page is the whole listing
+//!    (a photo; a video's thumbnail is checked by decryption alone, D135;
+//!    [`Photos::thumbnail_ref`]). Only
 //!    the 512 px thumbnail, never the 1920 px preview (D107).
 //! 3. **The thumbnails** of the batch: their URLs in one request, started
 //!    in one more turn, the downloads checked against the signed digests

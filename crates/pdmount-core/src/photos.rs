@@ -44,8 +44,11 @@
 //! do, with the session's download permits. The session's bulk-read guard
 //! ([`ScanGuard`], D111) sees the tree's opens as it sees the engines': a
 //! photo opened during a scan reads its first bytes as a scan read (a turn
-//! of the guard, scan priority, the scan share of the cache). No readahead
-//! for any read.
+//! of the guard, scan priority, the scan share of the cache). Other reads
+//! get the engine's sequential readahead ([`crate::readahead`], D135): once
+//! a handle's reads in order cross into the next block, the next blocks
+//! are fetched in the background with the session's readahead permits, so
+//! a video plays at the link's rate; scan reads get none.
 //!
 //! Live Photos and Motion Photos (tags 3 and 4): the timeline's related
 //! photos (the video of a Live Photo) show beside their main photo, in its
@@ -81,6 +84,7 @@ mod sync;
 #[cfg(test)]
 mod tests;
 pub mod thumbnails;
+mod wipe;
 
 pub use model::{Month, Photo, PhotoMeta, Placer, local_month, utc_month};
 pub use thumbnails::{ThumbnailOptions, Thumbnailer};
@@ -94,6 +98,7 @@ use crate::gate::{Gate, Turn};
 use crate::health::{Health, Monitored};
 use crate::limits::SessionLimits;
 use crate::metrics::{Metrics, TimedBackend};
+use crate::readahead::Sequential;
 use crate::readonly::ReadOnlyTree;
 use crate::scan::{ScanGuard, UserWait};
 use crate::staging::Protections;
@@ -180,6 +185,7 @@ pub struct PhotosStatus {
 
 #[derive(Debug, Clone)]
 struct OpenPhoto {
+    ino: Ino,
     link: LinkId,
     revision: RevisionId,
     size: u64,
@@ -188,6 +194,8 @@ struct OpenPhoto {
     scan: bool,
     /// Bytes read through the handle so far.
     read_bytes: u64,
+    /// Its reads in order, for readahead (D135).
+    sequential: Sequential,
 }
 
 /// Open folder handles, and per folder the digest of the entries the
@@ -248,6 +256,8 @@ pub struct PhotosTree {
     hook: parking_lot::RwLock<Option<Arc<dyn ThumbnailHook>>>,
     /// The thumbnails' writer, the hook unless a test set another.
     thumbnailer: Option<Arc<Thumbnailer>>,
+    /// Photos whose signatures do not verify, and the mode (D132).
+    signatures: crate::signatures::Signatures,
     runtime: tokio::runtime::Handle,
 }
 
@@ -269,6 +279,10 @@ impl PhotosTree {
         }
         let store = Arc::new(Store::open(&options.state_db)?);
         let loaded = rows::open(&store, &options.volume, &options.root).await?;
+        let signatures = crate::signatures::Signatures::new(
+            options.config.signatures,
+            store.read(crate::signatures::load)?,
+        );
         let scan = options.scan.clone().unwrap_or_else(|| {
             let cap = options
                 .cache
@@ -361,6 +375,7 @@ impl PhotosTree {
             last_poll: parking_lot::Mutex::default(),
             hook: parking_lot::RwLock::new(hook),
             thumbnailer,
+            signatures,
             runtime: tokio::runtime::Handle::current(),
         });
         Ok((tree, receiver))
@@ -423,6 +438,111 @@ impl PhotosTree {
             unreadable: model.unreadable(),
             restarts: self.restarts.load(Ordering::Relaxed),
         }
+    }
+
+    /// Newly found photos whose signatures do not verify (D132).
+    pub fn subscribe_signatures(&self) -> tokio::sync::broadcast::Receiver<u64> {
+        self.signatures.subscribe()
+    }
+
+    /// Found photos now, and how many of them are refused.
+    pub fn signature_counts(&self) -> (u64, u64) {
+        let (found, refused) = self.signatures.counts();
+        (found as u64, refused as u64)
+    }
+
+    /// `pdmount signatures list` of the tree: paths `/<year>/<month>/<name>`.
+    pub async fn signatures_list(&self) -> Result<Vec<crate::signatures::FoundView>> {
+        self.store.flush().await?;
+        let stored = self.store.read(crate::signatures::load)?;
+        let model = self.model.read();
+        Ok(crate::signatures::views(&self.signatures, stored, |link| {
+            let (year, month) = model.month_of(link)?;
+            let name = model.shown_name(link)?;
+            Some(format!("/{}/{}/{name}", year_name(year), month_name(month)))
+        }))
+    }
+
+    /// `pdmount signatures accept <id>` of the tree (see
+    /// `Engine::signature_accept`).
+    pub async fn signature_accept(&self, id: &str) -> Result<Option<crate::signatures::FoundView>> {
+        let links = self.signatures.links_of(id);
+        let link = match links.as_slice() {
+            [] => return Ok(None),
+            [link] => link.clone(),
+            _ => {
+                return Err(CoreError::Refused(format!(
+                    "the id {id} names {} photos; nothing was accepted",
+                    links.len()
+                )));
+            }
+        };
+        let digest = self
+            .model
+            .read()
+            .photo(&link)
+            .and_then(|photo| photo.meta.as_ref())
+            .and_then(|meta| meta.unverified.as_ref())
+            .map(|unverified| unverified.digest.clone());
+        let Some(digest) = digest else {
+            return Ok(None);
+        };
+        let stored = (link.clone(), digest.clone());
+        self.store
+            .write_durable(move |conn| {
+                crate::signatures::store_accept(conn, &stored.0, &stored.1).map(|_| ())
+            })
+            .await?;
+        self.signatures.set_accepted(&link, &digest);
+        Ok(self
+            .signatures_list()
+            .await?
+            .into_iter()
+            .find(|view| view.link == link.0))
+    }
+
+    /// `pdmount signatures check` of the tree: every photo's node read
+    /// again, a batch per background turn ([`PhotosTree::fetch_nodes`]);
+    /// its months count as the folders.
+    pub async fn signatures_check(
+        &self,
+        progress: &crate::engine::CheckProgress,
+    ) -> Result<crate::signatures::CheckCounts> {
+        let (links, months): (Vec<LinkId>, usize) = {
+            let model = self.model.read();
+            let links: Vec<LinkId> = model.links().cloned().collect();
+            let months = model
+                .years()
+                .into_iter()
+                .map(|year| model.months_of(year).len())
+                .sum();
+            (links, months)
+        };
+        for batch in links.chunks(NAME_BATCH) {
+            if let Err(error) = self.fetch_nodes(batch).await {
+                tracing::warn!(%error, "photos: signatures check: a batch could not be read");
+                progress.add(crate::signatures::CheckCounts {
+                    failed: 1,
+                    ..Default::default()
+                });
+                continue;
+            }
+            let model = self.model.read();
+            let unverified = batch
+                .iter()
+                .filter_map(|link| model.photo(link)?.meta.as_ref()?.unverified.as_ref())
+                .count();
+            progress.add(crate::signatures::CheckCounts {
+                nodes: batch.len() as u64,
+                unverified: unverified as u64,
+                ..Default::default()
+            });
+        }
+        progress.add(crate::signatures::CheckCounts {
+            folders: months as u64,
+            ..Default::default()
+        });
+        Ok(progress.counts())
     }
 
     /// Bytes of the tree's block cache on disk, and its blocks.
@@ -676,21 +796,35 @@ impl PhotosTree {
         self.scan.turn(self.config.timeouts.block.0 / 3).await
     }
 
-    /// After a read of `len` bytes at `offset` through `handle`: counts
-    /// them on the handle and, unless it was a scan read, takes the blocks
-    /// it used out of the scan blocks (the engine's readahead bookkeeping,
-    /// without readahead).
-    fn after_read(&self, handle: u64, file: &OpenPhoto, layout: &Layout, offset: u64, len: u64) {
-        let scan = {
+    /// For a read of `len` bytes at `offset` through `handle`: counts them
+    /// on the handle and, unless it is a scan read, takes the blocks it uses
+    /// out of the scan blocks and runs the engine's sequential readahead
+    /// (§5.3, D135) with the session's readahead permits.
+    fn readahead(&self, handle: u64, file: &OpenPhoto, layout: &Layout, offset: u64, len: u64) {
+        let (ahead, scan) = {
             let mut files = self.files.lock();
             let Some(open) = files.get_mut(&handle) else {
                 return;
             };
             let scan = self.is_scan_read(open);
             open.read_bytes = open.read_bytes.saturating_add(len);
-            scan
+            (open.sequential.record(layout, offset, len), scan)
         };
-        if scan || !self.cache.scan_seat().is_some_and(|seat| seat.any_blocks()) {
+        if scan {
+            return;
+        }
+        if ahead > 0 {
+            crate::readahead::fetch_ahead(
+                &self.cache,
+                &self.runtime,
+                &file.link,
+                &file.revision,
+                layout,
+                (offset, len),
+                ahead,
+            );
+        }
+        if !self.cache.scan_seat().is_some_and(|seat| seat.any_blocks()) {
             return;
         }
         let keys: Vec<BlockKey> = layout
@@ -840,12 +974,21 @@ impl ReadOnlyTree for PhotosTree {
                         .photo(link)
                         .and_then(|photo| photo.meta.as_ref())
                         .ok_or(CoreError::NotFound)?;
+                    if self.signatures.refuses(link, meta.unverified.as_ref()) {
+                        tracing::debug!(
+                            ino,
+                            "photos: refused, its signatures do not verify (D132)"
+                        );
+                        return Err(CoreError::AccessDenied);
+                    }
                     OpenPhoto {
+                        ino,
                         link: link.clone(),
                         revision: meta.revision.clone(),
                         size: meta.size,
                         scan: false,
                         read_bytes: 0,
+                        sequential: Sequential::default(),
                     }
                 }
                 Some(_) => return Err(CoreError::IsADirectory),
@@ -890,7 +1033,7 @@ impl ReadOnlyTree for PhotosTree {
         let Some(read) = self.read_blocks_local(&file, &layout, offset, len) else {
             return Ok(None);
         };
-        self.after_read(handle, &file, &layout, offset, len);
+        self.readahead(handle, &file, &layout, offset, len);
         Ok(Some(read))
     }
 
@@ -912,15 +1055,29 @@ impl ReadOnlyTree for PhotosTree {
         } else {
             (Priority::Interactive, None)
         };
-        let layout = self
-            .cache
-            .layout(&file.link, &file.revision, file.size)
-            .await?;
-        let data = self
-            .read_layout(&file, &layout, offset, len, priority)
-            .await?;
-        self.after_read(handle, &file, &layout, offset, len);
-        Ok(data)
+        let read = async {
+            let layout = self
+                .cache
+                .layout(&file.link, &file.revision, file.size)
+                .await?;
+            // Before its own download: a read that crosses into the next
+            // block starts the readahead beside it.
+            self.readahead(handle, &file, &layout, offset, len);
+            self.read_layout(&file, &layout, offset, len, priority)
+                .await
+        };
+        if scan {
+            return read.await;
+        }
+        // A wait the user notices is reported (D137).
+        let describe = || {
+            let name = self.model.read().shown_name(&file.link)?.to_owned();
+            Some((name, file.size))
+        };
+        self.scan
+            .slow_reads()
+            .watch((self.scan_tree, file.ino), describe, read)
+            .await
     }
 
     fn release(&self, handle: u64) {

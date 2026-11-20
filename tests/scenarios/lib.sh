@@ -430,8 +430,113 @@ make_workdir() {
 # removes the work directory.
 scenario_cleanup() {
     if [[ -n ${fault_active:-} ]]; then fake_fault clear >/dev/null 2>&1 || true; fi
+    local pid
+    for pid in "${scenario_pids[@]}"; do
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    done
     rm -rf "${work:-}"
 }
+
+# ---- Private session buses and the notification stub (M6.1, D138) ----
+#
+# Notifications go over D-Bus (notify.rs), so a scenario that checks them runs
+# a private session bus with `pdmount fake notifications serve` on it, and
+# starts the daemons with DBUS_SESSION_BUS_ADDRESS set to it. The log has one
+# JSON line per call (summary, body, actions, replaces_id, id; the bus too).
+# Both are stopped by scenario_cleanup, after the scenario's own unmounts.
+scenario_pids=()
+
+# Skips the scenario (exit 0) when dbus-daemon is not installed.
+need_dbus_daemon() { # <scenario name>
+    command -v dbus-daemon >/dev/null || { echo "$1: no dbus-daemon; skipped"; exit 0; }
+}
+
+# A private session bus: anyone may own and call anything, as on a session
+# bus. Sets bus_address. <service dir>: where it finds activation files.
+# Needs $work (make_workdir); run it in the scenario's own shell, not in $(...).
+start_session_bus() { # <name> [<service dir>]
+    local socket=$work/$1.sock conf=$work/$1.conf
+    {
+        cat <<EOF
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:path=$socket</listen>
+  <auth>EXTERNAL</auth>
+EOF
+        [[ -z ${2:-} ]] || echo "  <servicedir>$2</servicedir>"
+        cat <<EOF
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+EOF
+    } >"$conf"
+    dbus-daemon --config-file="$conf" --nofork --nopidfile &
+    local pid=$!
+    scenario_pids+=("$pid")
+    until [[ -S $socket ]]; do
+        kill -0 "$pid" 2>/dev/null || fail "dbus-daemon did not start"
+        sleep 0.1
+    done
+    bus_address=unix:path=$socket
+}
+
+# The notification stub on <bus address>, logging to <log> (appended). Waits
+# until it owns its name. Sets notify_pid. Options: --no-actions,
+# --no-markup, --delay-ms <n>.
+start_notify_stub() { # <bus address> <log> [stub options...]
+    local before
+    : >>"$2"
+    before=$(grep -c '"op":"ready"' "$2" || true)
+    "$PDMOUNT" fake notifications serve --bus "$1" --log "$2" "${@:3}" &
+    notify_pid=$!
+    scenario_pids+=("$notify_pid")
+    local start=$SECONDS
+    until (($(grep -c '"op":"ready"' "$2" || true) > before)); do
+        kill -0 "$notify_pid" 2>/dev/null || fail "the notification stub did not start"
+        ((SECONDS - start < 20)) || fail "the notification stub is not ready"
+        sleep 0.1
+    done
+}
+
+# Stops the stub that start_notify_stub started last: the bus then has no
+# notification server (a call to its name fails), until the next start.
+stop_notify_stub() {
+    kill "$notify_pid" 2>/dev/null || true
+    wait "$notify_pid" 2>/dev/null || true
+}
+
+# A stub file manager (`pdmount fake notifications file-manager`, M6.2) on
+# <bus>: owns org.freedesktop.FileManager1 and logs each ShowItems as a JSON
+# line (`"op":"show_items"`, `uris`). Sets fm_pid; stop_file_manager_stub
+# takes the name off the bus again.
+start_file_manager_stub() { # <bus address> <log>
+    local before
+    : >>"$2"
+    before=$(grep -c '"op":"fm_ready"' "$2" || true)
+    "$PDMOUNT" fake notifications file-manager --bus "$1" --log "$2" &
+    fm_pid=$!
+    scenario_pids+=("$fm_pid")
+    local start=$SECONDS
+    until (($(grep -c '"op":"fm_ready"' "$2" || true) > before)); do
+        kill -0 "$fm_pid" 2>/dev/null || fail "the file manager stub did not start"
+        ((SECONDS - start < 20)) || fail "the file manager stub is not ready"
+        sleep 0.1
+    done
+}
+stop_file_manager_stub() {
+    kill "$fm_pid" 2>/dev/null || true
+    wait "$fm_pid" 2>/dev/null || true
+}
+
+# What a stub logged: the notifications (one JSON line each), their number.
+notify_lines() { grep '"op":"notify"' "$1" || true; } # <log>
+notify_count() { grep -c '"op":"notify"' "$1" || true; } # <log>
 
 # ---- M2 write scenarios ----
 

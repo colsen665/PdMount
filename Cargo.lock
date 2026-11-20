@@ -3306,7 +3306,7 @@ checksum = "35fb2e5f958ec131621fdd531e9fc186ed768cbe395337403ae56c17a74c68ec"
 
 [[package]]
 name = "pdmount"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3337,7 +3337,7 @@ dependencies = [
 
 [[package]]
 name = "pdmount-backend"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3363,7 +3363,7 @@ dependencies = [
 
 [[package]]
 name = "pdmount-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3399,7 +3399,7 @@ dependencies = [
 
 [[package]]
 name = "pdmount-fuse"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "fuser",
@@ -3845,8 +3845,8 @@ dependencies = [
 
 [[package]]
 name = "proton-drive-sdk"
-version = "0.4.0"
-source = "git+https://github.com/colsen665/proton-sdk-rs2?rev=caafaea683116e71957d8e6b86de1450afc97ac1#caafaea683116e71957d8e6b86de1450afc97ac1"
+version = "0.5.1"
+source = "git+https://github.com/colsen665/proton-sdk-rs2?rev=19cc34de6b519d630b6f01750b93d47e3aa863a5#19cc34de6b519d630b6f01750b93d47e3aa863a5"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3907,8 +3907,8 @@ dependencies = [
 
 [[package]]
 name = "proton-sdk-rs2"
-version = "0.4.0"
-source = "git+https://github.com/colsen665/proton-sdk-rs2?rev=caafaea683116e71957d8e6b86de1450afc97ac1#caafaea683116e71957d8e6b86de1450afc97ac1"
+version = "0.5.1"
+source = "git+https://github.com/colsen665/proton-sdk-rs2?rev=19cc34de6b519d630b6f01750b93d47e3aa863a5#19cc34de6b519d630b6f01750b93d47e3aa863a5"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -4375,12 +4375,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
 ]
 
@@ -5738,6 +5740,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23f0c9c52aa7cd7d77769a4cfe2a9adb1b331f489a41d912ce14513d5ab995c6"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d1ec4f6517c9e11ae630e200b2b65d193279042e28edd4a2cda233e46670bbb"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

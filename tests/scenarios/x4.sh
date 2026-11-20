@@ -4,29 +4,37 @@
 # uploaded; after a stop that left none it says nothing; and no "uploaded"
 # follows when the first notification did not go out. The stops: SIGTERM
 # with a grace too short for the queue (as X2), and kill -9. Fake with the
-# network profile and the notify-send stub (stubs/notify-send).
+# network profile and the notification stub on a private session bus (lib.sh).
 source "$(dirname "$0")/lib.sh"
 [[ $BACKEND == fake ]] || { echo "x4 needs the fake's network profile; skipped for BACKEND=$BACKEND"; exit 0; }
+need_dbus_daemon x4
 x_live_only
 ensure_dataset
 prepare_mount
 make_workdir
 scenario_area x4
 x_config_save
-trap 'x_restore; scenario_cleanup' EXIT
+x4_cleanup() {
+    x_restore
+    # The next scenario's daemon must not keep this one's bus.
+    if is_mounted; then pd unmount "$MNT" >/dev/null 2>&1 || true; fi
+    scenario_cleanup
+}
+trap x4_cleanup EXIT
 grace=4
 
-# The stub lives in the repository, since SCENARIO_ROOT may be noexec; a
-# session bus address only has to be set. The daemon inherits both.
-touch "$work/notify.log"
-export PATH=$repo/tests/scenarios/stubs:$PATH X11_NOTIFY_LOG=$work/notify.log \
-    X11_NOTIFY_FAIL=$work/notify.fail DBUS_SESSION_BUS_ADDRESS=unix:path=$work/no-session-bus
-notifications() { wc -l <"$work/notify.log"; }
+# The daemons started from here on send on the private bus, where the stub
+# is the notification server. The mount from prepare_mount is started again.
+notify_log=$work/notify.log
+start_session_bus x4
+start_notify_stub "$bus_address" "$notify_log"
+export DBUS_SESSION_BUS_ADDRESS=$bus_address
+notifications() { notify_count "$notify_log"; }
 # Waits until the stub has logged <n> notifications.
 wait_notifications() { # <n> <seconds>
     local deadline=$((SECONDS + $2))
     until (($(notifications) >= $1)); do
-        ((SECONDS < deadline)) || fail "expected $1 notifications within $2 s, got: $(cat "$work/notify.log")"
+        ((SECONDS < deadline)) || fail "expected $1 notifications within $2 s, got: $(cat "$notify_log")"
         sleep 0.2
     done
 }
@@ -58,14 +66,14 @@ log_mark
 mount_now
 expect_log '[0-9]+ changes? from the last session (was|were) not uploaded' "the start"
 wait_notifications 1 5
-grep -Eq 'PdMount: [0-9]+ changes from the last session are still uploading' "$work/notify.log" ||
-    fail "first notification: $(cat "$work/notify.log")"
+grep -Eq 'PdMount: [0-9]+ changes from the last session are still uploading' "$notify_log" ||
+    fail "first notification: $(cat "$notify_log")"
 expect_eq "notifications while uploading" "$(notifications)" 1
 "$PDMOUNT" fake profile clear "$FAKE_DIR"
 wait_queue_empty
 wait_notifications 2 15
-grep -Eq 'PdMount: the [0-9]+ changes from the last session are uploaded' "$work/notify.log" ||
-    fail "second notification: $(cat "$work/notify.log")"
+grep -Eq 'PdMount: the [0-9]+ changes from the last session are uploaded' "$notify_log" ||
+    fail "second notification: $(cat "$notify_log")"
 wait_log 'the changes of the last session are done' 10 "the end"
 sleep 1
 expect_eq "notifications" "$(notifications)" 2
@@ -93,11 +101,11 @@ log_mark
 mount_now
 expect_log '[0-9]+ changes? from the last session (was|were) not uploaded' "the start"
 wait_notifications 3 5
-grep -Eq 'still uploading' <(tail -1 "$work/notify.log") || fail "notification: $(tail -1 "$work/notify.log")"
+grep -Eq 'still uploading' <(notify_lines "$notify_log" | tail -1) || fail "notification: $(notify_lines "$notify_log" | tail -1)"
 "$PDMOUNT" fake profile clear "$FAKE_DIR"
 wait_queue_empty
 wait_notifications 4 15
-grep -Eq 'are uploaded' <(tail -1 "$work/notify.log") || fail "notification: $(tail -1 "$work/notify.log")"
+grep -Eq 'are uploaded' <(notify_lines "$notify_log" | tail -1) || fail "notification: $(notify_lines "$notify_log" | tail -1)"
 
 step "the first notification did not go out: no second one"
 x_config '[upload]' 'debounce = "60s"' '[timeouts]' "shutdown_grace = \"${grace}s\""
@@ -110,13 +118,13 @@ write_files "$area/c" c 6 1024
 kill_daemon
 pd unmount --force "$MNT"
 x_config '[timeouts]' "shutdown_grace = \"${grace}s\""
-touch "$work/notify.fail"
+# No notification server on the bus: the call to its name fails.
+stop_notify_stub
 log_mark
 mount_now
 expect_log '[0-9]+ changes? from the last session (was|were) not uploaded' "the start"
 "$PDMOUNT" fake profile clear "$FAKE_DIR"
 wait_queue_empty
-rm -f "$work/notify.fail"
 wait_log 'the changes of the last session are done' 10 "the end"
 sleep 3
 expect_eq "notifications" "$(notifications)" 4

@@ -199,7 +199,7 @@ async fn prepare_signals(connection: &Connection) -> zbus::Result<MessageStream>
 
 /// Takes a `delay` lock for `shutdown`; the lock lasts while the returned
 /// descriptor is open. zbus duplicates it with close-on-exec, so children
-/// such as `notify-send` do not keep it.
+/// (the keyring helper) do not keep it.
 async fn inhibit(connection: &Connection) -> anyhow::Result<OwnedFd> {
     let reply = tokio::time::timeout(
         BUS_TIMEOUT,

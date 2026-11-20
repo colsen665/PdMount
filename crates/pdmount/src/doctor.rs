@@ -307,37 +307,125 @@ fn error_chain(error: &dyn std::error::Error) -> String {
     text
 }
 
+/// The SDK's server time offset the clock line shows (D133): the one keys and
+/// signatures are dated and verified with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SdkOffset {
+    /// The running daemon's (its `status` reply), `None` while it has adopted
+    /// none (no Drive API answer yet, one refused, or the fake backend).
+    Mount(Option<i64>),
+    /// No daemon runs: the offset the SDK adopts from this check's answer as a
+    /// first answer, `None` when it refuses it (more than a day off).
+    Check(Option<i64>),
+}
+
+impl fmt::Display for SdkOffset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mount(Some(offset)) => write!(f, "the mount's server time offset {offset:+} s"),
+            Self::Mount(None) => {
+                write!(
+                    f,
+                    "the mount has adopted no server time offset (device clock)"
+                )
+            }
+            Self::Check(Some(offset)) => write!(f, "server time offset {offset:+} s"),
+            Self::Check(None) => write!(
+                f,
+                "a server time offset this large is refused (device clock)"
+            ),
+        }
+    }
+}
+
+/// The clock line from the device clock's difference to the Proton API
+/// (`skew`, device minus server) and the SDK's offset: `WARN` beyond a minute
+/// of skew, or when the mount's offset is more than a minute from this check's
+/// (a change it holds until a second answer confirms it, D133).
+pub fn classify_clock(skew: chrono::TimeDelta, offset: SdkOffset) -> Check {
+    let mut check = classify_clock_skew(skew);
+    check.detail = format!("{}; {offset}", check.detail);
+    let measured = -skew.num_seconds();
+    if let SdkOffset::Mount(Some(adopted)) = offset
+        && adopted.abs_diff(measured) > MAX_CLOCK_SKEW.as_secs()
+    {
+        check.level = check.level.max(Level::Warn);
+        check.detail = format!("{}, {measured:+} s by this check", check.detail);
+    }
+    check
+}
+
 /// Unauthenticated endpoint that answers with a `Date` header.
 const PING_URL: &str = "https://drive-api.proton.me/core/v4/tests/ping";
 
-async fn check_clock() -> Check {
+/// The Proton API's time by its `Date` header, or the clock line saying why
+/// there is none.
+async fn api_time() -> Result<chrono::DateTime<chrono::Utc>, Check> {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
     {
         Ok(client) => client,
-        Err(error) => return Check::new("clock", Level::Warn, format!("cannot check: {error}")),
+        Err(error) => {
+            return Err(Check::new(
+                "clock",
+                Level::Warn,
+                format!("cannot check: {error}"),
+            ));
+        }
     };
     let response = match client.get(PING_URL).send().await {
         Ok(response) => response,
         Err(error) => {
-            return Check::new(
+            return Err(Check::new(
                 "clock",
                 Level::Warn,
                 format!("cannot reach the Proton API: {}", error_chain(&error)),
-            );
+            ));
         }
     };
-    let server_time = response
+    response
         .headers()
         .get(reqwest::header::DATE)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| chrono::DateTime::parse_from_rfc2822(value).ok());
-    match server_time {
-        Some(server) => {
-            classify_clock_skew(chrono::Utc::now() - server.with_timezone(&chrono::Utc))
+        .and_then(|value| chrono::DateTime::parse_from_rfc2822(value).ok())
+        .map(|server| server.with_timezone(&chrono::Utc))
+        .ok_or_else(|| Check::new("clock", Level::Warn, "the Proton API sent no Date header"))
+}
+
+/// The running daemon's server time offset (`Some`), `None` when no daemon
+/// answers.
+async fn mount_offset(paths: &ProfilePaths) -> Option<Option<i64>> {
+    crate::control::call_ok::<crate::control::StatusReply>(
+        &paths.control_socket(),
+        crate::control::Request::Status,
+        Duration::from_secs(5),
+    )
+    .await
+    .ok()
+    .flatten()
+    .map(|reply| reply.server_time_offset)
+}
+
+async fn check_clock(paths: &ProfilePaths) -> Check {
+    let mount = mount_offset(paths).await;
+    match api_time().await {
+        Ok(server) => {
+            let offset = match mount {
+                Some(offset) => SdkOffset::Mount(offset),
+                None => {
+                    pdmount_backend::proton::observe_server_time(server.timestamp());
+                    SdkOffset::Check(pdmount_backend::proton::server_time_offset())
+                }
+            };
+            classify_clock(chrono::Utc::now() - server, offset)
         }
-        None => Check::new("clock", Level::Warn, "the Proton API sent no Date header"),
+        Err(mut check) => {
+            if let Some(offset) = mount {
+                check.detail = format!("{}; {}", check.detail, SdkOffset::Mount(offset));
+            }
+            check
+        }
     }
 }
 
@@ -794,6 +882,52 @@ async fn desktop_bus_check(paths: &ProfilePaths) -> Option<Check> {
     Some(classify_desktop_bus(terminal, service, &attach, names))
 }
 
+/// The `notifications` line (M6.1): what this terminal's session bus says
+/// about the notification server, which PdMount talks to over D-Bus itself
+/// (no `notify-send`).
+pub fn classify_notifications(state: &crate::bus::OwnState) -> Check {
+    use crate::bus::{NameState, OwnState};
+    const NAME: &str = "notifications";
+    match state {
+        OwnState::NoBus => Check::new(
+            NAME,
+            Level::Warn,
+            "no session bus: no desktop notification is shown; sign-in prompts are only \
+             logged, conflicts are shown once a notification server appears",
+        ),
+        OwnState::Unreachable(error) => Check::new(
+            NAME,
+            Level::Warn,
+            format!("cannot ask the session bus for a notification server: {error}"),
+        ),
+        OwnState::State {
+            state: NameState::Owned,
+            ..
+        } => Check::new(
+            NAME,
+            Level::Ok,
+            "a notification server runs on this terminal's session bus",
+        ),
+        OwnState::State {
+            state: NameState::Activatable,
+            ..
+        } => Check::new(
+            NAME,
+            Level::Ok,
+            "a notification server is not running but D-Bus starts one at the first notification",
+        ),
+        OwnState::State {
+            state: NameState::Absent,
+            ..
+        } => Check::new(
+            NAME,
+            Level::Warn,
+            "no notification server (org.freedesktop.Notifications) on this terminal's session \
+             bus: sign-in prompts are only logged, conflicts are shown once one appears",
+        ),
+    }
+}
+
 pub async fn run(paths: &ProfilePaths) -> Vec<Check> {
     let (keyring, state) = check_keyring(credentials::mode());
     let mut checks = vec![
@@ -806,11 +940,19 @@ pub async fn run(paths: &ProfilePaths) -> Vec<Check> {
         check_login(paths, state.as_ref()),
         check_free_space("data space", &paths.data_dir),
         check_free_space("cache space", &paths.cache_dir),
-        check_clock().await,
+        check_clock(paths).await,
         autostart_check(paths),
         service_check(paths),
     ];
     checks.extend(desktop_bus_check(paths).await);
+    checks.push(classify_notifications(
+        &crate::bus::state_on(
+            None,
+            crate::bus::Service::Notifications,
+            Duration::from_secs(3),
+        )
+        .await,
+    ));
     if let Ok(config) = Config::load(&paths.config_file()) {
         if let Some(home) = std::env::var_os("HOME") {
             let home = Path::new(&home);
@@ -841,6 +983,26 @@ mod tests {
             Level::Ok
         );
         assert_eq!(check_keyring(SecretsMode::ForceFile).0.level, Level::Ok);
+    }
+
+    #[test]
+    fn the_notifications_line_names_the_server_state() {
+        use crate::bus::{NameState, OwnState};
+        let state = |state| OwnState::State {
+            address: "unix:path=/x".into(),
+            state,
+        };
+        for (own, level) in [
+            (state(NameState::Owned), Level::Ok),
+            (state(NameState::Activatable), Level::Ok),
+            (state(NameState::Absent), Level::Warn),
+            (OwnState::NoBus, Level::Warn),
+            (OwnState::Unreachable("gone".into()), Level::Warn),
+        ] {
+            let check = classify_notifications(&own);
+            assert_eq!(check.level, level, "{own:?}");
+            assert!(!check.detail.contains("notify-send"));
+        }
     }
 
     #[test]
@@ -905,6 +1067,79 @@ mod tests {
             classify_clock_skew(chrono::TimeDelta::seconds(-300)).level,
             Level::Warn
         );
+    }
+
+    /// D133: the clock line names the SDK's server time offset, the mount's when
+    /// a daemon runs, and warns when the mount's is more than a minute from what
+    /// this check measured.
+    #[test]
+    fn the_clock_line_shows_the_server_time_offset() {
+        let skew = chrono::TimeDelta::seconds;
+        let line = |skew, offset| {
+            let check = classify_clock(skew, offset);
+            (check.level, check.detail)
+        };
+        assert_eq!(
+            line(skew(-3), SdkOffset::Mount(Some(3))),
+            (
+                Level::Ok,
+                "3 s difference to the Proton API; the mount's server time offset +3 s".into()
+            )
+        );
+        assert_eq!(
+            line(skew(2), SdkOffset::Mount(None)),
+            (
+                Level::Ok,
+                "2 s difference to the Proton API; the mount has adopted no server time offset \
+                 (device clock)"
+                    .into()
+            )
+        );
+        assert_eq!(
+            line(skew(7_200), SdkOffset::Check(Some(-7_200))),
+            (
+                Level::Warn,
+                "7200 s difference to the Proton API; sync the system clock; server time offset \
+                 -7200 s"
+                    .into()
+            )
+        );
+        assert_eq!(
+            line(skew(-100_000), SdkOffset::Check(None)),
+            (
+                Level::Warn,
+                "100000 s difference to the Proton API; sync the system clock; a server time \
+                 offset this large is refused (device clock)"
+                    .into()
+            )
+        );
+        // The mount holds an offset ten minutes off what this check sees.
+        assert_eq!(
+            line(skew(-1), SdkOffset::Mount(Some(601))),
+            (
+                Level::Warn,
+                "1 s difference to the Proton API; the mount's server time offset +601 s, +1 s by \
+                 this check"
+                    .into()
+            )
+        );
+        assert_eq!(line(skew(-1), SdkOffset::Mount(Some(61))).0, Level::Ok);
+        assert_eq!(line(skew(-1), SdkOffset::Mount(Some(62))).0, Level::Warn);
+    }
+
+    /// An older daemon's `status` reply has no offset.
+    #[test]
+    fn a_status_reply_without_an_offset_reads_as_none() {
+        let reply: crate::control::StatusReply = serde_json::from_value(serde_json::json!({
+            "pid": 1, "mountpoint": "/m", "queue_pending": 0, "queue_parked": 0,
+            "queue_oldest_secs": null, "events_last_poll_secs": null, "events_refreshing": false,
+            "read_only": false, "conflicts": 0, "connectivity": "online", "connectivity_since": 0,
+            "sign_in_url": null, "sign_in_code": null, "sign_in_error": null, "username": "u",
+            "credentials": "c", "quota_used": null, "quota_max": null, "inodes": 1,
+            "cache_bytes": 0, "cache_blocks": 0, "pinned": null,
+        }))
+        .expect("an older reply decodes");
+        assert_eq!(reply.server_time_offset, None);
     }
 
     #[test]

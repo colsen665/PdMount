@@ -26,8 +26,35 @@ pub struct Config {
     pub timeouts: TimeoutConfig,
     pub stats: StatsConfig,
     pub photos: PhotosConfig,
+    /// Desktop notifications (D077, D137).
+    pub notify: NotifyConfig,
+    /// My Files' handling of nodes whose signatures do not verify (D132):
+    /// `refuse` (the default) or `warn`. Further roots have their own.
+    pub signatures: SignatureMode,
     /// Further roots, each on its own mountpoint (M5, D079, D110).
     pub roots: Vec<RootConfig>,
+}
+
+/// What a tree does with a node whose signatures do not verify (D132
+/// amended): `refuse` answers EACCES to opening, renaming, moving and
+/// deleting it, and to creating in or moving into a folder whose key did
+/// not verify, until `pdmount signatures accept`; `warn` only records it.
+/// Both list it in `pdmount signatures list`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SignatureMode {
+    #[default]
+    Refuse,
+    Warn,
+}
+
+impl SignatureMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Refuse => "refuse",
+            Self::Warn => "warn",
+        }
+    }
 }
 
 /// One further root (`[[roots]]`, D079, D110): a mount of its own next to
@@ -50,6 +77,25 @@ pub struct RootConfig {
     /// `kind = "test"` only: the trees of the mount.
     #[serde(default)]
     pub tree: Vec<TestTreeConfig>,
+    /// Nodes whose signatures do not verify (D132): by default `refuse` in
+    /// Photos and in a tree on the user's own volume, `warn` in shares.
+    #[serde(default)]
+    pub signatures: Option<SignatureMode>,
+}
+
+impl RootConfig {
+    /// The mode of one of the root's trees; `own`: the tree is on the
+    /// user's own volume (Photos' is). Shared roots warn by default: other
+    /// members' keys come from the server, and former members' deleted keys
+    /// make harmless failures likely.
+    pub fn signature_mode(&self, own: bool) -> SignatureMode {
+        self.signatures.unwrap_or(match self.kind {
+            RootKind::Shared => SignatureMode::Warn,
+            RootKind::Photos => SignatureMode::Refuse,
+            RootKind::Computers | RootKind::Test if own => SignatureMode::Refuse,
+            RootKind::Computers | RootKind::Test => SignatureMode::Warn,
+        })
+    }
 }
 
 /// What a further root maps. Computers is parsed so that a config naming
@@ -397,6 +443,31 @@ impl Default for PhotosConfig {
     }
 }
 
+/// Desktop notifications (`[notify]`, D077, D137; M6.2, M6.4).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotifyConfig {
+    /// A notification for each conflict the user has to look at (state
+    /// `open`, DESIGN.md §10.8); `false` turns them off.
+    pub conflicts: bool,
+    /// The conflict's file and tree in its text; `false` leaves them out
+    /// (a lock screen that shows notifications).
+    pub conflict_names: bool,
+    /// A notification naming a file whose read has waited 5 s for its
+    /// blocks (D137).
+    pub downloads: bool,
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        Self {
+            conflicts: true,
+            conflict_names: true,
+            downloads: true,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("cannot read {path}: {source}")]
@@ -601,6 +672,8 @@ mod tests {
         assert_eq!(config.cache.max_bytes, ByteSize(10 << 30));
         assert_eq!(config.upload.debounce.0, Duration::from_secs(2));
         assert!(config.photos.thumbnail_cache, "on by default (D115)");
+        assert!(config.notify.conflicts && config.notify.conflict_names);
+        assert!(config.notify.downloads, "on by default (D137)");
     }
 
     #[test]
@@ -650,6 +723,11 @@ prometheus_textfile = "~/metrics/pdmount.prom"
 
 [photos]
 thumbnail_cache = false
+
+[notify]
+conflicts = true
+conflict_names = false
+downloads = false
 "#,
         )
         .expect("valid");
@@ -680,6 +758,9 @@ thumbnail_cache = false
         assert_eq!(config.sync.probe_interval.0, Duration::from_secs(15));
         assert!(config.sync.pending_marker);
         assert!(!config.photos.thumbnail_cache);
+        assert!(config.notify.conflicts);
+        assert!(!config.notify.conflict_names);
+        assert!(!config.notify.downloads);
         assert_eq!(config.timeouts.metadata.0, Duration::from_secs(30));
         assert_eq!(
             config.prometheus_textfile(Path::new("/home/u")),
@@ -877,6 +958,32 @@ root = "link-3"
         )
         .expect("valid");
         assert!(config.roots[0].pending_marker);
+    }
+
+    /// D132: My Files and Photos refuse by default, shares warn; each
+    /// root can say otherwise.
+    #[test]
+    fn signature_modes_default_by_root_and_can_be_set() {
+        assert_eq!(
+            parse("").expect("defaults").signatures,
+            SignatureMode::Refuse
+        );
+        assert_eq!(
+            parse("signatures = \"warn\"\n").expect("valid").signatures,
+            SignatureMode::Warn
+        );
+        assert!(parse("signatures = \"off\"\n").is_err());
+        let config = parse(
+            "[[roots]]\nkind = \"shared\"\nmountpoint = \"~/s\"\n\
+             [[roots]]\nkind = \"photos\"\nmountpoint = \"~/p\"\n",
+        )
+        .expect("valid");
+        assert_eq!(config.roots[0].signature_mode(false), SignatureMode::Warn);
+        assert_eq!(config.roots[1].signature_mode(true), SignatureMode::Refuse);
+        let config =
+            parse("[[roots]]\nkind = \"shared\"\nmountpoint = \"~/r\"\nsignatures = \"refuse\"\n")
+                .expect("valid");
+        assert_eq!(config.roots[0].signature_mode(false), SignatureMode::Refuse);
     }
 
     #[test]

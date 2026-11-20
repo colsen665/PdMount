@@ -6,6 +6,193 @@ entry. At the end of a session, add its entry at the top of "Session entries" (A
 
 ## Session entries
 
+- **M6 squashed, decisions consolidated, tagged (2026-11-20, Opus orchestrating, one Opus agent; user: "as proposed
+  until push", the tag before the CI):** the agent consolidated D130–D142 (D129): D132←D134; D138←D141 (capabilities);
+  D139←D141 (Show, `clean_name`, `xdg-open`; the open review findings in its Consequences); D142←D141 (X21); entries
+  checked against the code (D139's `clean_name` set completed from `notify.rs`). Version 0.6.0, licences regenerated;
+  `dist plan` and a local `dist build` (release config changed in M6.0.4) checked and deleted. 78 commits on
+  `b295224` became one `M6:` commit on `master` (the earlier local `M6.0.5` commit on `master`, superseded by the one in
+  the branch, kept as `backup/master-m6.0.5`; old branch tip as `backup/m6-before-squash`); tag `v0.6.0` on it; full
+  CI on the tagged commit.
+- **D141 accepted (2026-11-20, user).**
+- **D142 (2026-11-20, user):** X21, M6's checks by hand on GNOME and KDE, not run; the user cannot install there and
+  accepts the risk. M6's exit rests on X6, X20, the script's test and the security review.
+- **M6.5 (2026-11-20, Opus agents: two area reviewers, one verifier and exit):** security review
+  `docs/security/2026-11-20-review/`: nothing above Low; V-2, V-4, V-6, V-7, V-9, V-12 fixed and V-3, V-8 in part, each
+  with a test (D141 proposed): Show's `xdg-open` fallback only on the bus's error reply and once per notification,
+  `xdg-open` from an absolute `PATH` directory in `/` without `NOTIFY_SOCKET`, capabilities asked again when the
+  service changes owner, `clean_name` widened and used by the signatures summary. Open for M7 or no fix: V-1 (a renamed
+  share's notifications keep the old name), V-5 (names that look like addresses become links on GNOME), V-10, V-11 and
+  the cgroup part of V-8. X21: `scripts/repro/m6-desktop.sh` for the user's checks on GNOME and KDE on a fake drive,
+  its test `tests/scenarios/m6desktop.sh` in `scripts/ci.sh`, the checklist in `docs/plans/m6.md` ("Running the M6
+  checks"); the user guide's notification section; DESIGN §10.8, §14.4, §15.3, §16, Appendix B.
+- **M6.3 (2026-11-20, Sonnet agent):** store schema 6, `conflicts.notified_at` (old rows migrate as notified; the
+  row upsert never clears it), marked once the server accepted; `notify_watch.rs` follows the notification bus and
+  `NameOwnerChanged` (the bus chosen again every 60 s and at an attach or drop, `bus::attach_changed`), and at start or
+  when the service appears each tree's unshown `open` conflicts go out, more than three as one summary;
+  `Burst::retract` so a failed send does not use the window; `notify.conflicts = false` marks without sending (D140
+  proposed); X6 step 5. A mark is not durable: a `kill -9` right after can show a conflict once more.
+- **M6.4 (2026-11-20, Opus agent):** `pdmount-core/src/slow.rs` (`SlowReads` on the session's `ScanGuard`) reports a
+  user read's wait past 5 s on the slow path (`Engine::read`, `PhotosTree::read`; scan reads and cached reads never),
+  per file by seat and inode; the daemon's `downloads.rs` names the file and size, one per file per 10 min, three
+  then a sum through `Coalescer`, each closed when its wait ends; `[notify] downloads`; scenario X20. D137 refined (no
+  D141). Read bench unchanged. Merged after M6.2: `NotifyConfig`, Appendix B and the scenario lists joined.
+- **M6.2 (2026-11-20, Opus agent):** one conflict announcer for the daemon (`conflict_notify.rs`) for My Files and
+  every further tree: only `open` conflicts, "PdMount: conflict", the path in its tree and plain words per kind; three
+  per 30 s through the new `notify::Burst`, the rest summed; **Show** calls `FileManager1.ShowItems`, else `xdg-open` on
+  the folder with the attached bus and display; `[notify] conflicts` and `conflict_names`; scenario X6 (`x6.sh`), a
+  file-manager stub and an `xdg-open` stub. D139 proposed. Open: a Show clicked after a daemon restart does nothing.
+- **M6.1 (2026-11-20, Sonnet agent, Opus orchestrator; user: M6.1, then M6.2 with M6.4, M6.3, CI, exit):**
+  `notify.rs` is a zbus client of `org.freedesktop.Notifications` on the route's bus (one connection per address on a
+  runtime of its own, 2 s deadlines, capabilities per connection, the body escaped with `body-markup`); `notify-send`
+  and its scenario stub removed; `doctor` has a `notifications` line; `pdmount fake notifications serve|invoke` is the
+  test server; x4, x11, x12, x13, x16 use it on private buses. API for M6.2–M6.4: `Notification`, `send`, `close`,
+  `capabilities`, `subscribe` (`Event::Action`, `Event::Closed`), `escape_markup`. D138 proposed. Quick CI and the six
+  scenarios in four modes green in the agent.
+- **M6.0.10, M6.0.11, fork pushed, D135 accepted (2026-11-19, Opus orchestrator, agents W (Sonnet) and L (Opus); user:
+  both tasks, then D135, the fork push and a real-account check):** W (M6.0.10, `3d0a8c8`): `cache wipe` for every tree,
+  by path or all, X19, D136 proposed. L (M6.0.11): the fake charges a round trip per block-list page (`d242b9d`);
+  `block_lists.rs` lists by range in pages of 20 with a per-page expiry and the manifest verified before the first
+  byte (`84f28ea`, fork P30 `f33d65e` on `0.5/feat/block-list-range`); readahead held until reads in order cross a
+  block (`d4466e6`); Photos readahead on the session's permits (`a643e96`). The official clients: JS lists pages of 20
+  and seeks with a page of one, checking neither manifest nor hash; C# pages of 10; both verify the manifest after a
+  whole download (D135). Integrated by cherry-pick, W first; `docs/decisions.md` conflicts kept both sides. One full
+  `scripts/ci.sh` against the fork merge `19cc34d` through a local override: every step passed (58 min; the live
+  scenarios 35 min). The user accepted D135; the fork's tests pass on `19cc34d` (344, 1 ignored); `pdmount-0.5`,
+  P30's branch and `pin/19cc34d` pushed (the publishing scan passed); PdMount pins `19cc34d` (`Cargo.lock`: the two
+  fork crates only; the licence file unchanged). Real account (release build, My Files, the test account's Photos has
+  no video): a 633 MiB MP4 with its index at the end, uploaded to `pdmount-test/m6011/` in 41 s, then for each run a
+  fresh daemon and its blocks wiped by the new `cache wipe <path>`: pages of 20 full, 73–400 ms each; first frame
+  median 2.6 s (1.5–4.0, 7 runs) against 4.5 s (2.4–7.3, 9 runs) on `c4958f4`; 10 s of playback 12.3 against 14.1 s;
+  copies 43–44 s against 36–51 s; no 429. The three Photos thumbnails, moved aside, were made again by the new
+  single-request path, byte-identical. A first round mixed an old daemon with the new client, whose absolute path the
+  old daemon refused, so the wipe ran after each remount. The video was deleted (in the trash; storage 4.1 of
+  5.0 GiB) and the check's config removed. AGENTS.md's full-CI time updated to about an hour. Open: D136 for review;
+  M6.1 next, with the slow-download notification (a decision: it shows the file's name).
+- **Slow large-video opens, M6.0.10 planned, D133/D134 accepted (2026-11-19, Opus orchestrator, one Opus agent):** the
+  user checked P21's file in the web client (recorded), accepted D133 and D134 with their known gaps (D134's key swap
+  after an accept planned for M7), asked for `cache wipe` in every mount (M6.0.10 planned) and reported a ~650 MiB
+  phone MP4 taking minutes to open in SMPlayer from the Photos mount. A diagnosis agent on the fake (folder shaped like
+  the user's, mpv/ffprobe, 20/5/2 MB/s at 80 ms) measured 1–12 s to the first frame; causes and the proposed M6.0.11 are
+  in `TODO.md`'s Next action. The user's listing was kept in the scratchpad only, not in the repository. Parked for a
+  reboot; nothing running or mounted, nothing pushed in PdMount since v0.5.0; the fork is at `pin/10a4471`.
+- **M6.0.6–M6.0.9 and real-account checks (2026-11-19, Opus orchestrator, five Opus agents; user: M6.0.7 for V-8/V-9
+  with the bounds' design, M6.0.6, the parity picks E2/E1/E3/F11 and F1/R6/N2, real-account checks approved, one CI,
+  then the fork push):** A (M6.0.7): fork P29 (`f18062e`, on `pdmount-0.5` since it changes P2's, P24's and P27's
+  checks) and P19 amended (`a6786c0`, `c368c40` merging P12 for the retry middleware); `doctor`'s offset; D133. The
+  official clients verify at server time too. B: the parity probe (`probe_parity.rs`), results in each patch's "Real
+  account" bullet: P28 v4 primary key, uploads and renames pass; P22 2511 then `Active`; P23 code 200002 at the draft;
+  P21 accepted, a stale `CurrentRevisionID` answers 2511/409 (C# expects 2500), still falls back; P24 all verify; P27/P4
+  0 of 3,720 nodes flagged, 316 rPGP "packet header mismatch" WARNs (re-encoding only, filtered from PdMount's log); P2
+  token lifetime 1800 s, 404 not provable. C (M6.0.6): D132 built, D134. D (M6.0.8): `QUIET_PERIOD` 5 min, jitter
+  scaled below 30 s intervals. E (M6.0.9): `SharedApi`; the fork already refreshes a 404 target per block, so PdMount
+  adds only the cut-body retry (no map-wide URL refresh). Integration A, C, E, B, D by cherry-pick: `status` reply
+  fields (A, C), D133/D134 and D112's two amendments kept side by side. Full CI against the fork's local merge: all
+  green but `test` (a mounted test's unmount ECONNABORTED, reproduced on the base 1/40 under load, 0/40 on the new
+  code; rerun green). Real account with the release build: `doctor` "+0 s", R1 live (21 commits), 40 dataset files
+  read with 27 cache misses, no WARN, no 429. Fork merges redone with the usual messages (same tree), pushed with
+  `pin/10a4471`; PdMount pins it (`Cargo.lock`: the two fork crates only; the licence file unchanged).
+- **M6.0.4.17–M6.0.4.21 (2026-11-19, Opus orchestrator, one Opus agent; user: the PdMount security findings):** V-12
+  (agent): `meta.incoming_devices` keeps up to 64 devices whose markers were read, preferred by the cap after the
+  devices shown; a full list replaces the newest known device not read in that pass, so planted markers only replace
+  each other; D096 amended. V-13: `scripts/ci.sh` makes the scenario root private before locking `<root>/.lock`. V-14:
+  the scan exemptions end at a path boundary (the scanner matches `/home/<name>` alone, a `~/` path up to a space); the
+  review's example strings exempt only in its report and in `.betterleaks.toml`; the pre-push hook run on the unpushed
+  commits without a push finds nothing. V-6: `[dist.github-action-commits]` for checkout, upload-artifact,
+  download-artifact and attest. V-7: `.github/build-setup.yml` installs 1.98.1 and runs `cargo metadata --locked`;
+  `ci.yml` checks the versions agree. Not picked: V-8 to V-11 (fork). One full `scripts/ci.sh` on the five passed.
+- **M6.0.4 pin (2026-11-19, Opus; user: push the fork):** pushed the nine new parity branches, the amended P2, P3, P4
+  and P19 branches (fast-forwards), `pdmount-0.5` (`e9e8c02`) and `pin/e9e8c02`; the publishing scan passed. PdMount pins
+  `e9e8c02`; `THIRD-PARTY-LICENSES.html` unchanged; quick CI green (the full CI had passed against the same tip through a
+  local override).
+- **D132 accepted (2026-11-19, the user):** with `pdmount signatures check [<path>]` added to the amendment and to
+  M6.0.6: every folder under the path listed again and its nodes checked, paced as a refresh.
+- **D132 amended (2026-11-19, the user; recorded by Opus):** of three options for unverified signatures (a mount flag
+  `--accept-invalid-signatures`; `signatures list/accept/delete`; a mode per root with `list` and `accept`) the user chose
+  the third without `delete`. Refused nodes stay listed and answer EACCES (hiding would let `rsync --delete` remove them
+  from backups; renames would re-sign the name with the user's key). Planned as M6.0.6 with a count-only notification.
+- **M6.0.4.5–M6.0.4.16 (2026-11-19, Opus orchestrator, three Opus agents; user: all proposed parity patches):** agent
+  A (upload) P20 verifies each encrypted block before upload, P23 sends the intended upload size, P21 uploads small files
+  in one request (off: no flag source), P28 signs with the primary address key; agent B (decode, read) P26 degrades
+  nodes that do not decrypt in listings and batches (D132 proposed: known degraded children keep their entry, a folder
+  holding one is not trashed), P27 keeps signature failures on the node (WARN once per node), P4 amended (XAttr fields
+  decoded one by one) with a P3 fix (pre-2025 block sizes sorted), P2 amended (a block missing after its refresh is an
+  integrity error, one retry of a hash mismatch); agent C (shares, commit, time) P24 verifies membership acceptance, P25
+  fetches a share once, P22 accepts "not in draft" when the revision is sealed, P19 amended (the crypto time never goes
+  back, within 60 s). Integration: thirteen fork merges on `pdmount-0.5` after `55adc5f`, tip `e9e8c02` (local, no
+  conflicts; fork tests 329 pass); twelve PdMount commits, conflicts only between the agents' `docs/sdk-patches.md`
+  sections and rows; one full `scripts/ci.sh` green through a local override; PdMount also builds against the pin.
+  Open: D132, the fork push and pin move, the real-account checks, the open points in TODO's Known gaps.
+- **D130 accepted (2026-11-19, the user):** the poller gives an event page up after three non-transient failures and
+  refreshes the volume's trees from a fresh cursor; a node under an undecryptable parent is degraded in the P13 batch.
+- **M6.0.4 GitHub settings (2026-11-19, the user; recorded by Opus):** the user set or checked the six settings of
+  M6.0.3 V-4/V-5: immutable releases, a tag ruleset (all tags) and a `master` ruleset without a GitHub Actions bypass,
+  read-only default workflow permissions, approval for external contributors' pull requests, Actions disabled on the SDK
+  fork. Threat model and TODO updated (V-4, V-5 closed); AGENTS.md names dist's real tag pattern (V-5's repository
+  part); D097's Consequences no longer say the default workflow permissions must allow writing.
+- **M6.0.4 pin (2026-11-18, Opus; user: push the fork):** pushed `0.5/fix/no-secret-logs` (`1ea0985`),
+  `0.5/feat/fresh-node-batch` (`223ae6a`), `pdmount-0.5` (`55adc5f`) and `pin/55adc5f`; the publishing scan passed.
+  PdMount pins `55adc5f`; `THIRD-PARTY-LICENSES.html` unchanged; quick CI green (the code had passed the full CI against
+  the same fork tip through a local override). `docs/sdk-patches.md`'s state text, stale since M6.0.1's push, updated.
+- **M6.0.4.4 (2026-11-18, Opus):** M6.0.3 V-4, repository part: `github-attestations = true`, `release.yml`
+  regenerated; the build job runs with `contents: read` (plus attestation rights) and attests the archive; `plan`,
+  `build-global-artifacts`, `host` and `announce` keep `contents: write`. D097 amended; threat model, user guide and the
+  release check name `gh attestation verify`. Integration: the four fixes on one branch, the fork's two patch branches
+  merged locally into `pdmount-0.5` (`294c75e`, `55adc5f`, not pushed); fork tests (239 + 24) and one full
+  `scripts/ci.sh` on the four with a local override to that tip passed. The pin stays at `70f10ff` until the fork push.
+- **M6.0.4.3 (2026-11-18, Opus agent):** M6.0.3 V-3 fixed. Fork P13 amended (`0.5/feat/fresh-node-batch` `223ae6a`): a
+  link whose parent does not decrypt comes back degraded and the batch goes on, told apart by a new
+  `UndecryptableNodeError` type. PdMount's poller gives a page up after three non-transient failures
+  (`BackendError::is_permanent`): fresh cursor, refresh of the volume's trees, a WARN line (D130 proposed, DESIGN §9.2).
+  Fake fault `broken-nodes`, an E1 live step (about +100 s). Remainder of parity R1 (P26): a link that does not decrypt
+  itself still fails the batch, and `NodeBatchLoader` listings still fail on one bad child (upstream code).
+- **M6.0.4.2 (2026-11-18, Opus agent):** M6.0.3 V-2 fixed. Fork P16 amended (`0.5/fix/no-secret-logs` `1ea0985`): the
+  session-fork poll's errors carry no URL (`without_url()`, path template `auth/v4/sessions/forks/<selector>`, serde
+  errors without text); transport errors, timeouts (30 s per poll) and 408/429/5xx are retried until `FORK_MAX_WAIT`
+  (`Retry-After` honoured); a login that ends without a session sends `DELETE auth/v4/sessions/forks/<selector>` (from
+  the official API description; the official client never calls it). PdMount redacts `/sessions/forks/<…>` in the
+  sign-in error before log, `login_error` and print. D071 amended, DESIGN §12.1. Untested: what a spent selector answers.
+- **M6.0.4.1 (2026-11-18, Opus agent; user: "use the proposed fix"):** M6.0.3 V-1 fixed. `Engine::unqueued_staged`
+  replaces `local_only_staged`: every staged, attached file not in the journal with `local_only` or pending content;
+  `changes_to_keep()` counts it for `SharedRoot::remove`, and `export_queued` exports it once, as `not-uploaded` when the
+  file has a remote. An uploaded file moved into a local-only folder still keeps its remote place and its edits stay
+  local (DESIGN §7.7 now says so; the report's point 3 not adopted). D114 amended. Engine tests (two failed before the
+  fix), `x16.sh` step. Under load x16 failed twice in steps it does not touch ("B's Incoming: to go" timing, `/d`
+  missing from the manifest after an event-pass race); green on rerun and in the full CI.
+- **M6.0.3 (2026-11-18, Opus orchestrating, four Fable reviewers, a Fable verifier, an Opus writer):** scope adjusted
+  because M5.8 had reviewed all M5 code: PdMount `976ea61..9818aa1` (M5.8's fixes, OpenRC `-U`, the CI fix), the
+  release pipeline (first review), the fork's P1–P19 at `70f10ff` and upstream `v0.4.0..v0.5.1`. 25 findings, 21
+  groups: 1 High (V-1, M5.8 V-1's fix misses a moved-and-edited file), 3 Medium (V-2 selector in logs, V-3 batch
+  failure loop, V-4 release token), 10 Low, 7 Info; none rejected. Rebase fidelity clean; M5.8 V-2 to V-8 and D128
+  fixes complete. Threat model: assets A6–A8, actors S1–S4, a pipeline rating scale, the missing M5.8 review line. Six
+  agents ran at once (the reviewers build nothing), over D098's three. Also this session: M6.0.2 and M6.0.5 by agents,
+  integrated on a scratch branch with M6.0.3, TODO and log amended into each commit.
+- **M6.0.5 (2026-11-18, Opus agent):** `narrrl/proton-sdk-rs` evaluated at its crates.io 0.12.1 (whose source commit is
+  not on GitHub) in `docs/sdk-evaluation-narrrl.md`. Recommendation: stay on rs2 and the fork through M6, look again
+  at M7 planning or if rs2 misses the crypto migration (Q5). narrrl lacks P6, P11, P14, P17 and block integrity checks
+  (block hashes unread, a failed manifest check only logged, range reads unchecked); its batch move retries code 2000
+  with the server's name hash (defeats D038); no web sign-in, though one could be built on its API. It builds without
+  Go, clang or protoc. Patches: has 6, lacks 4, differs 9; findings: has 7, lacks 3, differs 6. No decision added.
+- **M6.0.2 (2026-11-18, Opus agent with two research agents):** parity of the fork and PdMount with the official SDK at
+  `cs/v0.33.0` (`05c91159`, the newest tag: `js/v0.23.0`, upstream rs2's baseline, plus 28 commits), in
+  `docs/sdk-parity.md`. 55 rows: 28 same, 16 differ, 7 missing, 4 not applicable; 4 High: W1 blocks uploaded without
+  checking that they decrypt (P20), R1 one undecryptable node fails a listing or event page (P26; same cause as M6.0.3
+  V-3), R2 one bad XAttr field drops the whole XAttr and R3 unsorted block sizes from old Windows clients (both amend P4).
+  Proposed P20–P28, amendments to P2, P4, P19 (never move crypto time backwards, as C#). No service-rule breach (nearest:
+  E2, the last shared volume used keeps polling at 30 s). Q5: nothing new. `cs/` row moved to `cs/v0.33.0`; three
+  citations in `docs/sdk-patches.md` moved; dated records keep `js/v0.21.0`.
+- **M6.0.1 (2026-11-18, Opus orchestrating, Opus agents):** the SDK fork rebased onto upstream `v0.5.1` (`base/0.5.1` =
+  `e2e45bb`). Triage: all 18 patches still needed; P1 reduced (upstream `bbcbf9c` fixed the 40 MiB truncation, F2, but
+  has no public listing and no sort); F8 partly fixed upstream (P9 still returns the error). Each patch rebuilt as
+  `0.5/<old name>`, merged `--no-ff` into `pdmount-0.5` in the old order; fork tests 268, workspace 352, no new clippy
+  warning. PdMount needed no code change: requirement `proton-drive-sdk = "0.5"`, one citation, docs to 0.5.1 (dated
+  records stay at 0.4.0). Full CI green against a local override. Real account (user's consent): Q1/Q6 probe S1–S11 as
+  in M3.1 (`PROBE_PROFILE_B=same`, `second` not logged in); r1 (48 MiB, 12 blocks), g3, a1 live and r1 fresh green, no
+  429. G3 hit "Signature has a creation time in the future" once (retried): upstream's whole-second server-time offset,
+  overwritten by every response, can step back 1 s between a new key and its signature. P19 (user) keeps the offset
+  unless it moves by 2 s or more; unit tests, quick CI and a g3 rerun green. Pushed with the user's agreement: 19
+  `0.5/*` branches, `pdmount-0.5` at `70f10ff`, `base/0.5.1`, `pin/70f10ff`; PdMount pinned to it, override removed,
+  licences regenerated. Also: M6.0.5 added (evaluation of `narrrl/proton-sdk-rs`, user), a dependency of M6.0.4 (user).
 - **v0.5.0 released (2026-11-18, Opus):** full CI green on `42e3436`; the pre-push scan blocked 57 generic paths: exempted
   by pattern in `.betterleaks.toml` (standard files, made-up homes, placeholders) or inline `betterleaks:allow` where the
   scan matched whole tokens; a shared file's name dropped from `docs/plans/m5.md`. Pushed `318c015` and tag `v0.5.0`; the

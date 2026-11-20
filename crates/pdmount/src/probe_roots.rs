@@ -14,9 +14,13 @@
 //! `snapshot` prints one pass over every root and saves the volume and event
 //! ids to `target/probe-roots/state.json`. `watch` polls from those ids
 //! (`PROBE_FRESH=1`: from the latest ones) for `PROBE_WATCH_SECS` (default
-//! 600): own volumes and the core events every 30 s, other users' volumes and
-//! the invitation, shared-with-me and device listings every 60 s, as the
-//! official JS client. Each run's output also goes to
+//! 600): own volumes and the core events every 30 s, and other users'
+//! volumes every 10 min, as the official JS client's `EventScheduler` polls
+//! them in the background (the 60 s of its `internal/events/index.ts` belong
+//! to the deprecated `subscribeToTreeEvents`); so a watch of 600 s polls an
+//! other user's volume once at most, and a longer `PROBE_WATCH_SECS` shows
+//! more. The invitation, shared-with-me and device listings every 60 s, the
+//! probe's own choice. Each run's output also goes to
 //! `target/probe-roots/<phase>-<unix time>.log`. The results are interpreted
 //! in docs/plans/m5.md, "M5.9".
 
@@ -45,9 +49,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const CLIENT_UID: &str = "pdmount-rootsprobe";
-/// Polling intervals of the official JS client (`internal/events/index.ts`).
+/// Polling intervals of the official JS client's `EventScheduler`
+/// (`internal/events/eventScheduler.ts`: the own volume in the foreground,
+/// other volumes in the background).
 const OWN_VOLUME_POLL: Duration = Duration::from_secs(30);
-const OTHER_VOLUME_POLL: Duration = Duration::from_secs(60);
+const OTHER_VOLUME_POLL: Duration = Duration::from_secs(600);
+/// The core events, as the official client (`internal/events/index.ts`).
 const CORE_POLL: Duration = Duration::from_secs(30);
 /// Invitations, shared-with-me, devices and the share roots' roles.
 const LISTING_POLL: Duration = Duration::from_secs(60);
@@ -70,12 +77,12 @@ const MAX_CHILDREN: usize = 50;
 /// SDK calls made by the probe (one call may send several requests).
 static CALLS: AtomicU64 = AtomicU64::new(0);
 /// HTTP/2 requests sent, counted from h2's `send_headers` trace events.
-static REQUESTS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static REQUESTS: AtomicU64 = AtomicU64::new(0);
 /// Set when the SDK's retry layer saw a 429 (it retries those silently).
-static SAW_429: AtomicBool = AtomicBool::new(false);
+pub(crate) static SAW_429: AtomicBool = AtomicBool::new(false);
 
 /// Counts requests and notices 429 responses the SDK retried.
-struct CountLayer;
+pub(crate) struct CountLayer;
 
 #[derive(Default)]
 struct Fields {
@@ -114,7 +121,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CountLayer {
 
 /// The error that ends the probe.
 #[derive(Debug)]
-struct RateLimited;
+pub(crate) struct RateLimited;
 
 impl std::fmt::Display for RateLimited {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

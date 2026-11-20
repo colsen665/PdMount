@@ -38,7 +38,7 @@ use pdmount_backend::proton::ProtonBackend;
 use pdmount_backend::shared::SharedWithMe;
 use pdmount_backend::{Backend, LinkId};
 use pdmount_core::cache::{CacheOptions, DiskBudget, SharedCap};
-use pdmount_core::config::{RootConfig, RootKind};
+use pdmount_core::config::{RootConfig, RootKind, SignatureMode};
 use pdmount_core::conflicts::system_clock;
 use pdmount_core::device::DeviceIdentity;
 use pdmount_core::engine::marker::{MARKER_WINDOW, MarkerOutcome};
@@ -140,6 +140,8 @@ struct TreeSpec {
     writable: bool,
     /// `pending_marker` of its `[[roots]]` entry (D076, D114).
     pending_marker: bool,
+    /// Its `[[roots]]` entry's mode for unverified signatures (D132).
+    signatures: SignatureMode,
 }
 
 /// An open tree.
@@ -149,6 +151,9 @@ struct OpenTree {
     volume: String,
     own: bool,
     engine: Arc<Engine>,
+    /// A shared single file: it shows in the files folder of a Shared
+    /// mount, not as a folder of its own.
+    file: bool,
 }
 
 /// A mounted root: its trees and FUSE session.
@@ -344,6 +349,8 @@ impl RootMount {
                 role: role.map(str::to_owned),
                 poll_interval_secs: intervals.get(&tree.volume).map(Duration::as_secs),
                 detail: None,
+                signatures_found: tree.engine.signature_counts().0,
+                signatures_refused: tree.engine.signature_counts().1,
             }
         };
         let failed_reply = |(name, error): &(String, String)| control::TreeReply {
@@ -360,6 +367,8 @@ impl RootMount {
             role: None,
             poll_interval_secs: None,
             detail: None,
+            signatures_found: 0,
+            signatures_refused: 0,
         };
         let trees = match &self.state {
             RootState::Mounted(active) => {
@@ -418,6 +427,8 @@ pub struct RootsContext {
     /// `mount -o ro` of the daemon: every mount read-only.
     pub read_only: bool,
     pub home: PathBuf,
+    /// The daemon's conflict notifications (§10.8, M6.2).
+    pub conflicts: crate::conflict_notify::Announcer,
 }
 
 /// The further mounts of a daemon.
@@ -682,8 +693,15 @@ impl Roots {
                     active
                 }
                 Ok(active) => {
+                    // One tree is mounted at the mountpoint itself, several
+                    // each in a folder of the top level.
+                    let alone = active.trees.len() == 1;
                     for tree in &active.trees {
-                        announce_tree(&tree.name, &tree.engine);
+                        let place = match alone {
+                            true => crate::conflict_notify::Place::alone(&tree.name, &mountpoint),
+                            false => crate::conflict_notify::Place::folder(&tree.name, &mountpoint),
+                        };
+                        announce_tree(self, &tree.name, place, &tree.engine);
                         tree.engine.start_background_polled();
                         self.pollers
                             .add(&tree.volume, tree.own, Arc::clone(&tree.engine));
@@ -783,6 +801,7 @@ impl Roots {
                         own: tree.volume == MAIN_VOLUME,
                         writable: tree.writable,
                         pending_marker: config.pending_marker,
+                        signatures: config.signature_mode(tree.volume == MAIN_VOLUME),
                     })
                     .collect())
             }
@@ -806,11 +825,19 @@ impl Roots {
             .with_context(|| format!("cannot create {}", mountpoint.display()))?;
         if config.kind == RootKind::Shared {
             return self
-                .open_shared(mountpoint, read_only, session, config.pending_marker)
+                .open_shared(
+                    mountpoint,
+                    read_only,
+                    session,
+                    config.pending_marker,
+                    config.signature_mode(false),
+                )
                 .await;
         }
         if config.kind == RootKind::Photos {
-            return self.open_photos(mountpoint, session).await;
+            return self
+                .open_photos(mountpoint, session, config.signature_mode(true))
+                .await;
         }
         let mut opened = Vec::new();
         let mut failed = Vec::new();
@@ -851,6 +878,7 @@ impl Roots {
                 volume: spec.volume,
                 own: spec.own,
                 engine,
+                file: false,
             });
         }
         let target = mountpoint.to_owned();
@@ -881,6 +909,7 @@ impl Roots {
         read_only: bool,
         session: Session,
         pending_marker: bool,
+        signatures: SignatureMode,
     ) -> anyhow::Result<Box<Active>> {
         let target = mountpoint.to_owned();
         let config = self.context.config.clone();
@@ -893,7 +922,16 @@ impl Roots {
         let set = mounted
             .tree_set()
             .context("a Shared mount without its tree set")?;
-        let shared = SharedRoot::start(self, session, set, read_only, pending_marker).await;
+        let shared = SharedRoot::start(
+            self,
+            session,
+            set,
+            mountpoint,
+            read_only,
+            pending_marker,
+            signatures,
+        )
+        .await;
         Ok(Box::new(Active {
             trees: Vec::new(),
             mounted,
@@ -911,6 +949,7 @@ impl Roots {
         self: &Arc<Self>,
         mountpoint: &Path,
         session: Session,
+        signatures: SignatureMode,
     ) -> anyhow::Result<Box<Active>> {
         let api = session.source.photos();
         let volume = api.photos_volume().await?.context(
@@ -923,6 +962,7 @@ impl Roots {
         config.fsync.remote_paths.clear();
         config.sync.pending_marker = false;
         config.roots.clear();
+        config.signatures = signatures;
         let options = PhotosOptions {
             volume: volume.volume.clone(),
             root: volume.root.clone(),
@@ -973,6 +1013,10 @@ impl Roots {
             }
         };
         tree.start();
+        tokio::spawn(crate::signatures::announce(
+            Some("Photos".to_owned()),
+            tree.subscribe_signatures(),
+        ));
         tracing::info!(volume = volume.volume, "the Photos tree is mounted");
         Ok(Box::new(Active {
             trees: Vec::new(),
@@ -1038,6 +1082,7 @@ impl Roots {
         config.fsync.remote_paths.clear();
         config.sync.pending_marker = spec.pending_marker;
         config.roots.clear();
+        config.signatures = spec.signatures;
         let options = EngineOptions {
             state_db: paths.tree_state_db(&key),
             staging_dir: paths.tree_staging_dir(&key),
@@ -1163,7 +1208,10 @@ impl Roots {
         let noun = if count == 1 { "change" } else { "changes" };
         // The name is plain text in the summary; the body may be markup.
         crate::notify::desktop(
-            &format!("PdMount: {count} {noun} to {name} kept"),
+            &format!(
+                "PdMount: {count} {noun} to {} kept",
+                crate::notify::clean_name(name)
+            ),
             "The share is gone, so they cannot be uploaded. `pdmount status` shows where they are.",
         );
         Some((dir, incomplete))
@@ -1350,6 +1398,78 @@ impl Roots {
         self.pollers.stop();
     }
 
+    /// The mounted trees that keep nodes whose signatures do not verify
+    /// (D132), each named as `signatures list` shows its root: the
+    /// mountpoint and, for a tree that is a folder of it, the folder.
+    pub fn signature_trees(&self) -> Vec<(String, crate::signatures::Tree)> {
+        let mounts = self.mounts.lock();
+        let mut trees = Vec::new();
+        for mount in mounts.iter() {
+            let RootState::Mounted(active) = &mount.state else {
+                continue;
+            };
+            let place = mount.mountpoint.display().to_string();
+            for tree in active.all_trees() {
+                trees.push((
+                    format!("{place}/{}", tree.name),
+                    crate::signatures::Tree::Engine(tree.engine),
+                ));
+            }
+            if let Some(photos) = &active.photos {
+                trees.push((place, crate::signatures::Tree::Photos(Arc::clone(photos))));
+            }
+        }
+        trees
+    }
+
+    /// Every tree of the mounted further roots, whole, for `cache wipe`
+    /// without a path (M6.0.10).
+    pub fn cache_trees(&self) -> Vec<CacheTarget> {
+        let mounts = self.mounts.lock();
+        let mut targets = Vec::new();
+        for mount in mounts.iter() {
+            if let RootState::Mounted(active) = &mount.state {
+                targets.extend(cache_targets(active, &mount.mountpoint, &[]).unwrap_or_default());
+            }
+        }
+        targets
+    }
+
+    /// The trees of the further mount that has `path` (absolute) and what
+    /// to wipe in each, for `cache wipe <path>`: the part of the path below
+    /// the mountpoint picks the tree, the rest is the path in it. `Ok(None)`:
+    /// no further mount has the path.
+    pub fn cache_trees_at(&self, path: &Path) -> Result<Option<Vec<CacheTarget>>, String> {
+        let path = std::path::absolute(path).map_err(|error| error.to_string())?;
+        let mounts = self.mounts.lock();
+        for mount in mounts.iter() {
+            let place =
+                std::path::absolute(&mount.mountpoint).map_err(|error| error.to_string())?;
+            let Ok(below) = path.strip_prefix(&place) else {
+                continue;
+            };
+            let RootState::Mounted(active) = &mount.state else {
+                return Err(format!(
+                    "the mount at {} {}",
+                    place.display(),
+                    mount.state.refusal()
+                ));
+            };
+            let mut rel = Vec::new();
+            for part in below.components() {
+                match part {
+                    std::path::Component::Normal(part) => rel.push(
+                        part.to_str()
+                            .ok_or_else(|| format!("{} is not valid UTF-8", path.display()))?,
+                    ),
+                    _ => return Err(format!("{} must not contain `..`", path.display())),
+                }
+            }
+            return cache_targets(active, &place, &rel).map(Some);
+        }
+        Ok(None)
+    }
+
     /// The mounts as `status` shows them; never waits for a command.
     pub fn status(&self) -> Vec<control::RootReply> {
         let waiting = self.session.borrow().is_none();
@@ -1360,6 +1480,93 @@ impl Roots {
             .map(|mount| mount.reply(self.context.read_only, waiting, &intervals))
             .collect()
     }
+}
+
+/// A tree `cache wipe` reaches, and what to wipe in it (M6.0.10).
+pub struct CacheTarget {
+    /// As `signatures list` names the tree's root.
+    pub name: String,
+    pub tree: crate::signatures::Tree,
+    /// The path in the tree; `None`: all of it.
+    pub path: Option<String>,
+}
+
+/// Which trees of a mount lie at `rel`, the path below its mountpoint,
+/// and the path in each: `(index into trees, path)`. In a mount of folder
+/// trees a tree is a folder of the top level; a Shared mount also has the
+/// files folder, with a shared file's tree under its name. A path that
+/// names the top level (or the files folder) is all trees in it.
+fn pick_trees(
+    rel: &[&str],
+    shared: bool,
+    trees: &[(&str, bool)],
+) -> Result<Vec<(usize, Option<String>)>, String> {
+    let whole = |wanted: &dyn Fn(bool) -> bool| -> Vec<(usize, Option<String>)> {
+        trees
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, file))| wanted(*file))
+            .map(|(index, _)| (index, None))
+            .collect()
+    };
+    let Some((first, rest)) = rel.split_first() else {
+        return Ok(whole(&|_| true));
+    };
+    if shared && *first == self::shared::FILES_FOLDER {
+        return match rest.split_first() {
+            None => Ok(whole(&|file| file)),
+            // Below a shared file there is nothing: the file is the tree.
+            Some((name, _)) => trees
+                .iter()
+                .position(|(tree, file)| *file && tree == name)
+                .map(|index| vec![(index, None)])
+                .ok_or_else(|| format!("no shared file named {name}")),
+        };
+    }
+    trees
+        .iter()
+        .position(|(tree, file)| !*file && tree == first)
+        .map(|index| {
+            let path = (!rest.is_empty()).then(|| format!("/{}", rest.join("/")));
+            vec![(index, path)]
+        })
+        .ok_or_else(|| format!("no tree named {first} in this mount"))
+}
+
+/// [`pick_trees`] for a mounted root; a Photos mount is one tree whose
+/// paths are the mount's.
+fn cache_targets(active: &Active, place: &Path, rel: &[&str]) -> Result<Vec<CacheTarget>, String> {
+    if let Some(photos) = &active.photos {
+        let path = (!rel.is_empty()).then(|| format!("/{}", rel.join("/")));
+        return Ok(vec![CacheTarget {
+            name: place.display().to_string(),
+            tree: crate::signatures::Tree::Photos(Arc::clone(photos)),
+            path,
+        }]);
+    }
+    let trees = active.all_trees();
+    let names: Vec<(&str, bool)> = trees
+        .iter()
+        .map(|tree| (tree.name.as_str(), tree.file))
+        .collect();
+    let picked = pick_trees(rel, active.shared.is_some(), &names)
+        .map_err(|error| format!("{}: {error}", place.display()))?;
+    Ok(picked
+        .into_iter()
+        .map(|(index, path)| {
+            let tree = &trees[index];
+            let name = if tree.file {
+                format!("{}/{}/{}", place.display(), shared::FILES_FOLDER, tree.name)
+            } else {
+                format!("{}/{}", place.display(), tree.name)
+            };
+            CacheTarget {
+                name,
+                tree: crate::signatures::Tree::Engine(Arc::clone(&tree.engine)),
+                path,
+            }
+        })
+        .collect())
 }
 
 /// The status line of the Photos tree: its stages (D113).
@@ -1392,6 +1599,8 @@ fn photos_reply(photos: &PhotosTree) -> control::TreeReply {
         incoming: Vec::new(),
         incoming_not_read: 0,
         note: None,
+        signatures_found: photos.signature_counts().0,
+        signatures_refused: photos.signature_counts().1,
     }
 }
 
@@ -1560,38 +1769,23 @@ impl Cleanups {
 
 /// Logs and announces what a further tree's engine reports, naming the
 /// tree: other devices' pending markers (D076; one notification per pass,
-/// D126) and new conflicts (§10.8). The tasks end with the engine.
-fn announce_tree(name: &str, engine: &Engine) {
+/// D126) and new conflicts (§10.8, through the daemon's announcer, which
+/// shows the conflict at `place`). The tasks end with the engine.
+fn announce_tree(
+    roots: &Roots,
+    name: &str,
+    place: crate::conflict_notify::Place,
+    engine: &Arc<Engine>,
+) {
     tokio::spawn(crate::incoming::announce_in(
         Some(name.to_owned()),
         engine.subscribe_incoming(),
     ));
-    let mut notices = engine.subscribe_conflicts();
-    let name = name.to_owned();
-    tokio::spawn(async move {
-        use tokio::sync::broadcast::error::RecvError;
-        loop {
-            match notices.recv().await {
-                Ok(notice) => {
-                    tracing::info!(
-                        tree = name,
-                        id = notice.id,
-                        kind = notice.kind.as_str(),
-                        path = notice.path.as_deref().unwrap_or(""),
-                        "conflict recorded in a further tree"
-                    );
-                    // The tree's name is plain text in the summary; the
-                    // body may be read as markup.
-                    crate::notify::desktop(
-                        &format!("PdMount: conflict in {name}"),
-                        "Both versions are kept; the other one is a conflict copy beside the file.",
-                    );
-                }
-                Err(RecvError::Lagged(_)) => {}
-                Err(RecvError::Closed) => return,
-            }
-        }
-    });
+    tokio::spawn(crate::signatures::announce(
+        Some(name.to_owned()),
+        engine.subscribe_signatures(),
+    ));
+    roots.context.conflicts.follow(Some(name), place, engine);
 }
 
 /// `pdmount unmount [--force] <mountpoint>` of a further root: through the
@@ -1710,6 +1904,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_path_in_a_mount_picks_its_trees() {
+        // Two folder shares, one shared file, in a Shared mount.
+        let trees = [("Docs", false), ("Team", false), ("plan.txt", true)];
+        let pick = |rel: &[&str]| pick_trees(rel, true, &trees);
+        let some = |path: &str| Some(path.to_owned());
+        // The top level: every tree. The files folder: the files.
+        assert_eq!(
+            pick(&[]).unwrap(),
+            [(0, None), (1, None), (2, None)],
+            "the mountpoint"
+        );
+        assert_eq!(pick(&["Shared files"]).unwrap(), [(2, None)]);
+        assert_eq!(pick(&["Shared files", "plan.txt"]).unwrap(), [(2, None)]);
+        // A share: all of it, or a path in it.
+        assert_eq!(pick(&["Team"]).unwrap(), [(1, None)]);
+        assert_eq!(
+            pick(&["Team", "a", "b.txt"]).unwrap(),
+            [(1, some("/a/b.txt"))]
+        );
+        // What is not there.
+        assert!(pick(&["Nope"]).unwrap_err().contains("no tree named Nope"));
+        assert!(
+            pick(&["Shared files", "Team"])
+                .unwrap_err()
+                .contains("no shared file named Team")
+        );
+        assert!(pick(&["plan.txt"]).is_err(), "a file tree is no folder");
+        // Without a files folder, its name is an ordinary tree name.
+        assert!(pick_trees(&["Shared files"], false, &trees).is_err());
+        assert_eq!(
+            pick_trees(&["Docs", "x"], false, &trees).unwrap(),
+            [(0, some("/x"))]
+        );
+    }
+
+    #[test]
     fn root_mountpoints_may_not_overlap() {
         let home = Path::new("/home/u");
         let mut config = Config::default();
@@ -1719,6 +1949,7 @@ mod tests {
             read_only: false,
             pending_marker: false,
             tree: Vec::new(),
+            signatures: None,
         };
         config.roots = vec![root("~/ProtonDrive-Test")];
         let my_files = Path::new("/home/u/ProtonDrive");
@@ -1744,6 +1975,7 @@ mod tests {
                 read_only,
                 pending_marker: false,
                 tree: Vec::new(),
+                signatures: None,
             },
             PathBuf::from("/m/test"),
         )

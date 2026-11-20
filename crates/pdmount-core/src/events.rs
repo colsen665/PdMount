@@ -141,7 +141,7 @@ impl Engine {
     /// to the store after the rows a page changed, so a crash never stores
     /// it without them. While a refresh runs it is not stored at all.
     pub async fn sync_events(self: &Arc<Self>) -> Result<()> {
-        crate::poller::sync_trees(std::slice::from_ref(self)).await
+        crate::poller::sync_trees(MY_FILES_VOLUME, std::slice::from_ref(self)).await
     }
 
     /// The pass of [`Self::sync_events`] is done: the stream was read to its

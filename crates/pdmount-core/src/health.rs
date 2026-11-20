@@ -198,6 +198,11 @@ impl Backend for Monitored {
         self.seen(self.inner.list_children(folder).await)
     }
 
+    async fn list_children_checked(&self, folder: &LinkId) -> Result<pdmount_backend::Listing> {
+        self.allowed()?;
+        self.seen(self.inner.list_children_checked(folder).await)
+    }
+
     async fn get_nodes(&self, ids: &[LinkId]) -> Result<Vec<Option<RemoteNode>>> {
         self.allowed()?;
         self.seen(self.inner.get_nodes(ids).await)

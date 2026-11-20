@@ -45,7 +45,7 @@ pub(crate) use process::{daemon_pid, fusermount, refuse_while_running};
 use process::{stop_limit, wait_for_daemon_exit};
 pub use reset::reset;
 pub use run::run_foreground;
-use stop::{StopSignals, announce_conflicts, hurry_on_signal, shutdown, wait_for_stop};
+use stop::{StopSignals, hurry_on_signal, shutdown, wait_for_stop};
 
 use crate::auth::Auth;
 use crate::control::{self, Request};

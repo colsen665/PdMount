@@ -1,0 +1,5 @@
+#!/bin/sh
+# xdg-open for the scenarios (x6, M6.2): logs its argument and the session bus
+# it was given to $PDMOUNT_TEST_XDG_OPEN_LOG instead of opening anything.
+[ -n "$PDMOUNT_TEST_XDG_OPEN_LOG" ] || exit 1
+printf '%s %s\n' "$1" "$DBUS_SESSION_BUS_ADDRESS" >>"$PDMOUNT_TEST_XDG_OPEN_LOG"

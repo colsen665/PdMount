@@ -5,3 +5,12 @@
   with:
     go-version: "1.25.x"
     cache: false
+# The release build uses the toolchain ci.yml pins (its RUST_TOOLCHAIN; ci.yml checks the two agree), not the runner
+# image's stable (M6.0.3 V-7).
+- name: Install the pinned Rust toolchain
+  run: |
+    rustup toolchain install 1.98.1 --profile minimal
+    rustup default 1.98.1
+# dist's cargo build passes no --locked; this fails the build when Cargo.lock does not match Cargo.toml (M6.0.3 V-7).
+- name: Check that Cargo.lock is current
+  run: cargo metadata --locked --format-version 1 >/dev/null

@@ -374,6 +374,7 @@ impl Engine {
         if rows.is_empty() {
             return;
         }
+        self.observe_signatures(&rows);
         self.store.write(move |conn| write_rows(conn, &rows));
     }
 }

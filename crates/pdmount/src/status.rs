@@ -68,6 +68,9 @@ pub enum MountState {
         read_only: bool,
         /// Conflicts waiting for the user.
         conflicts: u64,
+        /// My Files' nodes whose signatures do not verify, and the refused
+        /// ones (D132).
+        signatures: (u64, u64),
         inodes: u64,
         cache_bytes: u64,
         cache_blocks: u64,
@@ -156,6 +159,11 @@ pub(crate) fn root_lines(roots: &[control::RootReply]) -> Vec<String> {
             lines.push(line);
             if let Some(note) = &tree.note {
                 lines.push(format!("    {note}"));
+            }
+            if let Some(line) =
+                crate::signatures::status_line(tree.signatures_found, tree.signatures_refused)
+            {
+                lines.push(format!("    Signatures: {line}"));
             }
             for line in crate::incoming::status_lines(
                 &tree.incoming,
@@ -325,6 +333,7 @@ impl StatusReport {
                 events_refreshing,
                 read_only,
                 conflicts,
+                signatures,
                 inodes,
                 cache_bytes,
                 cache_blocks,
@@ -373,6 +382,9 @@ impl StatusReport {
                 }
                 if *conflicts > 0 {
                     writeln!(f, "Conflicts:  {conflicts} open (pdmount conflicts list)")?;
+                }
+                if let Some(line) = crate::signatures::status_line(signatures.0, signatures.1) {
+                    writeln!(f, "Signatures: {line}")?;
                 }
                 if let Some(desktop_bus) = desktop_bus {
                     writeln!(f, "Bus:        {desktop_bus}")?;
@@ -463,6 +475,7 @@ pub async fn status(
                 events_refreshing: reply.events_refreshing,
                 read_only: reply.read_only,
                 conflicts: reply.conflicts,
+                signatures: (reply.signatures_found, reply.signatures_refused),
                 inodes: reply.inodes,
                 cache_bytes: reply.cache_bytes,
                 cache_blocks: reply.cache_blocks,
@@ -715,6 +728,7 @@ mod tests {
                 events_refreshing: true,
                 read_only: true,
                 conflicts: 0,
+                signatures: (0, 0),
                 inodes: 1,
                 cache_bytes: 0,
                 cache_blocks: 0,
@@ -764,6 +778,7 @@ mod tests {
                 events_refreshing: false,
                 read_only: false,
                 conflicts: 0,
+                signatures: (0, 0),
                 inodes: 1,
                 cache_bytes: 0,
                 cache_blocks: 0,
@@ -854,6 +869,7 @@ mod tests {
                 events_refreshing: false,
                 read_only: false,
                 conflicts: 0,
+                signatures: (0, 0),
                 inodes: 7,
                 cache_bytes: 1 << 20,
                 cache_blocks: 3,
@@ -881,6 +897,7 @@ mod tests {
                 events_refreshing: false,
                 read_only: false,
                 conflicts: 3,
+                signatures: (2, 1),
                 inodes: 7,
                 cache_bytes: 0,
                 cache_blocks: 0,
@@ -895,6 +912,10 @@ mod tests {
             },
         );
         assert!(conflicted.contains("Conflicts:  3 open (pdmount conflicts list)"));
+        assert!(
+            conflicted.contains("Signatures: 2 unverified, 1 refused (pdmount signatures list)")
+        );
+        assert!(!mounted.contains("Signatures:"));
         assert!(mounted.contains("Cache:      1.0 MiB in 3 blocks"));
         assert!(!mounted.contains("Cache cap:"));
     }
@@ -929,6 +950,8 @@ mod tests {
                 incoming: Vec::new(),
                 incoming_not_read: 0,
                 note: None,
+                signatures_found: 0,
+                signatures_refused: 0,
             }],
         }]);
         assert_eq!(
@@ -954,6 +977,8 @@ mod tests {
                 incoming: Vec::new(),
                 incoming_not_read: 0,
                 note: None,
+                signatures_found: 0,
+                signatures_refused: 0,
             }],
         }]);
         assert_eq!(
@@ -985,6 +1010,8 @@ mod tests {
                 }],
                 incoming_not_read: 7,
                 note: Some("the server refused a change".into()),
+                signatures_found: 0,
+                signatures_refused: 0,
                 detail: None,
             }],
         }]);
@@ -1021,6 +1048,8 @@ mod tests {
             incoming: Vec::new(),
             incoming_not_read: 0,
             note: None,
+            signatures_found: 0,
+            signatures_refused: 0,
         };
         let lines = root_lines(&[control::RootReply {
             mountpoint: "/s".into(),
@@ -1143,6 +1172,7 @@ mod tests {
                     events_refreshing: false,
                     read_only: false,
                     conflicts: 0,
+                    signatures: (0, 0),
                     inodes: 1,
                     cache_bytes: 0,
                     cache_blocks: 0,

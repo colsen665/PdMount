@@ -3,11 +3,12 @@
 use super::*;
 
 impl Engine {
-    /// After a read of remote content: counts its bytes on the handle and,
-    /// unless it was a scan read (D111), takes the blocks it used out of the
-    /// scan blocks and runs sequential readahead (§5.3): after two adjacent
-    /// reads, fetch the next blocks (2, then 4 once the run continues) in
-    /// the background. Scan reads get no readahead.
+    /// For a read of remote content: counts its bytes on the handle and,
+    /// unless it is a scan read (D111), takes the blocks it uses out of the
+    /// scan blocks and runs sequential readahead (§5.3, D135): once the
+    /// handle's reads in order cross into the next block, fetch the next
+    /// blocks (2, then 4 once a second block is crossed) in the background.
+    /// Scan reads get no readahead.
     pub(super) fn readahead(
         self: &Arc<Self>,
         handle: u64,
@@ -17,49 +18,29 @@ impl Engine {
         offset: u64,
         len: u64,
     ) {
-        let (run, scan) = {
+        let (ahead, scan) = {
             let mut files = self.files.lock();
             let Some(open) = files.get_mut(&handle) else {
                 return;
             };
             let scan = self.is_scan_read(open);
             open.read_bytes = open.read_bytes.saturating_add(len);
-            open.sequential_reads = if offset == open.last_end && offset > 0 {
-                open.sequential_reads + 1
-            } else {
-                0
-            };
-            open.last_end = offset + len;
-            (open.sequential_reads, scan)
+            (open.sequential.record(layout, offset, len), scan)
         };
         if scan {
             return;
         }
         self.scan_used(link, rev, layout, offset, len);
-        if run == 0 {
-            return;
-        }
-        let ahead = if run < 4 { 2 } else { 4 };
-        let Some(last) = layout.spans(offset, len).last().map(|span| span.index) else {
-            return;
-        };
-        let mut index = last;
-        for _ in 0..ahead {
-            let Some(next) = layout.next_after(index) else {
-                break;
-            };
-            index = next.index;
-            let key = BlockKey::new(link, rev, next.index);
-            if self.cache.contains(&key) {
-                continue;
-            }
-            let cache = Arc::clone(&self.cache);
-            let len = next.len;
-            self.runtime.spawn(async move {
-                if let Err(error) = cache.get(&key, len, Priority::Readahead).await {
-                    tracing::debug!(%error, "readahead failed");
-                }
-            });
+        if ahead > 0 {
+            crate::readahead::fetch_ahead(
+                &self.cache,
+                &self.runtime,
+                link,
+                rev,
+                layout,
+                (offset, len),
+                ahead,
+            );
         }
     }
 

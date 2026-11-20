@@ -180,6 +180,14 @@ impl Engine {
             .ok_or_else(|| refused(format!("{target} has no unresolved conflict")))
     }
 
+    /// One conflict by id, with the current paths of both copies, as
+    /// `conflicts show` reports it; `None` for an unknown id. For the
+    /// desktop notification of a new conflict (M6.2).
+    pub fn conflict_view(&self, id: i64) -> Option<ConflictView> {
+        let conflict = self.conflicts.lock().get(id).cloned()?;
+        Some(self.view(conflict))
+    }
+
     pub async fn conflict_show(self: &Arc<Self>, target: &str) -> Result<ConflictView> {
         let conflict = self.find_conflict(target).await?;
         Ok(self.view(conflict))

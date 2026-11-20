@@ -67,7 +67,10 @@ impl Engine {
         check_not_hot(&self.metrics, "list_children");
         Metrics::inc(&self.metrics.listings);
         let fetched_at = self.remote_clock.load(Ordering::SeqCst);
-        let children = self.backend.list_children(&link).await?;
+        // Children that do not decrypt are named apart, so that they are
+        // not taken for gone (D132).
+        let pdmount_backend::Listing { children, degraded } =
+            self.backend.list_children_checked(&link).await?;
         let mut inos = Vec::new();
         loop {
             let unknown = self.tree.read().unknown_count(&children);
@@ -77,7 +80,7 @@ impl Engine {
             let applied = self
                 .tree
                 .write()
-                .apply_listing_at(dir, &children, &mut inos, fetched_at);
+                .apply_listing_at(dir, &children, &degraded, &mut inos, fetched_at);
             match applied {
                 Ok(changes) => {
                     let vanished = self.apply_changes(changes);

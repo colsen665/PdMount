@@ -8,19 +8,20 @@
 //! variants, so the server refuses a rename that raced another device's;
 //! without one they send no precondition.
 
+use crate::block_lists::{BLOCK_PAGE_SIZE, BlockLists, Listed, Page, PageSource};
 use crate::photos::{
     MAX_THUMBNAIL_BYTES, Photos, PhotosVolume, RelatedPhoto, ThumbnailRef, TimelineItem,
 };
 use crate::shared::{CorePage, DegradedShare, ShareRole, SharedEntry, SharedListing, SharedWithMe};
 use crate::{
     AccountInfo, Backend, BackendError, BlockInfo, EventId, EventKind, EventPage, FileMeta, LinkId,
-    NameHash, NodeKind, NodeLookup, RemoteEvent, RemoteNode, Result, RevisionId, StorageInfo,
-    UploadSource,
+    Listing, NameHash, NodeKind, NodeLookup, RemoteEvent, RemoteNode, Result, RevisionId,
+    SignaturePart, StorageInfo, Unverified, UploadSource,
 };
 use bytes::Bytes;
 use parking_lot::Mutex;
 use proton_drive_sdk::account::{AccountClient, AccountClientAdapter};
-use proton_drive_sdk::api::share::ShareTargetType;
+use proton_drive_sdk::api::revision::RevisionDto;
 use proton_drive_sdk::client::{ProtonDriveClient, ProtonDriveDefaults};
 use proton_drive_sdk::error::{ApiError, HttpTransferError, TooManyRequestsException};
 use proton_drive_sdk::http::retry::DriveApiRetryMiddleware;
@@ -29,10 +30,10 @@ use proton_drive_sdk::node::download::{
 };
 use proton_drive_sdk::node::draft::{NodeWithSameNameExistsError, RevisionDraftConflictError};
 use proton_drive_sdk::node::file::FileOperations;
-use proton_drive_sdk::node::file::block_map::{BlockMap, verify_block_listing};
-use proton_drive_sdk::node::revision::{RevisionOperations, RevisionUid};
+use proton_drive_sdk::node::file::block_map::verify_block_listing;
+use proton_drive_sdk::node::revision::RevisionUid;
 use proton_drive_sdk::node::thumbnail::ThumbnailType;
-use proton_drive_sdk::node::{Node, NodeMemberRole, NodeUid};
+use proton_drive_sdk::node::{DegradedNode, Node, NodeMemberRole, NodeUid};
 use proton_drive_sdk::photo::ProtonPhotosClient;
 use proton_drive_sdk::proton_sdk_rs2::auth::{TokenCredential, TokenRefreshError};
 use proton_drive_sdk::proton_sdk_rs2::client::ProtonApiDefaults;
@@ -43,21 +44,23 @@ use proton_drive_sdk::utils::PotentialObject;
 use proton_drive_sdk::volume::VolumeId;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 /// Key of the additional revision metadata holding POSIX permission bits,
 /// written as an octal string such as `"644"`.
 const MODE_METADATA_KEY: &str = "pdmount.mode";
 
-/// Block URLs expire; maps older than this are fetched again.
-const BLOCK_MAP_TTL: Duration = Duration::from_secs(600);
-/// Memoized block maps kept before idle ones are dropped.
-const BLOCK_MAP_LIMIT: usize = 256;
+/// A listed block's storage target, with the key that decrypts it.
+#[derive(Clone)]
+struct BlockTarget {
+    bare_url: String,
+    token: String,
+    content_key: proton_drive_sdk::pgp::PgpSessionKey,
+}
 
-type BlockMapKey = (LinkId, RevisionId);
-/// One slot per revision. Its async lock makes concurrent misses wait for a
-/// single fetch: a large file's map takes one API call per 10 blocks.
-type BlockMapSlot = Arc<tokio::sync::Mutex<Option<(Instant, Arc<BlockMap>)>>>;
+/// The revisions' block lists, read by range (D135): a page of the block a
+/// read needs, the rest for the manifest.
+type ProtonBlockLists = BlockLists<BlockTarget, RevisionDto>;
 
 /// The authenticated connection, replaced as a whole by a new login (M3.16).
 #[derive(Clone)]
@@ -66,6 +69,9 @@ struct Live {
     credential: TokenCredential,
     /// The Photos clients of the session ([`ProtonBackend::set_photos`]).
     photos: Option<PhotosClients>,
+    /// The shared-with-me reader ([`ProtonBackend::set_shared_api`]); it
+    /// holds no tokens, so a new login keeps it.
+    shared: Option<SharedApi>,
 }
 
 /// The clients a Photos mount needs (M5.13, D113): the SDK's Photos client,
@@ -102,20 +108,9 @@ impl PhotosClients {
     ) -> anyhow::Result<Self> {
         let client = ProtonPhotosClient::new(session, uid)?;
         let drive = limits(client.drive().clone());
-        // As `ProtonPhotosClient::new` builds its own.
-        let http = session.get_http_client(
-            Some(ProtonDriveDefaults::DRIVE_BASE_ROUTE.to_owned()),
-            Some(Duration::from_secs(u64::from(
-                ProtonApiDefaults::DEFAULT_TIMEOUT_SECONDS,
-            ))),
-            None,
-        )?;
-        let base = reqwest::Url::parse(&session.client_config.base_url.to_string())?
-            .join(ProtonDriveDefaults::DRIVE_BASE_ROUTE)?;
+        let (http, base) = drive_http(session)?;
         let timeline = TimelineClient {
-            http: reqwest_middleware::ClientBuilder::new(http)
-                .with(DriveApiRetryMiddleware::default())
-                .build(),
+            http,
             base,
             credential: session.token_credential.clone(),
         };
@@ -134,6 +129,168 @@ impl PhotosClients {
     pub fn drive(&self) -> &ProtonDriveClient {
         &self.drive
     }
+}
+
+/// The drive API's HTTP client and base URL for PdMount's own readers
+/// ([`TimelineClient`], [`SharedApi`]), as `ProtonPhotosClient::new` builds
+/// its own: the session's headers and timeout, the SDK's retry middleware.
+/// Neither depends on the session's tokens, which each request adds.
+fn drive_http(
+    session: &ProtonAPISession,
+) -> anyhow::Result<(reqwest_middleware::ClientWithMiddleware, reqwest::Url)> {
+    let http = session.get_http_client(
+        Some(ProtonDriveDefaults::DRIVE_BASE_ROUTE.to_owned()),
+        Some(Duration::from_secs(u64::from(
+            ProtonApiDefaults::DEFAULT_TIMEOUT_SECONDS,
+        ))),
+        None,
+    )?;
+    let base = reqwest::Url::parse(&session.client_config.base_url.to_string())?
+        .join(ProtonDriveDefaults::DRIVE_BASE_ROUTE)?;
+    let http = reqwest_middleware::ClientBuilder::new(http)
+        .with(DriveApiRetryMiddleware::default())
+        .build();
+    Ok((http, base))
+}
+
+/// PdMount's client of the shared-with-me listing (`v2/sharedwithme`, F1),
+/// read into its own types ([`SharedPageDto`]) as the timeline is (D119):
+/// the SDK takes `ShareTargetType` as a closed enum, so one link of a type
+/// it does not know failed the whole page, and a Shared mount stayed empty.
+/// The official clients skip such a link
+/// (`cs/client/js/src/internal/sharing/apiService.ts:191-194`).
+#[derive(Clone)]
+pub struct SharedApi {
+    http: reqwest_middleware::ClientWithMiddleware,
+    base: reqwest::Url,
+}
+
+impl SharedApi {
+    /// The client for `session`'s API; any later session's tokens work
+    /// with it ([`ProtonBackend::set_shared_api`]).
+    pub fn new(session: &ProtonAPISession) -> anyhow::Result<Self> {
+        let (http, base) = drive_http(session)?;
+        Ok(Self { http, base })
+    }
+
+    /// One page: the first with `anchor` `None`, else the page after it.
+    async fn page(
+        &self,
+        credential: &TokenCredential,
+        anchor: Option<&str>,
+    ) -> anyhow::Result<SharedPageDto> {
+        let mut url = self.base.join("v2/sharedwithme")?;
+        if let Some(anchor) = anchor {
+            url.query_pairs_mut().append_pair("AnchorID", anchor);
+        }
+        let (access, _) = credential.get_tokens().await?;
+        let response = self
+            .http
+            .get(url)
+            .header("Authorization", format!("Bearer {access}"))
+            .header("x-pm-uid", credential.session_id().raw())
+            .send()
+            .await?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.text().await?;
+        parse_api_page(
+            "shared-with-me",
+            status,
+            &headers,
+            &body,
+            |page: &SharedPageDto| page.code,
+        )
+    }
+}
+
+/// A shared-with-me page as the server sends it. `Links` has no default:
+/// an error object with a 2xx status must not read as an empty listing,
+/// which would close every share.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct SharedPageDto {
+    #[serde(default)]
+    code: Option<u64>,
+    links: Vec<SharedLinkDto>,
+    #[serde(default, rename = "AnchorID")]
+    anchor_id: Option<String>,
+    #[serde(default)]
+    more: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SharedLinkDto {
+    #[serde(rename = "VolumeID")]
+    volume_id: String,
+    #[serde(rename = "ShareID")]
+    share_id: String,
+    #[serde(rename = "LinkID")]
+    link_id: String,
+    /// A number, also one PdMount does not know.
+    #[serde(default, rename = "ShareTargetType")]
+    target_type: serde_json::Value,
+}
+
+/// Share target types already warned about, once per type and process.
+static UNKNOWN_SHARE_TYPES: SeenNodes = SeenNodes::new();
+
+impl SharedLinkDto {
+    /// Share, volume, root and kind of a link PdMount mounts: a folder (1)
+    /// or a file (2). Root (0), album (3), photo (4) and Proton documents
+    /// (5) are left out quietly, as before; a type the official clients do
+    /// not know either is left out with a warning, once per type.
+    fn entry(self) -> Option<(String, String, String, NodeKind)> {
+        let kind = match self.target_type.as_u64() {
+            Some(1) => NodeKind::Folder,
+            Some(2) => NodeKind::File,
+            Some(0 | 3..=5) => return None,
+            _ => {
+                let raw = self.target_type.to_string();
+                let first = {
+                    let mut seen = UNKNOWN_SHARE_TYPES.0.get_or_init(Default::default).lock();
+                    if seen.len() >= SeenNodes::MAX {
+                        seen.clear();
+                    }
+                    seen.insert(raw.clone())
+                };
+                if first {
+                    tracing::warn!(
+                        share_type = %raw,
+                        link = %self.link_id,
+                        "a shared item of a type PdMount does not know is left out"
+                    );
+                }
+                return None;
+            }
+        };
+        Some((self.share_id, self.volume_id, self.link_id, kind))
+    }
+}
+
+/// The links of the shared-with-me listing PdMount mounts, page by page as
+/// the official clients read it (`More` and `AnchorID`), at most
+/// [`MAX_SHARED_PAGES`]; one refresh of a rejected token per page.
+async fn shared_links(
+    api: &SharedApi,
+    credential: &TokenCredential,
+) -> Result<Vec<(String, String, String, NodeKind)>> {
+    let mut links = Vec::new();
+    let mut anchor: Option<String> = None;
+    for _ in 0..MAX_SHARED_PAGES {
+        let page = with_reauth(credential, || async {
+            api.page(credential, anchor.as_deref())
+                .await
+                .map_err(map_error)
+        })
+        .await?;
+        links.extend(page.links.into_iter().filter_map(SharedLinkDto::entry));
+        match page.anchor_id {
+            Some(next) if page.more && !next.is_empty() => anchor = Some(next),
+            _ => break,
+        }
+    }
+    Ok(links)
 }
 
 /// PdMount's client of the timeline endpoint (`volumes/<id>/photos`), sent
@@ -253,6 +410,22 @@ fn parse_timeline(
     headers: &reqwest::header::HeaderMap,
     body: &str,
 ) -> anyhow::Result<TimelineDto> {
+    parse_api_page("timeline", status, headers, body, |page: &TimelineDto| {
+        page.code
+    })
+}
+
+/// A page of PdMount's own readers: a non-2xx status or a `Code` other than
+/// 1000 (`code` reads it from the page) is the API's error, classified as
+/// any SDK error ([`map_error`]); a body that does not parse is an error
+/// with its start, `what` naming the endpoint.
+fn parse_api_page<T: serde::de::DeserializeOwned>(
+    what: &str,
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    body: &str,
+    code: impl Fn(&T) -> Option<u64>,
+) -> anyhow::Result<T> {
     if !status.is_success() {
         return Err(ApiError::from_http(status, headers, body).into());
     }
@@ -261,20 +434,15 @@ fn parse_timeline(
             .filter(|api| api.code != Some(1000))
             .map(anyhow::Error::from)
     };
-    match serde_json::from_str::<TimelineDto>(body) {
-        Ok(page) if page.code.is_none_or(|code| code == 1000) => Ok(page),
-        Ok(_) => {
-            Err(refused().unwrap_or_else(|| anyhow::anyhow!("the timeline answered an error")))
-        }
+    match serde_json::from_str::<T>(body) {
+        Ok(page) if code(&page).is_none_or(|code| code == 1000) => Ok(page),
+        Ok(_) => Err(refused().unwrap_or_else(|| anyhow::anyhow!("the {what} answered an error"))),
         Err(error) => Err(refused().unwrap_or_else(|| {
             let cut = body
                 .char_indices()
                 .nth(512)
                 .map_or(body.len(), |(at, _)| at);
-            anyhow::anyhow!(
-                "timeline: JSON parse error: {error}. Body: {}",
-                &body[..cut]
-            )
+            anyhow::anyhow!("{what}: JSON parse error: {error}. Body: {}", &body[..cut])
         })),
     }
 }
@@ -292,7 +460,7 @@ pub struct ProtonBackend {
     /// A tree of the Photos volume ([`ProtonBackend::photos_tree`]): its
     /// calls go through the Photos clients' drive client.
     photos_tree: bool,
-    block_maps: Mutex<HashMap<BlockMapKey, BlockMapSlot>>,
+    block_lists: ProtonBlockLists,
     /// Creator and creation time by share id: they never change, so the
     /// shared-with-me listing asks for each share once (M5.12).
     share_info: Mutex<HashMap<String, ShareInfo>>,
@@ -370,9 +538,10 @@ impl ProtonBackend {
                 client,
                 credential,
                 photos: None,
+                shared: None,
             })),
             username,
-            block_maps: Mutex::new(HashMap::new()),
+            block_lists: ProtonBlockLists::default(),
             share_info: Mutex::new(HashMap::new()),
         })
     }
@@ -392,13 +561,14 @@ impl ProtonBackend {
                 client,
                 credential,
                 photos: None,
+                shared: None,
             })),
             username,
             volume: VolumeId::new(volume.into()),
             root,
             my_files: true,
             photos_tree: false,
-            block_maps: Mutex::new(HashMap::new()),
+            block_lists: ProtonBlockLists::default(),
             share_info: Mutex::new(HashMap::new()),
         }
     }
@@ -415,7 +585,7 @@ impl ProtonBackend {
             root,
             my_files: false,
             photos_tree: false,
-            block_maps: Mutex::new(HashMap::new()),
+            block_lists: ProtonBlockLists::default(),
             share_info: Mutex::new(HashMap::new()),
         }
     }
@@ -441,11 +611,25 @@ impl ProtonBackend {
         credential: TokenCredential,
         photos: Option<PhotosClients>,
     ) {
-        *self.live.write() = Live {
+        let mut live = self.live.write();
+        *live = Live {
             client,
             credential,
             photos,
+            shared: live.shared.take(),
         };
+    }
+
+    /// The shared-with-me reader for `session`'s API (F1); a Shared mount's
+    /// listing fails without it (logged).
+    pub fn set_shared_api(&self, session: &ProtonAPISession) {
+        match SharedApi::new(session) {
+            Ok(api) => self.live.write().shared = Some(api),
+            Err(error) => tracing::warn!(
+                error = %format!("{error:#}"),
+                "cannot make the shared-with-me client"
+            ),
+        }
     }
 
     /// The session's Photos clients (M5.13), for a Photos mount.
@@ -533,31 +717,105 @@ impl ProtonBackend {
         )
     }
 
-    async fn block_map(&self, file: &LinkId, revision: &RevisionId) -> Result<Arc<BlockMap>> {
-        let slot = {
-            let mut maps = self.block_maps.lock();
-            if maps.len() >= BLOCK_MAP_LIMIT {
-                // Drop slots nobody is using; their maps are refetched on demand.
-                maps.retain(|_, slot| Arc::strong_count(slot) > 1);
-            }
-            Arc::clone(maps.entry((file.clone(), revision.clone())).or_default())
-        };
-        let mut cached = slot.lock().await;
-        if let Some((fetched, map)) = cached.as_ref()
-            && fetched.elapsed() < BLOCK_MAP_TTL
-        {
-            return Ok(Arc::clone(map));
+    /// The block pages of one revision, through the session's client.
+    fn pages(&self, file: &LinkId, revision: &RevisionId) -> ProtonPages<'_> {
+        ProtonPages {
+            backend: self,
+            uid: self.revision_uid(file, revision),
         }
-        let uid = self.revision_uid(file, revision);
-        let map = Arc::new(
-            self.authed(|client| {
+    }
+
+    /// The claimed plaintext block sizes of `revision` from its node, when
+    /// it is the node's active revision and declares them (fork P4): the
+    /// layout without a block listing. The node usually comes from the
+    /// SDK's cache.
+    async fn node_block_sizes(
+        &self,
+        file: &LinkId,
+        revision: &RevisionId,
+    ) -> Result<Option<Vec<u32>>> {
+        let uid = self.node_uid(file);
+        let node = self
+            .authed(|client| {
                 let uid = uid.clone();
-                async move { client.get_block_map(uid).await.map_err(map_error) }
+                async move { client.get_node(uid).await.map_err(map_error) }
             })
-            .await?,
-        );
-        *cached = Some((Instant::now(), Arc::clone(&map)));
-        Ok(map)
+            .await?;
+        let PotentialObject::Node(Node::File(file) | Node::Photo(file)) = node else {
+            return Ok(None);
+        };
+        let active = file.active_revision;
+        if active.uid.revision_id.raw() != revision.as_str() {
+            return Ok(None);
+        }
+        Ok(active
+            .claimed_block_sizes
+            .filter(|sizes| !sizes.is_empty())
+            .and_then(|sizes| sizes.iter().map(|&size| u32::try_from(size).ok()).collect()))
+    }
+}
+
+/// [`PageSource`] of one revision on the Proton API (fork P30).
+struct ProtonPages<'a> {
+    backend: &'a ProtonBackend,
+    uid: RevisionUid,
+}
+
+#[async_trait::async_trait]
+impl PageSource for ProtonPages<'_> {
+    type Target = BlockTarget;
+    type Meta = RevisionDto;
+
+    async fn page(&self, from: u32, size: u32) -> Result<Page<BlockTarget, RevisionDto>> {
+        let from = i32::try_from(from).map_err(|_| BackendError::NotFound)?;
+        let size = i32::try_from(size).unwrap_or(i32::MAX);
+        let (listing, content_key) = self
+            .backend
+            .authed(|client| {
+                let uid = self.uid.clone();
+                async move {
+                    let listing = client
+                        .get_block_page(&uid, from, size)
+                        .await
+                        .map_err(map_error)?;
+                    let secrets = FileOperations::get_secrets(&client, uid.node_uid.clone())
+                        .await
+                        .map_err(map_error)?;
+                    Ok((listing, secrets.content_key))
+                }
+            })
+            .await?;
+        let blocks = listing
+            .blocks
+            .into_iter()
+            .map(|block| Listed {
+                index: block.index.max(0) as u32,
+                hash: block.hash_digest,
+                target: BlockTarget {
+                    bare_url: block.bare_url,
+                    token: block.token,
+                    content_key: content_key.clone(),
+                },
+            })
+            .collect();
+        Ok(Page {
+            blocks,
+            meta: listing.revision,
+        })
+    }
+
+    async fn verify(&self, meta: &RevisionDto, hashes: &[&[u8]]) -> Result<()> {
+        self.backend
+            .authed(|client| {
+                let uid = self.uid.clone();
+                async move {
+                    client
+                        .verify_listed_block_hashes(&uid, meta, hashes)
+                        .await
+                        .map_err(map_error)
+                }
+            })
+            .await
     }
 }
 
@@ -582,6 +840,47 @@ fn file_size(claimed_size: Option<i64>, block_sizes: Option<&[i32]>) -> Option<u
     Some(sum)
 }
 
+/// The size of a file whose revision claims neither a size nor block
+/// sizes (fork P4 leaves it unknown since M6.0.4.11): its encrypted storage
+/// size, an upper bound, logged once per node at WARN. Reads of such a file
+/// end in EIO at the last block instead of showing it empty; the official
+/// clients show its size as unknown (DESIGN §6.1).
+fn estimated_size(uid: &NodeUid, storage_size: i64) -> Option<u64> {
+    let size = u64::try_from(storage_size).ok()?;
+    if first_for_node(&ESTIMATED_SIZES, uid) {
+        tracing::warn!(
+            link = %link_of(uid),
+            storage_size,
+            "a file claims no size; its encrypted size stands in, and its last block will not read"
+        );
+    }
+    Some(size)
+}
+
+/// Nodes already logged by [`estimated_size`].
+static ESTIMATED_SIZES: SeenNodes = SeenNodes::new();
+
+/// Nodes a warning was logged for, so that it is logged once per node and
+/// process; at most [`SeenNodes::MAX`], then it starts again.
+struct SeenNodes(std::sync::OnceLock<Mutex<std::collections::HashSet<String>>>);
+
+impl SeenNodes {
+    const MAX: usize = 10_000;
+
+    const fn new() -> Self {
+        Self(std::sync::OnceLock::new())
+    }
+}
+
+/// Whether `uid` is new to `seen` (and now in it).
+fn first_for_node(seen: &SeenNodes, uid: &NodeUid) -> bool {
+    let mut set = seen.0.get_or_init(Default::default).lock();
+    if set.len() >= SeenNodes::MAX {
+        set.clear();
+    }
+    set.insert(uid.to_string())
+}
+
 fn link_of(uid: &NodeUid) -> LinkId {
     LinkId::new(uid.link_id.raw())
 }
@@ -597,7 +896,65 @@ fn parse_mode(value: &str) -> Option<u32> {
         .filter(|mode| *mode <= 0o7777)
 }
 
+/// Which of a node's signatures did not verify (fork P27): its name's, its
+/// key's (passphrase, or a folder's hash key) and its content key's, each
+/// with the signer it claims.
+fn unverified_signatures(node: &Node) -> Vec<(SignaturePart, Option<String>)> {
+    fn claimed(error: &proton_drive_sdk::protobuf::SignatureVerificationError) -> Option<String> {
+        error
+            .claimed_author
+            .as_ref()
+            .map(|author| author.email_address.clone())
+            .filter(|email| !email.is_empty())
+    }
+    let base = node.base();
+    let mut unverified = Vec::new();
+    if let PotentialObject::Degraded(error) = &base.name_author {
+        unverified.push((SignaturePart::Name, claimed(error)));
+    }
+    if let PotentialObject::Degraded(error) = &base.author {
+        unverified.push((SignaturePart::Key, claimed(error)));
+    }
+    if let Node::File(file) | Node::Photo(file) = node
+        && let Some(PotentialObject::Degraded(error)) = &file.active_revision.content_author
+    {
+        unverified.push((SignaturePart::ContentKey, claimed(error)));
+    }
+    unverified
+}
+
+/// Nodes already logged by [`unverified_of`].
+static UNVERIFIED: SeenNodes = SeenNodes::new();
+
+/// The node's failed signatures for [`RemoteNode::unverified`] (D132),
+/// logged at WARN once per node and process.
+fn unverified_of(node: &Node) -> Option<Unverified> {
+    let failed = unverified_signatures(node);
+    let parts: Vec<(SignaturePart, Option<&str>)> = failed
+        .iter()
+        .map(|(part, signer)| (*part, signer.as_deref()))
+        .collect();
+    let unverified = Unverified::of(&link_of(node.uid()), &node.base().name, &parts)?;
+    warn_unverified(node.uid(), &unverified);
+    Some(unverified)
+}
+
+/// Logs a node whose signatures do not verify at WARN, once per node and
+/// process. Returns whether it logged.
+fn warn_unverified(uid: &NodeUid, unverified: &Unverified) -> bool {
+    if !first_for_node(&UNVERIFIED, uid) {
+        return false;
+    }
+    tracing::warn!(
+        link = %link_of(uid),
+        signatures = ?unverified.parts().iter().map(|part| part.as_str()).collect::<Vec<_>>(),
+        "a node's signatures do not verify; the root's `signatures` mode decides whether it opens"
+    );
+    true
+}
+
 fn convert_node(node: Node) -> RemoteNode {
+    let unverified = unverified_of(&node);
     match node {
         Node::Folder(folder) | Node::Album(folder) => RemoteNode {
             link_id: link_of(&folder.base.uid),
@@ -614,6 +971,7 @@ fn convert_node(node: Node) -> RemoteNode {
             sha1: None,
             name_hash: None,
             trashed: folder.base.trash_time.is_some(),
+            unverified,
         },
         Node::File(file) | Node::Photo(file) => {
             let base = file.base.base;
@@ -633,7 +991,8 @@ fn convert_node(node: Node) -> RemoteNode {
                 size: file_size(
                     revision.claimed_size,
                     revision.claimed_block_sizes.as_deref(),
-                ),
+                )
+                .or_else(|| estimated_size(&base.uid, revision.size_on_cloud_storage)),
                 // Without a claimed mtime, the revision's commit time.
                 mtime: Some(system_time(
                     revision
@@ -647,6 +1006,7 @@ fn convert_node(node: Node) -> RemoteNode {
                     .and_then(|digest| <[u8; 20]>::try_from(digest).ok()),
                 name_hash: None,
                 trashed: base.trash_time.is_some(),
+                unverified,
             }
         }
     }
@@ -660,20 +1020,6 @@ fn hash_to_hex(digest: &[u8]) -> NameHash {
 /// The digest behind a hex name hash; `None` when `text` is not hex.
 fn hash_from_hex(text: &str) -> Option<Vec<u8>> {
     hex::decode(text).ok()
-}
-
-/// Nodes whose metadata could not be decrypted are skipped with a warning.
-fn decrypted<D: std::fmt::Debug>(object: PotentialObject<Node, D>) -> Option<RemoteNode> {
-    match object {
-        PotentialObject::Node(node) => Some(convert_node(node)),
-        PotentialObject::Degraded(degraded) => {
-            tracing::warn!(
-                ?degraded,
-                "skipping node whose metadata could not be decrypted"
-            );
-            None
-        }
-    }
 }
 
 /// The first cause of type `T` in an SDK error's chain.
@@ -717,6 +1063,8 @@ pub fn classify(error: &anyhow::Error) -> BackendError {
         || cause::<CompletedDownloadManifestVerificationException>(error).is_some()
         || cause::<proton_drive_sdk::error::ChecksumMismatchIntegrityException>(error).is_some()
         || cause::<proton_drive_sdk::error::ContentSizeMismatchIntegrityException>(error).is_some()
+        // A block that fails its check before upload, twice (P20).
+        || cause::<proton_drive_sdk::error::IntegrityException>(error).is_some()
     {
         return BackendError::Integrity(format!("{error:#}"));
     }
@@ -770,6 +1118,20 @@ pub fn is_connection_error(error: &anyhow::Error) -> bool {
     transport_error(error).is_some_and(reqwest::Error::is_connect)
 }
 
+/// The SDK's adopted server time offset in this process (server time minus
+/// device time, in seconds), which dates keys and signatures and the time they
+/// are verified at; `None` while no Drive API answer has been adopted and the
+/// device clock is used (fork P19 amended, P29).
+pub fn server_time_offset() -> Option<i64> {
+    proton_drive_sdk::server_time::offset_seconds()
+}
+
+/// Passes a Drive API answer's server time (Unix seconds) through the SDK's
+/// offset rules, as the answers of a mount's clients are.
+pub fn observe_server_time(server_unix_seconds: i64) {
+    proton_drive_sdk::server_time::update(server_unix_seconds);
+}
+
 /// The `reqwest::Error` behind an SDK error. Drive API calls go through
 /// `reqwest_middleware`, whose `Error::Reqwest` is `#[error(transparent)]`: the
 /// `reqwest::Error` is then not part of `anyhow::Error::chain()` and has to be
@@ -785,6 +1147,35 @@ fn transport_error(error: &anyhow::Error) -> Option<&reqwest::Error> {
     })
 }
 
+/// Runs a block download, and once more when its body was cut off on the
+/// way (parity R6): the fork retries a failed connect, a timeout and a
+/// retryable status itself, refreshes an expired target and fetches a block
+/// whose hash does not match once more (P2), but fails at once when the
+/// connection breaks while the block is read. The JS SDK retries any failed
+/// block once. A second cut is the error (`Transient`).
+async fn once_more_if_cut<T, F, Fut>(index: i32, download: F) -> anyhow::Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    match download().await {
+        Err(error) if cut_off(&error) => {
+            tracing::warn!(
+                block = index,
+                error = %format!("{error:#}"),
+                "a block's transfer was cut off; fetching it once more"
+            );
+            download().await
+        }
+        other => other,
+    }
+}
+
+/// The connection broke while an answer's body was on its way.
+fn cut_off(error: &anyhow::Error) -> bool {
+    transport_error(error).is_some_and(|http| http.is_body() || http.is_decode())
+}
+
 /// A failed block transfer (download, or upload to the storage endpoint).
 fn map_transfer_error(transfer: &HttpTransferError, error: &anyhow::Error) -> BackendError {
     match transfer.status {
@@ -797,10 +1188,118 @@ fn map_transfer_error(transfer: &HttpTransferError, error: &anyhow::Error) -> Ba
     }
 }
 
-/// Code of a refused rename or move (M3.1, S6–S8); the message tells the cases apart.
+/// Code of a refused rename or move (M3.1, S6–S8); the node's state tells
+/// the cases apart ([`refused_move`]), the message only as a last resort.
 const CODE_REFUSED: u32 = 2000;
 /// Code of a commit whose draft was removed meanwhile (M3.1, S3).
 const CODE_NOT_IN_DRAFT: u32 = 2511;
+/// Folders read at most, from a move's target up, to find a cycle.
+const MAX_ANCESTORS: usize = 128;
+
+/// Whether an SDK error is the server's refusal of a rename or move.
+fn is_refused(error: &anyhow::Error) -> bool {
+    ApiError::find(error)
+        .is_some_and(|api| api.code == Some(CODE_REFUSED) && !api.is_unauthorized())
+}
+
+/// What a rename or move that the server refused with code 2000 ran into,
+/// read from the node's state as C#'s `NodeMoveOperation` reads the node
+/// again (`Nodes/Move/NodeMoveOperation.cs:252-253`, `:313-344`), not from
+/// the English message, which the server may reword (parity N2):
+/// - the node is gone or trashed, or the move's target folder is: `NotFound`
+///   (the journal tells them apart);
+/// - its name hash is no longer `expected`: renamed or moved meanwhile, also
+///   by this device's earlier attempt whose answer was lost: `NameConflict`;
+/// - a move into the node itself or one of its descendants: `InvalidMove`;
+/// - another node has `new_name` in the target folder: `AlreadyExists`;
+/// - none of these (an unchanged node whose hash was refused): `NameConflict`,
+///   which the journal parks after reading the node again (§8.3).
+///
+/// When a read fails, or a node on the way cannot be decrypted, the
+/// message's reading (`by_message`) decides.
+async fn refused_move(
+    backend: &dyn Backend,
+    node: &LinkId,
+    new_parent: Option<&LinkId>,
+    new_name: &str,
+    expected: Option<&NameHash>,
+    by_message: BackendError,
+) -> BackendError {
+    match refusal_by_state(backend, node, new_parent, new_name, expected).await {
+        Ok(decided) => decided,
+        Err(error) => {
+            tracing::debug!(%node, %error, "a refused rename could not be checked; its message decides");
+            by_message
+        }
+    }
+}
+
+async fn refusal_by_state(
+    backend: &dyn Backend,
+    node: &LinkId,
+    new_parent: Option<&LinkId>,
+    new_name: &str,
+    expected: Option<&NameHash>,
+) -> Result<BackendError> {
+    let Some(current) = live_node(backend, node).await? else {
+        return Ok(BackendError::NotFound);
+    };
+    if expected.is_some() && current.name_hash.as_ref() != expected {
+        return Ok(BackendError::NameConflict);
+    }
+    let target = match new_parent {
+        Some(parent) => {
+            let mut at = parent.clone();
+            let mut levels = 0;
+            loop {
+                if at == *node {
+                    return Ok(BackendError::InvalidMove);
+                }
+                let Some(folder) = live_node(backend, &at).await? else {
+                    return Ok(BackendError::NotFound);
+                };
+                match folder.parent_link_id {
+                    Some(up) if levels < MAX_ANCESTORS => at = up,
+                    Some(_) => return Err(BackendError::Other("too many ancestors".into())),
+                    None => break,
+                }
+                levels += 1;
+            }
+            parent.clone()
+        }
+        None => match current.parent_link_id {
+            Some(parent) => parent,
+            None => return Ok(BackendError::NameConflict),
+        },
+    };
+    let taken = backend
+        .list_children(&target)
+        .await?
+        .into_iter()
+        .find(|child| child.name == new_name && child.link_id != *node);
+    Ok(match taken {
+        Some(child) => BackendError::AlreadyExists {
+            existing: Some(child.link_id),
+        },
+        None => BackendError::NameConflict,
+    })
+}
+
+/// The node `link`, fresh; `None` when it is gone or trashed. One that
+/// cannot be decrypted is an error: its state cannot be read.
+async fn live_node(backend: &dyn Backend, link: &LinkId) -> Result<Option<RemoteNode>> {
+    match backend
+        .get_nodes_checked(std::slice::from_ref(link))
+        .await?
+        .pop()
+    {
+        Some(NodeLookup::Found(node)) => Ok((!node.trashed).then_some(node)),
+        Some(NodeLookup::Absent) | None => Ok(None),
+        Some(NodeLookup::Degraded) => {
+            Err(BackendError::Other(format!("{link} cannot be decrypted")))
+        }
+    }
+}
 
 fn map_api_error(api: &ApiError, error: &anyhow::Error) -> BackendError {
     // An expired token can also arrive as HTTP 200 with `Code` 401 in the body
@@ -896,22 +1395,12 @@ impl ProtonBackend {
             .map_err(map_error)
     }
 
-    /// The claimed plaintext size of a block, if its block map has it.
-    async fn claimed_block_size(
-        &self,
-        file: &LinkId,
-        revision: &RevisionId,
-        index: u32,
-    ) -> Result<Option<u32>> {
-        let map = self.block_map(file, revision).await?;
-        let index = i32::try_from(index).map_err(|_| BackendError::NotFound)?;
-        Ok(map.entry(index).ok_or(BackendError::NotFound)?.plain_size)
-    }
-
     /// One verified, decrypted block, straight into `buf`; returns its
-    /// length. `download_block` of the SDK without its size check, which is
-    /// an untyped error: a block that decrypts to another size than claimed,
-    /// or to more than `buf` holds, is an integrity failure.
+    /// length. Its page is listed when needed and, on the revision's first
+    /// read, the rest of the listing for the manifest beside the download
+    /// (D135); the block counts once the manifest verified. A block that
+    /// decrypts to more than `buf` holds is an integrity failure; the cache
+    /// checks the length against the layout.
     async fn download_block_into(
         &self,
         file: &LinkId,
@@ -919,59 +1408,64 @@ impl ProtonBackend {
         index: u32,
         buf: &mut [u8],
     ) -> Result<usize> {
-        let map = self.block_map(file, revision).await?;
-        let index = i32::try_from(index).map_err(|_| BackendError::NotFound)?;
-        let entry = map.entry(index).ok_or(BackendError::NotFound)?;
+        let kept = self.block_lists.revision(file, revision);
+        let pages = self.pages(file, revision);
+        let uid = pages.uid.clone();
+        self.block_lists
+            .fetch(&kept, &pages, index, |listed| {
+                self.download_listed(uid, listed, buf)
+            })
+            .await
+    }
+
+    /// Downloads one listed block into `buf` (the fork's downloader checks
+    /// its hash and refreshes an expired target, P2).
+    async fn download_listed(
+        &self,
+        uid: RevisionUid,
+        listed: Listed<BlockTarget>,
+        buf: &mut [u8],
+    ) -> Result<usize> {
+        let index = i32::try_from(listed.index).map_err(|_| BackendError::NotFound)?;
         let capacity = buf.len();
-        let too_long = |len: String| {
+        let too_long = || {
             BackendError::Integrity(format!(
-                "block {index} of revision {} has {len} bytes, more than the {capacity} expected",
-                map.revision_uid
+                "block {index} of revision {uid} has more bytes than the {capacity} expected"
             ))
         };
-        if let Some(claimed) = entry.plain_size
-            && claimed as usize > capacity
-        {
-            return Err(too_long(claimed.to_string()));
-        }
         // `authed` runs the call again after a token refresh, so its
         // closure is `Fn`: it borrows the buffer through a lock.
         let buf = tokio::sync::Mutex::new(buf);
+        let (uid, listed) = (&uid, &listed);
         self.authed(|client| {
-            let (map, buf) = (Arc::clone(&map), &buf);
+            let buf = &buf;
             async move {
-                let entry = map.entry(index).expect("checked above");
-                let mut buf = buf.lock().await;
-                let mut out = std::io::Cursor::new(&mut **buf);
-                client
-                    .block_downloader()
-                    .download_verified(
-                        &client,
-                        map.revision_uid.clone(),
-                        index,
-                        entry.bare_url.clone(),
-                        entry.token.clone(),
-                        &entry.hash_digest,
-                        map.content_key.clone(),
-                        &mut out,
-                    )
-                    .await
-                    .map_err(|error| {
-                        if overflowed(&error) {
-                            too_long("more".into())
-                        } else {
-                            map_error(error)
-                        }
-                    })?;
-                let len = out.position();
-                if let Some(claimed) = entry.plain_size
-                    && len != u64::from(claimed)
-                {
-                    return Err(BackendError::Integrity(format!(
-                        "block {index} of revision {} decrypted to {len} bytes, claimed {claimed}",
-                        map.revision_uid,
-                    )));
-                }
+                let client = &client;
+                let download = move || async move {
+                    let mut buf = buf.lock().await;
+                    let mut out = std::io::Cursor::new(&mut **buf);
+                    client
+                        .block_downloader()
+                        .download_verified(
+                            client,
+                            uid.clone(),
+                            index,
+                            listed.target.bare_url.clone(),
+                            listed.target.token.clone(),
+                            &listed.hash,
+                            listed.target.content_key.clone(),
+                            &mut out,
+                        )
+                        .await?;
+                    Ok(out.position())
+                };
+                let len = once_more_if_cut(index, download).await.map_err(|error| {
+                    if overflowed(&error) {
+                        too_long()
+                    } else {
+                        map_error(error)
+                    }
+                })?;
                 Ok(len as usize)
             }
         })
@@ -982,7 +1476,7 @@ impl ProtonBackend {
 #[async_trait::async_trait]
 impl Backend for ProtonBackend {
     /// The SDK's revision writer reads this many plaintext bytes per block
-    /// (`sdk/node/revision.rs:529`), whatever its doc says about encrypted
+    /// (`sdk/node/revision.rs:458`), whatever its doc says about encrypted
     /// sizes; the cache seeds its layout from it.
     fn upload_block_size(&self) -> u64 {
         // The SDK's constant, the same for every client of the session.
@@ -1019,6 +1513,12 @@ impl Backend for ProtonBackend {
     }
 
     async fn list_children(&self, folder: &LinkId) -> Result<Vec<RemoteNode>> {
+        Ok(self.list_children_checked(folder).await?.children)
+    }
+
+    /// A child that does not decrypt comes back degraded (fork P26) and is
+    /// named in [`Listing::degraded`], not left out as if it were gone.
+    async fn list_children_checked(&self, folder: &LinkId) -> Result<Listing> {
         let children = self
             .authed(|client| async move {
                 client
@@ -1032,11 +1532,34 @@ impl Backend for ProtonBackend {
                     .map_err(map_error)
             })
             .await?;
-        Ok(children
-            .into_iter()
-            .filter_map(decrypted)
-            .filter(|node| !node.trashed)
-            .collect())
+        let mut listing = Listing::default();
+        for child in children {
+            match child {
+                PotentialObject::Node(node) => {
+                    let node = convert_node(node);
+                    if !node.trashed {
+                        listing.children.push(node);
+                    }
+                }
+                PotentialObject::Degraded(degraded) => {
+                    let trashed = match &degraded {
+                        DegradedNode::Folder(n) | DegradedNode::Album(n) => n.base.trash_time,
+                        DegradedNode::File(n) | DegradedNode::Photo(n) => n.base.trash_time,
+                    }
+                    .is_some();
+                    if !trashed {
+                        let link = link_of(degraded.uid());
+                        tracing::warn!(
+                            %link,
+                            folder = %folder,
+                            "a child's metadata cannot be decrypted; what is known of it stays"
+                        );
+                        listing.degraded.push(link);
+                    }
+                }
+            }
+        }
+        Ok(listing)
     }
 
     /// Fresh from the API, 50 links per request (P13): `enumerate_nodes`
@@ -1100,14 +1623,57 @@ impl Backend for ProtonBackend {
             .collect())
     }
 
+    /// From the node's claimed block sizes when it has them for this
+    /// revision, without a listing; otherwise the whole listing, verified,
+    /// with the sizes of the listed revision (D135).
     async fn blocks(&self, file: &LinkId, revision: &RevisionId) -> Result<Vec<BlockInfo>> {
-        let map = self.block_map(file, revision).await?;
-        Ok(map
-            .blocks
-            .iter()
-            .map(|entry| BlockInfo {
-                index: entry.index.max(0) as u32,
-                plain_size: entry.plain_size,
+        let kept = self.block_lists.revision(file, revision);
+        if let Some(sizes) = self.node_block_sizes(file, revision).await? {
+            kept.set_count(sizes.len() as u32);
+            return Ok(sizes
+                .into_iter()
+                .zip(1..)
+                .map(|(size, index)| BlockInfo {
+                    index,
+                    plain_size: Some(size),
+                })
+                .collect());
+        }
+        let pages = self.pages(file, revision);
+        let count = self.block_lists.verified(&kept, &pages).await?.len();
+        let meta = kept.meta().ok_or(BackendError::NotFound)?;
+        let uid = pages.uid.clone();
+        let sizes = self
+            .authed(|client| {
+                let (uid, meta) = (uid.clone(), Arc::clone(&meta));
+                async move {
+                    client
+                        .listed_block_sizes(&uid, &meta)
+                        .await
+                        .map_err(map_error)
+                }
+            })
+            .await?
+            .and_then(|sizes| {
+                sizes
+                    .iter()
+                    .map(|&size| u32::try_from(size).ok())
+                    .collect::<Option<Vec<u32>>>()
+            })
+            .filter(|sizes| {
+                let matches = sizes.len() == count;
+                if !matches {
+                    tracing::warn!(
+                        %file, %revision, sizes = sizes.len(), blocks = count,
+                        "ignoring claimed block sizes that do not match the listing"
+                    );
+                }
+                matches
+            });
+        Ok((1..=count as u32)
+            .map(|index| BlockInfo {
+                index,
+                plain_size: sizes.as_ref().map(|sizes| sizes[index as usize - 1]),
             })
             .collect())
     }
@@ -1125,8 +1691,12 @@ impl Backend for ProtonBackend {
     /// Into a buffer sized once, from the claimed size when there is one.
     async fn fetch_block(&self, file: &LinkId, revision: &RevisionId, index: u32) -> Result<Bytes> {
         let size = self
-            .claimed_block_size(file, revision, index)
+            .blocks(file, revision)
             .await?
+            .iter()
+            .find(|block| block.index == index)
+            .ok_or(BackendError::NotFound)?
+            .plain_size
             .map_or(crate::MAX_BLOCK_BYTES, |size| {
                 (size as usize).min(crate::MAX_BLOCK_BYTES)
             });
@@ -1240,38 +1810,56 @@ impl Backend for ProtonBackend {
             })?),
             None => None,
         };
-        self.authed(|client| {
-            let uid = self.node_uid(node);
-            let new_name = new_name.to_owned();
-            let original = original.clone();
-            async move {
-                match (new_parent, original) {
-                    (Some(parent), None) => {
-                        client
-                            .move_node(uid, self.node_uid(parent), Some(new_name))
-                            .await
+        // A refusal (code 2000) comes back as its message's reading, the
+        // last resort of `refused_move`.
+        let refused = self
+            .authed(|client| {
+                let uid = self.node_uid(node);
+                let new_name = new_name.to_owned();
+                let original = original.clone();
+                async move {
+                    match (new_parent, original) {
+                        (Some(parent), None) => {
+                            client
+                                .move_node(uid, self.node_uid(parent), Some(new_name))
+                                .await
+                        }
+                        (Some(parent), Some(hash)) => {
+                            client
+                                .move_node_with_original_hash(
+                                    uid,
+                                    self.node_uid(parent),
+                                    Some(new_name),
+                                    hash,
+                                )
+                                .await
+                        }
+                        (None, None) => client.rename_node(uid, new_name, None).await,
+                        (None, Some(hash)) => {
+                            client
+                                .rename_node_with_original_hash(uid, new_name, None, hash)
+                                .await
+                        }
                     }
-                    (Some(parent), Some(hash)) => {
-                        client
-                            .move_node_with_original_hash(
-                                uid,
-                                self.node_uid(parent),
-                                Some(new_name),
-                                hash,
-                            )
-                            .await
-                    }
-                    (None, None) => client.rename_node(uid, new_name, None).await,
-                    (None, Some(hash)) => {
-                        client
-                            .rename_node_with_original_hash(uid, new_name, None, hash)
-                            .await
-                    }
+                    .map_or_else(
+                        |error| {
+                            if is_refused(&error) {
+                                Ok(Some(map_error(error)))
+                            } else {
+                                Err(map_error(error))
+                            }
+                        },
+                        |()| Ok(None),
+                    )
                 }
-                .map_err(map_error)
+            })
+            .await?;
+        match refused {
+            None => Ok(()),
+            Some(by_message) => {
+                Err(refused_move(self, node, new_parent, new_name, expected, by_message).await)
             }
-        })
-        .await
+        }
     }
 
     async fn trash(&self, nodes: &[LinkId]) -> Result<Vec<Result<()>>> {
@@ -1383,40 +1971,16 @@ impl SharedWithMe for ProtonBackend {
     }
 
     async fn shared_listing(&self) -> Result<SharedListing> {
-        let mut links = Vec::new();
-        let mut anchor = None;
-        for _ in 0..MAX_SHARED_PAGES {
-            let page = self
-                .authed(|client| {
-                    let anchor = anchor.clone();
-                    async move {
-                        client
-                            .api()
-                            .shares()
-                            .get_shared_with_me(anchor)
-                            .await
-                            .map_err(map_error)
-                    }
-                })
-                .await?;
-            for link in page.links {
-                let kind = match link.share_target_type {
-                    ShareTargetType::Folder => NodeKind::Folder,
-                    ShareTargetType::File => NodeKind::File,
-                    _ => continue,
-                };
-                links.push((
-                    link.share_id.raw().clone(),
-                    link.volume_id.raw().to_owned(),
-                    link.link_id.raw().to_owned(),
-                    kind,
-                ));
-            }
-            match page.anchor_id {
-                Some(next) if page.more => anchor = Some(next),
-                _ => break,
-            }
-        }
+        let api = self
+            .live
+            .read()
+            .shared
+            .clone()
+            .ok_or(BackendError::Unsupported(
+                "shared-with-me without its client",
+            ))?;
+        let (_, credential) = self.session_for_call().await?;
+        let links = shared_links(&api, &credential).await?;
         for (share, ..) in &links {
             if self.share_info.lock().contains_key(share) {
                 continue;
@@ -1578,11 +2142,15 @@ impl Photos for ProtonBackend {
             .collect())
     }
 
-    /// The revision's block listing, verified as `get_block_map` verifies
-    /// it: the manifest (the thumbnails' digests, then the blocks') signed
-    /// by the node key, or by the signer's address keys. The SDK's
-    /// `enumerate_thumbnails` checks nothing of a thumbnail but that it
-    /// decrypts, as the official SDKs (D115).
+    /// One request (DESIGN §14.5, D135): the revision's first page of
+    /// blocks, without their storage URLs. When that page is the whole
+    /// listing (fewer than [`BLOCK_PAGE_SIZE`] blocks, a photo), its
+    /// manifest is verified as `get_block_map` verifies it: the
+    /// thumbnails' digests, then the blocks', signed by the node key or by
+    /// the signer's address keys. A larger revision (a video) is not listed
+    /// further for its thumbnail: its thumbnail is checked as the official
+    /// clients check every thumbnail, by decrypting with the file's content
+    /// key (the JS SDK's `thumbnailDownloader.ts` checks no digest; D115).
     async fn thumbnail_ref(
         &self,
         volume: &str,
@@ -1600,9 +2168,29 @@ impl Photos for ProtonBackend {
             let secrets = FileOperations::get_secrets(drive, uid.node_uid.clone())
                 .await
                 .map_err(map_error)?;
-            let listing = RevisionOperations::get_revision_with_all_blocks(drive, &uid)
+            let listing = drive
+                .api()
+                .files()
+                .get_revision(
+                    uid.node_uid.volume_id.clone(),
+                    uid.node_uid.link_id.clone(),
+                    uid.revision_id.clone(),
+                    Some(1),
+                    Some(BLOCK_PAGE_SIZE as i32),
+                    true,
+                )
                 .await
-                .map_err(map_error)?;
+                .map_err(map_error)?
+                .revision;
+            if listing.blocks.len() >= BLOCK_PAGE_SIZE as usize {
+                tracing::debug!(%link, "a large revision's thumbnail: its manifest is not listed");
+                return Ok(listing
+                    .revision
+                    .thumbnails
+                    .into_iter()
+                    .flatten()
+                    .find(|thumbnail| thumbnail.r#type == ThumbnailType::Thumbnail));
+            }
             // The keys of the SDK's `manifest_verification_keys`.
             let keys = match listing.revision.signature_email_address.as_deref() {
                 None | Some("") => vec![secrets.base.key.0.as_public_key().clone()],
@@ -1737,6 +2325,51 @@ async fn download_thumbnail(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D132 (fork P27): a node whose name signature does not verify is
+    /// logged once and converted with its failed part and claimed signer
+    /// (M6.0.6); a verified node has none.
+    #[test]
+    fn an_unverified_node_is_logged_once_and_shown() {
+        use proton_drive_sdk::node::NodeBase;
+        use proton_drive_sdk::node::folder::FolderNode;
+        let folder = |link: &str, verified: bool| {
+            Node::Folder(FolderNode {
+                base: NodeBase {
+                    uid: NodeUid::from_parts("volume", link),
+                    parent_uid: Some(NodeUid::from_parts("volume", "parent")),
+                    name: link.to_owned(),
+                    name_author: if verified {
+                        PotentialObject::Node(Default::default())
+                    } else {
+                        PotentialObject::Degraded(
+                            proton_drive_sdk::protobuf::SignatureVerificationError {
+                                claimed_author: None,
+                                message: "Could not verify the author of this item".into(),
+                            },
+                        )
+                    },
+                    ..NodeBase::default()
+                },
+                claimed_modification_time: None,
+            })
+        };
+        let unverified = folder("p27-unverified", false);
+        assert_eq!(
+            unverified_signatures(&unverified),
+            [(SignaturePart::Name, None)]
+        );
+        let converted = convert_node(unverified.clone());
+        assert_eq!(converted.name, "p27-unverified");
+        let found = converted.unverified.expect("unverified");
+        assert_eq!(found.parts(), [SignaturePart::Name]);
+        assert_eq!(found.signer, "anonymous");
+        assert!(
+            !warn_unverified(unverified.uid(), &found),
+            "logged once per node, by the conversion"
+        );
+        assert_eq!(convert_node(folder("p27-verified", true)).unverified, None);
+    }
 
     /// The SDK's own path: an active key that no stored passphrase opens.
     mod locked_keys {
@@ -1936,6 +2569,155 @@ mod tests {
             map_error(refused(Some(422), "something else")),
             BackendError::Other(_)
         ));
+        assert!(is_refused(&refused(Some(422), "reworded")));
+        assert!(is_refused(&refused(None, "reworded")));
+        assert!(!is_refused(&anyhow::Error::from(ApiError::from_code(
+            2500, "exists"
+        ))));
+    }
+
+    /// A refusal (code 2000) is decided by the node's state on the fake, as
+    /// the server would have it, never by the message (N2); `by_message`
+    /// is a reading that is wrong for each case.
+    #[tokio::test]
+    async fn refused_renames_and_moves_are_decided_by_the_nodes_state() {
+        use crate::fake::{FakeBackend, FakeOp};
+        let fake = FakeBackend::new();
+        let root = fake.root().await.expect("root").link_id;
+        let folder = |parent: LinkId, name: &'static str| {
+            let fake = fake.clone();
+            async move {
+                fake.create_folder(&parent, name, SystemTime::UNIX_EPOCH)
+                    .await
+                    .expect("folder")
+            }
+        };
+        let (a, other) = (
+            folder(root.clone(), "a").await,
+            folder(root.clone(), "other").await,
+        );
+        let b = folder(a.clone(), "b").await;
+        let c = folder(b.clone(), "c").await;
+        let file = |name: &'static str| {
+            let (fake, root) = (fake.clone(), root.clone());
+            async move {
+                fake.upload_new(
+                    &root,
+                    name,
+                    UploadSource::Bytes(Bytes::from_static(b"x")),
+                    FileMeta {
+                        mtime: SystemTime::UNIX_EPOCH,
+                        mode: None,
+                        media_type: "text/plain".into(),
+                        sha1: None,
+                    },
+                )
+                .await
+                .expect("file")
+                .0
+            }
+        };
+        let (f, taken) = (file("f").await, file("taken").await);
+        let hash = |link: LinkId| {
+            let fake = fake.clone();
+            async move {
+                fake.get_nodes(&[link]).await.expect("get")[0]
+                    .as_ref()
+                    .and_then(|node| node.name_hash.clone())
+                    .expect("hash")
+            }
+        };
+        let decide = |node: LinkId, parent: Option<LinkId>, name: &'static str, expected| {
+            let fake = fake.clone();
+            async move {
+                refused_move(
+                    &fake,
+                    &node,
+                    parent.as_ref(),
+                    name,
+                    Some(&expected),
+                    BackendError::Other("the message".into()),
+                )
+                .await
+            }
+        };
+        let (hash_a, hash_f) = (hash(a.clone()).await, hash(f.clone()).await);
+
+        // A move into the node's own subtree, or into itself.
+        assert_eq!(
+            decide(a.clone(), Some(c.clone()), "a", hash_a.clone()).await,
+            BackendError::InvalidMove
+        );
+        assert_eq!(
+            decide(a.clone(), Some(a.clone()), "a", hash_a.clone()).await,
+            BackendError::InvalidMove
+        );
+        // The name is taken in the target folder, by a rename or a move.
+        assert_eq!(
+            decide(f.clone(), None, "taken", hash_f.clone()).await,
+            BackendError::AlreadyExists {
+                existing: Some(taken.clone())
+            }
+        );
+        let in_other = fake
+            .upload_new(
+                &other,
+                "x",
+                UploadSource::Bytes(Bytes::from_static(b"y")),
+                FileMeta {
+                    mtime: SystemTime::UNIX_EPOCH,
+                    mode: None,
+                    media_type: "text/plain".into(),
+                    sha1: None,
+                },
+            )
+            .await
+            .expect("x")
+            .0;
+        assert_eq!(
+            decide(f.clone(), Some(other.clone()), "x", hash_f.clone()).await,
+            BackendError::AlreadyExists {
+                existing: Some(in_other)
+            }
+        );
+        // A move that is no cycle and finds its name free: an unchanged
+        // node whose hash was refused.
+        assert_eq!(
+            decide(f.clone(), Some(c.clone()), "f", hash_f.clone()).await,
+            BackendError::NameConflict
+        );
+        // Renamed meanwhile (another device, or this one's lost answer).
+        fake.rename(&f, None, "g", None).await.expect("rename");
+        assert_eq!(
+            decide(f.clone(), None, "h", hash_f.clone()).await,
+            BackendError::NameConflict
+        );
+        // The target folder is gone, then the node itself.
+        let hash_g = hash(f.clone()).await;
+        fake.trash(std::slice::from_ref(&other))
+            .await
+            .expect("trash");
+        assert_eq!(
+            decide(f.clone(), Some(other.clone()), "g", hash_g.clone()).await,
+            BackendError::NotFound
+        );
+        fake.trash(std::slice::from_ref(&f)).await.expect("trash");
+        assert_eq!(
+            decide(f.clone(), None, "h", hash_g.clone()).await,
+            BackendError::NotFound
+        );
+        // A read that fails leaves it to the message.
+        fake.inject_failure(FakeOp::GetNodes, BackendError::Offline("down".into()));
+        assert_eq!(
+            decide(a.clone(), Some(c.clone()), "a", hash_a.clone()).await,
+            BackendError::Other("the message".into())
+        );
+        // So does a listing that fails.
+        fake.inject_failure(FakeOp::ListChildren, BackendError::Offline("down".into()));
+        assert_eq!(
+            decide(b.clone(), None, "taken", hash(b.clone()).await).await,
+            BackendError::Other("the message".into())
+        );
     }
 
     #[test]
@@ -2138,6 +2920,36 @@ mod tests {
         );
     }
 
+    /// A revision that claims neither a size nor block sizes (fork P4 as
+    /// amended in M6.0.4.11) shows its encrypted size, logged once.
+    #[test]
+    fn a_file_without_a_claimed_size_shows_its_encrypted_size() {
+        let uid = NodeUid::from_parts("volume", "p4-no-size");
+        assert_eq!(file_size(None, None), None);
+        assert_eq!(estimated_size(&uid, 5_100_000), Some(5_100_000));
+        assert!(!first_for_node(&ESTIMATED_SIZES, &uid), "logged once");
+        assert_eq!(estimated_size(&uid, -1), None);
+    }
+
+    /// Fork P2 amended (M6.0.4.12): a block still missing after its target
+    /// was refreshed comes as a `DataIntegrityException` and reads as an
+    /// integrity error (EIO, not cached, logged at ERROR); before, the raw
+    /// 404 was a plain failure.
+    #[test]
+    fn a_block_missing_after_its_refresh_is_an_integrity_error() {
+        let missing: anyhow::Error = DataIntegrityException::new(
+            "File contents are incomplete: block #3 is still missing after its target was refreshed",
+        )
+        .into();
+        assert!(matches!(
+            map_error(missing.context("block 3")),
+            BackendError::Integrity(_)
+        ));
+        let raw: anyhow::Error =
+            HttpTransferError::new(reqwest::StatusCode::NOT_FOUND, "blob", None).into();
+        assert!(matches!(map_error(raw), BackendError::Other(_)));
+    }
+
     #[test]
     fn integrity_and_unknown_errors_are_classified() {
         let integrity: anyhow::Error = DataIntegrityException::new("hash mismatch").into();
@@ -2148,6 +2960,15 @@ mod tests {
             CompletedDownloadManifestVerificationException::new("not signed").into();
         assert!(matches!(
             map_error(manifest.context("get_block_map")),
+            BackendError::Integrity(_)
+        ));
+        // A block that does not decrypt to its plaintext with the
+        // verification session key, after one more encryption (P20): the
+        // upload is retried and parked as for any integrity failure.
+        let block: anyhow::Error =
+            proton_drive_sdk::error::IntegrityException::new("block failed verification").into();
+        assert!(matches!(
+            map_error(block.context("Block 3 failed verification after 2 encryptions")),
             BackendError::Integrity(_)
         ));
         assert!(matches!(
@@ -2361,6 +3182,306 @@ mod tests {
         assert_eq!(read(200, r#"{"Code":1000,"Photos":[]}"#), Ok(0));
     }
 
+    /// A local HTTP server that answers its connections in order, each with
+    /// the next of `answers` (a whole raw response), and closes them; it
+    /// returns its URL and the request lines it got.
+    async fn serve(answers: Vec<Vec<u8>>) -> (String, Arc<Mutex<Vec<String>>>) {
+        let (listener, url) = listen().await;
+        (url, serve_on(listener, answers))
+    }
+
+    /// A local listener and its URL, for [`serve_on`].
+    async fn listen() -> (tokio::net::TcpListener, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}/", listener.local_addr().expect("address"));
+        (listener, url)
+    }
+
+    /// [`serve`] on a listener whose URL the answers need.
+    fn serve_on(
+        listener: tokio::net::TcpListener,
+        answers: Vec<Vec<u8>>,
+    ) -> Arc<Mutex<Vec<String>>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&requests);
+        tokio::spawn(async move {
+            for answer in answers {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut head = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let line = String::from_utf8_lossy(&head)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                seen.lock().push(line);
+                let _ = socket.write_all(&answer).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        requests
+    }
+
+    /// A complete HTTP answer with `status` and `body`.
+    fn answer(status: &str, body: &[u8]) -> Vec<u8> {
+        let mut answer = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        answer.extend_from_slice(body);
+        answer
+    }
+
+    /// A shared-with-me page with a link of a type nobody knows yet, and
+    /// types PdMount does not mount, keeps its folders and files: the SDK's
+    /// types refused the whole page, and a Shared mount stayed empty (F1).
+    #[test]
+    fn shared_links_of_unknown_types_are_left_out_alone() {
+        let body = r#"{"Code":1000,"More":false,"AnchorID":null,"Links":[
+            {"VolumeID":"v1","ShareID":"s1","LinkID":"l1","ShareTargetType":1},
+            {"VolumeID":"v1","ShareID":"s2","LinkID":"l2","ShareTargetType":9},
+            {"VolumeID":"v2","ShareID":"s3","LinkID":"l3","ShareTargetType":2},
+            {"VolumeID":"v2","ShareID":"s4","LinkID":"l4","ShareTargetType":"new"},
+            {"VolumeID":"v2","ShareID":"s5","LinkID":"l5","ShareTargetType":3},
+            {"VolumeID":"v2","ShareID":"s6","LinkID":"l6","ShareTargetType":5},
+            {"VolumeID":"v3","ShareID":"s7","LinkID":"l7"}]}"#;
+        assert!(
+            serde_json::from_str::<proton_drive_sdk::api::share::SharedWithMeResponse>(body)
+                .is_err(),
+            "the SDK's types refuse the page (else this test needs a new case)"
+        );
+        let read = |body: &str| {
+            parse_api_page(
+                "shared-with-me",
+                reqwest::StatusCode::OK,
+                &Default::default(),
+                body,
+                |page: &SharedPageDto| page.code,
+            )
+        };
+        let entries: Vec<_> = read(body)
+            .expect("the page is read")
+            .links
+            .into_iter()
+            .filter_map(SharedLinkDto::entry)
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                ("s1".into(), "v1".into(), "l1".into(), NodeKind::Folder),
+                ("s3".into(), "v2".into(), "l3".into(), NodeKind::File),
+            ]
+        );
+        assert!(read(r#"{"Code":1000}"#).is_err(), "no links, no listing");
+        assert!(
+            read(r#"{"Code":2011,"Error":"Not allowed"}"#)
+                .map_err(map_error)
+                .is_err_and(|error| error == BackendError::PermissionDenied)
+        );
+    }
+
+    /// The listing is read page by page, by `More` and `AnchorID`, and an
+    /// unknown type on the first page does not end it.
+    #[tokio::test]
+    async fn the_shared_listing_is_read_by_its_anchors() {
+        let first = br#"{"Code":1000,"More":true,"AnchorID":"next-1","Links":[
+            {"VolumeID":"v1","ShareID":"s1","LinkID":"l1","ShareTargetType":42},
+            {"VolumeID":"v1","ShareID":"s2","LinkID":"l2","ShareTargetType":1}]}"#;
+        let last = br#"{"Code":1000,"More":false,"AnchorID":"next-2","Links":[
+            {"VolumeID":"v2","ShareID":"s3","LinkID":"l3","ShareTargetType":2}]}"#;
+        let (url, requests) = serve(vec![answer("200 OK", first), answer("200 OK", last)]).await;
+        let api = SharedApi {
+            http: reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build(),
+            base: reqwest::Url::parse(&url).expect("url"),
+        };
+        let session = offline::session("s");
+        let links = shared_links(&api, &session.token_credential)
+            .await
+            .expect("listing");
+        assert_eq!(
+            links,
+            [
+                ("s2".into(), "v1".into(), "l2".into(), NodeKind::Folder),
+                ("s3".into(), "v2".into(), "l3".into(), NodeKind::File),
+            ]
+        );
+        assert_eq!(
+            *requests.lock(),
+            [
+                "GET /v2/sharedwithme HTTP/1.1",
+                "GET /v2/sharedwithme?AnchorID=next-1 HTTP/1.1"
+            ]
+        );
+    }
+
+    /// Reads block 1 of a one-block revision through the adapter, the fork's
+    /// downloader and a local server for the storage and the API: `answers`
+    /// gets the server's URL and the encrypted block and gives the answers
+    /// in the order the requests come. Returns the plaintext or the error,
+    /// and the request lines.
+    /// A listed revision, as a block page carries it.
+    fn listed_revision() -> RevisionDto {
+        serde_json::from_value(serde_json::json!({
+            "ID": "rev", "CreateTime": 0, "Size": 1, "State": 1,
+            "ManifestSignature": null, "SignatureEmail": null, "XAttr": null,
+            "Thumbnails": [],
+        }))
+        .expect("revision")
+    }
+
+    async fn read_one_block(
+        answers: impl FnOnce(&str, &[u8]) -> Vec<Vec<u8>>,
+    ) -> (Result<Vec<u8>>, Vec<String>) {
+        use proton_drive_sdk::proton_sdk_rs2::crypto::proton_rpgp;
+        use proton_rpgp::pgp::ser::Serialize;
+        use sha2::Digest;
+        let plain = b"the block's plaintext".to_vec();
+        let key = proton_drive_sdk::crypto::CryptoGenerator::generate_session_key();
+        let encrypted = proton_rpgp::Encryptor::default()
+            .with_session_key(key.to_rpgp_sk().expect("key"))
+            .encrypt(&plain)
+            .expect("encrypt")
+            .to_bytes()
+            .expect("bytes");
+        let (listener, url) = listen().await;
+        let requests = serve_on(listener, answers(&url, &encrypted));
+        let session = offline::session_at("s", &url);
+        let backend = ProtonBackend::with_root(
+            offline::drive(&session),
+            session.token_credential.clone(),
+            "user".into(),
+            "volume",
+            LinkId::new("root"),
+        );
+        let (file, revision) = (LinkId::new("file"), RevisionId::new("rev"));
+        // Block 1 listed and its manifest verified already.
+        backend.block_lists.seed(
+            &file,
+            &revision,
+            vec![Listed {
+                index: 1,
+                hash: sha2::Sha256::digest(&encrypted).to_vec(),
+                target: BlockTarget {
+                    bare_url: format!("{url}blob/old"),
+                    token: "token".into(),
+                    content_key: key,
+                },
+            }],
+            listed_revision(),
+            true,
+        );
+        let mut buf = vec![0; plain.len()];
+        let read = backend
+            .fetch_block_into(&file, &revision, 1, &mut buf)
+            .await
+            .map(|len| buf[..len].to_vec());
+        if let Ok(read) = &read {
+            assert_eq!(*read, plain);
+        }
+        let requests = requests.lock().clone();
+        (read, requests)
+    }
+
+    /// The headers and half of `body`, then the connection closes.
+    fn cut(body: &[u8]) -> Vec<u8> {
+        let mut answer = answer("200 OK", body);
+        answer.truncate(answer.len() - body.len() / 2);
+        answer
+    }
+
+    /// The revision's block listing of the fork's target refresh, with a
+    /// fresh target for block 1.
+    fn fresh_target(url: &str, encrypted: &[u8]) -> Vec<u8> {
+        use sha2::Digest;
+        let body = serde_json::json!({
+            "Code": 1000,
+            "Revision": {
+                "ID": "rev", "CreateTime": 0, "Size": encrypted.len(), "State": 1,
+                "ManifestSignature": null, "SignatureEmail": null, "XAttr": null,
+                "Thumbnails": [],
+                "Blocks": [{
+                    "Index": 1,
+                    "Hash": hex::encode(sha2::Sha256::digest(encrypted)),
+                    "BareURL": format!("{url}blob/fresh"),
+                    "Token": "fresh",
+                }],
+            },
+        });
+        answer("200 OK", body.to_string().as_bytes())
+    }
+
+    const OLD_BLOB: &str = "GET /blob/old HTTP/1.1";
+    const FRESH_BLOB: &str = "GET /blob/fresh HTTP/1.1";
+    const TARGET_REFRESH: &str = "GET /drive/v2/volumes/volume/files/file/revisions/rev?FromBlockIndex=1&PageSize=1&NoBlockUrls=0 HTTP/1.1";
+
+    /// A block whose transfer is cut off is fetched once more and read
+    /// (R6); the fork alone failed at once.
+    #[tokio::test]
+    async fn a_block_cut_off_on_the_way_is_fetched_once_more() {
+        let (read, requests) =
+            read_one_block(|_, encrypted| vec![cut(encrypted), answer("200 OK", encrypted)]).await;
+        assert!(read.is_ok(), "{read:?}");
+        assert_eq!(requests, [OLD_BLOB, OLD_BLOB]);
+    }
+
+    /// A second cut is a failed read (`Transient`, EIO), after two
+    /// requests, not more.
+    #[tokio::test]
+    async fn a_block_cut_off_twice_fails() {
+        let (read, requests) = read_one_block(|_, encrypted| {
+            vec![cut(encrypted), cut(encrypted), answer("200 OK", encrypted)]
+        })
+        .await;
+        assert!(matches!(read, Err(BackendError::Transient(_))), "{read:?}");
+        assert_eq!(requests, [OLD_BLOB, OLD_BLOB]);
+    }
+
+    /// An expired target (404) is refreshed through the revision's block
+    /// listing and the block read from the fresh one (the fork's refresh,
+    /// P2), within one read of the adapter.
+    #[tokio::test]
+    async fn an_expired_block_target_is_refreshed_and_read() {
+        let (read, requests) = read_one_block(|url, encrypted| {
+            vec![
+                answer("404 Not Found", br#"{"Code":2501,"Error":"Expired"}"#),
+                fresh_target(url, encrypted),
+                answer("200 OK", encrypted),
+            ]
+        })
+        .await;
+        assert!(read.is_ok(), "{read:?}");
+        assert_eq!(requests, [OLD_BLOB, TARGET_REFRESH, FRESH_BLOB]);
+    }
+
+    /// A fresh target that is missing too is an integrity error (EIO, the
+    /// block not cached), with no further request.
+    #[tokio::test]
+    async fn a_block_missing_after_its_refresh_fails() {
+        let (read, requests) = read_one_block(|url, encrypted| {
+            vec![
+                answer("404 Not Found", b""),
+                fresh_target(url, encrypted),
+                answer("404 Not Found", b""),
+                answer("200 OK", encrypted),
+            ]
+        })
+        .await;
+        assert!(matches!(read, Err(BackendError::Integrity(_))), "{read:?}");
+        assert_eq!(requests, [OLD_BLOB, TARGET_REFRESH, FRESH_BLOB]);
+    }
+
     /// Sessions made offline, for the clients' bookkeeping.
     mod offline {
         use super::*;
@@ -2368,6 +3489,27 @@ mod tests {
         use proton_drive_sdk::proton_sdk_rs2::{
             AppVersionConfiguration, PasswordMode, SessionId, UserId,
         };
+
+        /// A session whose API is the local server at `base` (its block
+        /// listing for a refreshed target, say), never Proton's.
+        pub fn session_at(id: &str, base: &str) -> ProtonAPISession {
+            ProtonAPISession::resume_with_options(
+                SessionId::new(id.to_owned()),
+                "user",
+                UserId::new("user-id".to_owned()),
+                "access".to_owned(),
+                "refresh".to_owned(),
+                Vec::new(),
+                false,
+                PasswordMode::Single,
+                AppVersionConfiguration::new("pdmount-test", 0, 0, 1),
+                Arc::new(InMemoryCacheRepository::new()),
+                proton_drive_sdk::proton_sdk_rs2::client::ProtonClientOptions {
+                    base_url: Some(base.parse().expect("uri")),
+                    ..Default::default()
+                },
+            )
+        }
 
         /// A session with id `id` that never reaches a server.
         pub fn session(id: &str) -> ProtonAPISession {

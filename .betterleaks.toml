@@ -1,7 +1,7 @@
 # Exemptions for the publishing scan: generic paths only, never private values (D090).
 [[allowlists]]
-description = "Made-up home directory in unit tests"
-regexes = ['''/home/(?:u|user)\b''']
+description = "Made-up home directories in unit tests and docs (a longer name is scanned, M6.0.3 V-14)"
+regexes = ['''/home/(?:u|user)(?:[^/\w.-]|$)''']
 
 [[allowlists]]
 description = "PdMount's files and default mountpoints on the target system"
@@ -41,12 +41,21 @@ regexes = [
 ]
 
 [[allowlists]]
-description = "GitHub's runner home"
-regexes = ['''/home/runner\b''']
+description = "GitHub's runner home (a longer name is scanned, M6.0.3 V-14)"
+regexes = ['''/home/runner(?:[^/\w.-]|$)''']
 
 [[allowlists]]
-description = "Example mountpoints and placeholder directories in docs and tests, and the M5.6 script's own folder"
+description = "Example mountpoints and placeholder directories in docs and tests, and the M5.6 and M6 scripts' own folders"
 regexes = [
-  '''(?:~|\$HOME)/(?:a|b|x|y|pd|Photos|ProtonPhotos|Shared(?:/Team)?|Other|Alone|Home)\b''',
-  '''(?:~|\$HOME)/PdMount-(?:m56\b|\$profile\b|%s)''',
+  '''(?:~|\$HOME)/(?:a(?:/b)?|b|p|r|s|x|y|pd|Photos|ProtonPhotos|Shared(?:/Team(?:/plan\b)?)?|Other|Alone|Home)(?:[^/\w.-]|$)''',
+  '''(?:~|\$HOME)/PdMount-(?:m56\b|m6\b|\$profile\b|%s)''',
+]
+
+[[allowlists]]
+description = "The made-up example strings that the M6.0.3 security review (C1-7) quotes, in that report and in this file only"
+condition = "AND"
+paths = ['''^docs/security/2026-11-18-review/area1\.md$''', '''^\.betterleaks\.toml$''']
+regexes = [
+  '''/home/(?:user\.name|user-backup|runner-x)(?:[^/\w.-]|$)''',
+  '''~/(?:pd/<key|Photos/<real|a-private-project/notes|Other/clients/<name>/contract(?:\.pdf)?)(?:[^/\w.-]|$)''',
 ]

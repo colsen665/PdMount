@@ -253,3 +253,46 @@ async fn scan_blocks_stay_within_their_share_and_spare_the_working_set() {
     assert_eq!(guard.held(), held - disk);
     engine.release_file(early);
 }
+
+/// A read a user waits on is reported once it waited long, with the file's
+/// name and size, and its end after its bytes came (D137); a read from the
+/// cache and a scan read are not.
+#[tokio::test]
+async fn a_long_wait_for_blocks_is_reported_unless_cached_or_a_scan() {
+    use crate::slow::SlowRead;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (backend, engine, inos) = scan_drive(dir.path(), 3, 64, 16, |scan| scan.opens = 2).await;
+    let slow = engine.scan_guard().slow_reads();
+    slow.set_after(Duration::from_millis(100));
+    let mut events = slow.subscribe();
+    backend.set_latency(Duration::from_millis(400));
+
+    let (handle, _) = engine.open_file(inos[0], READ).expect("open");
+    engine.read(handle, 0, 16).await.expect("read");
+    let began = events.try_recv().expect("reported");
+    let SlowRead::Began {
+        wait, name, size, ..
+    } = began
+    else {
+        panic!("not a begin: {began:?}");
+    };
+    assert_eq!((name.as_str(), size), ("f000", 64));
+    assert_eq!(events.try_recv().expect("ended"), SlowRead::Ended { wait });
+
+    // The same block again, from the cache: not slow.
+    engine.read(handle, 0, 16).await.expect("read");
+    assert!(events.try_recv().is_err(), "a cached read was reported");
+    engine.release_file(handle);
+
+    // An internal read (`.pdignore`'s) waits as long, unreported.
+    let cold = engine.read_whole(inos[1], 64).await.expect("read_whole");
+    assert_eq!(cold.len(), 64);
+    assert!(events.try_recv().is_err(), "an internal read was reported");
+
+    // A scan (two opens at once): its reads wait as long, unreported.
+    let (_first, _) = engine.open_file(inos[1], READ).expect("open");
+    let (scanned, _) = engine.open_file(inos[2], READ).expect("open");
+    assert!(engine.file(scanned).expect("handle").scan);
+    engine.read(scanned, 0, 16).await.expect("read");
+    assert!(events.try_recv().is_err(), "a scan read was reported");
+}

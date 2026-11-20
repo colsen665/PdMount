@@ -80,6 +80,8 @@
 //!   ([`crate::scan`], D111): classing opens and reads, waits of
 //!   interactive requests, the turns of scan reads.
 //! - `rights.rs`: write access a tree can lose (a share's role, D114).
+//! - `signatures.rs`: nodes whose signatures do not verify (D132): the
+//!   refusals, `signatures list`, `accept` and `check`.
 //! - `orphan.rs`: exporting the queued changes of a tree that goes away.
 //! - `marker.rs`, `pins.rs`, `queue.rs`, `surface.rs`: markers, pins, queue
 //!   tooling, conflict and xattr views (existing). `tests.rs` and
@@ -94,7 +96,7 @@ use crate::cache::{
 use crate::config::AccessMode;
 use crate::conflicts::{
     Clock, Conflict, ConflictKind, ConflictNote, ConflictNotice, ConflictState, Conflicts, Namer,
-    store_conflict, store_state,
+    store_conflict, store_notified, store_state,
 };
 use crate::device::DeviceIdentity;
 use crate::errors::{CoreError, Result};
@@ -262,9 +264,8 @@ struct DirHandles {
 struct OpenFile {
     ino: Ino,
     writable: bool,
-    /// End of the previous read, for sequential detection.
-    last_end: u64,
-    sequential_reads: u32,
+    /// Its reads in order, for readahead (§5.3).
+    sequential: crate::readahead::Sequential,
     /// Opened during a scan (D111): its first `scan.first_bytes` are scan
     /// reads.
     scan: bool,
@@ -336,6 +337,8 @@ pub struct Engine {
     conflicts: lock_order::Mutex<Conflicts>,
     /// Newly registered conflicts, for the notification hook.
     notices: tokio::sync::broadcast::Sender<ConflictNotice>,
+    /// Nodes whose signatures do not verify, and the tree's mode (D132).
+    pub(crate) signatures: crate::signatures::Signatures,
     /// The session's background turns (D027), from `limits`.
     pub(crate) gate: Arc<Gate>,
     /// The session's transfer limits, shared by every tree (D110).
@@ -352,6 +355,9 @@ pub struct Engine {
     pub(crate) refresh: parking_lot::Mutex<crate::events::RefreshState>,
     /// When the event stream was last read to its end.
     pub(crate) last_poll: parking_lot::Mutex<Option<std::time::Instant>>,
+    /// The event page that failed for every tree with a non-transient
+    /// error, by its cursor, and how often in a row (§9.2, M6.0.3 V-3).
+    pub(crate) stuck_page: parking_lot::Mutex<Option<(EventId, u32)>>,
     /// `mount -o ro`.
     read_only: bool,
     /// The write gate (D080, D110): open, writes follow the access rules;
@@ -401,11 +407,13 @@ pub mod queue;
 pub mod rights;
 mod scan;
 mod shutdown;
+mod signatures;
 mod staging;
 mod surface;
 #[cfg(test)]
 mod tests;
 
 pub use open::pending_changes;
+pub use signatures::CheckProgress;
 
 use staging::remove_committed_staging;

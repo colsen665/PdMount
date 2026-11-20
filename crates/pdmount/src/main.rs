@@ -5,11 +5,13 @@ mod auth;
 mod autostart;
 mod bus;
 mod cache;
+mod conflict_notify;
 mod conflicts;
 mod control;
 mod credentials;
 mod daemon;
 mod doctor;
+mod downloads;
 mod flush;
 mod incoming;
 mod keywait;
@@ -18,9 +20,14 @@ mod logind;
 mod logind_stub;
 mod mounts;
 mod notify;
+#[cfg(any(test, feature = "fake-backend"))]
+mod notify_stub;
+mod notify_watch;
 mod pins;
 #[cfg(test)]
 mod probe;
+#[cfg(test)]
+mod probe_parity;
 #[cfg(test)]
 mod probe_roots;
 mod queue;
@@ -29,6 +36,7 @@ mod roots;
 mod secret_cache;
 mod service;
 mod session;
+mod signatures;
 mod stats;
 mod status;
 mod supervise;
@@ -126,6 +134,9 @@ enum Command {
     /// The block cache (while mounted).
     #[command(subcommand)]
     Cache(CacheCommand),
+    /// Files and folders whose signatures do not verify (while mounted).
+    #[command(subcommand)]
+    Signatures(SignaturesCommand),
     /// The account's trash (Proton only, while not mounted).
     #[command(subcommand)]
     Trash(TrashCommand),
@@ -206,6 +217,26 @@ enum FakeCommand {
         path: String,
         dir: std::path::PathBuf,
     },
+    /// Make one signature of a node one that does not verify, as if a
+    /// stranger had signed it (D132), or with `--clear` one that does. The
+    /// daemons see it at their next event poll.
+    Unverified {
+        /// `name`, `key` or `content-key`.
+        #[arg(long)]
+        part: String,
+        /// The signer it claims; default: anonymous.
+        #[arg(long)]
+        signer: Option<String>,
+        #[arg(long)]
+        clear: bool,
+        /// The node's path in My Files (`/a/b`).
+        #[arg(long, conflicts_with = "photo", required_unless_present = "photo")]
+        path: Option<String>,
+        /// A photo, by its name.
+        #[arg(long)]
+        photo: Option<String>,
+        dir: std::path::PathBuf,
+    },
     /// Make calls of running daemons on this fake fail, or stop doing so.
     #[command(subcommand)]
     Fault(FaultCommand),
@@ -217,6 +248,10 @@ enum FakeCommand {
     /// names (scenario X11).
     #[command(subcommand)]
     Logind(LogindCommand),
+    /// A stand-in for a notification server on the bus that
+    /// `DBUS_SESSION_BUS_ADDRESS` names (scenarios X4, X11-X13, X16).
+    #[command(subcommand)]
+    Notifications(NotificationsCommand),
     /// Add a root folder without a parent (M5.10): on the drive's own
     /// volume, or on another user's volume shared with the drive's user.
     /// Prints `<volume> <root link> [<share>]` for a `[[roots.tree]]`.
@@ -342,6 +377,54 @@ enum LogindCommand {
 }
 
 #[cfg(feature = "fake-backend")]
+#[derive(Debug, Subcommand)]
+enum NotificationsCommand {
+    /// Own `org.freedesktop.Notifications` and log every call, until killed.
+    Serve {
+        /// Where to log, one JSON line per event (appended).
+        #[arg(long)]
+        log: std::path::PathBuf,
+        /// The bus to serve on; default: `DBUS_SESSION_BUS_ADDRESS`.
+        #[arg(long)]
+        bus: Option<String>,
+        /// A server without the `actions` capability.
+        #[arg(long)]
+        no_actions: bool,
+        /// A server without the `body-markup` capability.
+        #[arg(long)]
+        no_markup: bool,
+        /// Wait this many milliseconds before each `Notify` answers.
+        #[arg(long, default_value_t = 0)]
+        delay_ms: u64,
+    },
+    /// Make the stub send `ActionInvoked` (with `--action`) or
+    /// `NotificationClosed` for a notification id.
+    Invoke {
+        #[arg(long)]
+        id: u32,
+        /// The action key; without it `NotificationClosed` is sent.
+        #[arg(long)]
+        action: Option<String>,
+        /// The reason of `NotificationClosed` (2: dismissed by the user).
+        #[arg(long, default_value_t = 2)]
+        reason: u32,
+        /// The bus the stub serves on; default: `DBUS_SESSION_BUS_ADDRESS`.
+        #[arg(long)]
+        bus: Option<String>,
+    },
+    /// Own `org.freedesktop.FileManager1` and log every `ShowItems` and
+    /// `ShowFolders`, until killed (the **Show** of a conflict, M6.2).
+    FileManager {
+        /// Where to log, one JSON line per call (appended).
+        #[arg(long)]
+        log: std::path::PathBuf,
+        /// The bus to serve on; default: `DBUS_SESSION_BUS_ADDRESS`.
+        #[arg(long)]
+        bus: Option<String>,
+    },
+}
+
+#[cfg(feature = "fake-backend")]
 #[derive(Debug, clap::Args)]
 #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 struct ProfileArgs {
@@ -375,6 +458,8 @@ enum FaultCommand {
     Offline(FaultArgs),
     /// Calls fail as if the session had expired.
     Unauthorized(FaultArgs),
+    /// Node fetches fail as if a node could not be decrypted (not transient).
+    BrokenNodes(FaultArgs),
     /// Remove the rules (of one client, or all).
     Clear {
         /// Client UID (`pdmount-<device id>`, see `pdmount status`).
@@ -461,6 +546,29 @@ enum AccessCommand {
     Effective {
         /// Absolute inside the mountpoint, or relative to the mount root.
         path: std::path::PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SignaturesCommand {
+    /// Show the nodes of every tree whose signatures do not verify.
+    List {
+        /// One JSON array.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Open a refused node on this device, while its signatures stay as
+    /// they are now.
+    Accept {
+        /// The id `signatures list` shows.
+        id: String,
+    },
+    /// List every folder from the server and check every node in it: of
+    /// a path in My Files, or of every tree. A long run of listing requests
+    /// on a large drive.
+    Check {
+        /// Absolute inside the mountpoint, or relative to the mount root.
+        path: Option<std::path::PathBuf>,
     },
 }
 
@@ -585,9 +693,11 @@ enum CacheCommand {
         #[arg(long)]
         target: Option<pdmount_core::units::ByteSize>,
     },
-    /// Evict every block that may go, or only those of files at or below a path.
+    /// Evict every block that may go in every mount's cache (My Files, Photos,
+    /// shares), or only those of files at or below a path.
     Wipe {
-        /// Absolute inside the mountpoint, or relative to the mount root.
+        /// Absolute inside any mount (My Files, Photos, a share), or relative
+        /// to My Files' mount root.
         path: Option<std::path::PathBuf>,
     },
 }
@@ -823,14 +933,16 @@ async fn fake_command(command: FakeCommand) -> anyhow::Result<ExitCode> {
             owner,
             dir,
         } => {
-            let mut fake = FakeBackend::open(&dir)?;
+            // The client first: `with_client` replaces the whole client, the
+            // tree included, which `tree` then sets on it.
+            let mut fake =
+                FakeBackend::open(&dir)?.with_client(pdmount_backend::fake::FakeClient {
+                    user: owner,
+                    ..fake_client(app)
+                });
             if let (Some(root), Some(volume)) = (&root, &volume) {
                 fake = fake.tree(volume, pdmount_backend::LinkId::new(root.as_str()));
             }
-            let fake = fake.with_client(pdmount_backend::fake::FakeClient {
-                user: owner,
-                ..fake_client(app)
-            });
             let (parent, name) = path.rsplit_once('/').unwrap_or(("", path.as_str()));
             let parent = fake_resolve(&fake, parent).await?;
             let data = anyhow::Context::with_context(std::fs::read(&from), || {
@@ -844,6 +956,26 @@ async fn fake_command(command: FakeCommand) -> anyhow::Result<ExitCode> {
             };
             let source = pdmount_backend::UploadSource::Bytes(data.into());
             fake.upload_new(&parent, name, source, meta).await?;
+        }
+        FakeCommand::Unverified {
+            part,
+            signer,
+            clear,
+            path,
+            photo,
+            dir,
+        } => {
+            let part = pdmount_backend::SignaturePart::parse(&part)
+                .ok_or_else(|| anyhow::anyhow!("--part is name, key or content-key"))?;
+            let fake = FakeBackend::open(&dir)?;
+            let link = match (path, photo) {
+                (Some(path), _) => fake_resolve(&fake, &path).await?,
+                (None, Some(name)) => fake
+                    .photo_named(&name)
+                    .ok_or_else(|| anyhow::anyhow!("no photo named {name}"))?,
+                (None, None) => anyhow::bail!("give --path or --photo"),
+            };
+            fake.set_unverified(&link, part, !clear, signer.as_deref())?;
         }
         FakeCommand::Mkdir { path, dir } => {
             let fake = FakeBackend::open(&dir)?;
@@ -909,6 +1041,30 @@ async fn fake_command(command: FakeCommand) -> anyhow::Result<ExitCode> {
         }
         FakeCommand::Logind(LogindCommand::Prepare { active }) => {
             logind_stub::prepare(active).await?
+        }
+        FakeCommand::Notifications(NotificationsCommand::Serve {
+            log,
+            bus,
+            no_actions,
+            no_markup,
+            delay_ms,
+        }) => {
+            let options = notify_stub::Options {
+                no_actions,
+                no_markup,
+                delay: std::time::Duration::from_millis(delay_ms),
+                ..Default::default()
+            };
+            notify_stub::serve(bus, log, options).await?
+        }
+        FakeCommand::Notifications(NotificationsCommand::Invoke {
+            id,
+            action,
+            reason,
+            bus,
+        }) => notify_stub::emit(bus, id, action, reason).await?,
+        FakeCommand::Notifications(NotificationsCommand::FileManager { log, bus }) => {
+            notify_stub::serve_file_manager(bus, log).await?
         }
         FakeCommand::Changes { after, dir } => {
             for (seq, change) in FakeBackend::open(&dir)?.changes_since(after) {
@@ -1062,6 +1218,7 @@ fn fake_fault(command: FaultCommand) -> anyhow::Result<()> {
     match command {
         FaultCommand::Offline(args) => rule(FaultKind::Offline, args)?,
         FaultCommand::Unauthorized(args) => rule(FaultKind::Unauthorized, args)?,
+        FaultCommand::BrokenNodes(args) => rule(FaultKind::BrokenNodes, args)?,
         FaultCommand::Clear { client, dir } => clear_faults(&dir, client.as_deref())?,
     }
     Ok(())
@@ -1246,6 +1403,18 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 }
             }
         }
+        Command::Signatures(command) => match command {
+            SignaturesCommand::List { json } => signatures::list(&paths, json).await,
+            SignaturesCommand::Accept { id } => signatures::accept(&paths, id).await,
+            SignaturesCommand::Check { path } => {
+                let config = Config::load(&paths.config_file())?;
+                let mountpoint = daemon::existing_mountpoint(&paths, &config, &home_dir()?, None);
+                let path = path
+                    .map(|p| access::mount_relative(&p, &mountpoint))
+                    .transpose()?;
+                signatures::check(&paths, path).await
+            }
+        },
         Command::Conflicts(command) => {
             let config = Config::load(&paths.config_file())?;
             let mountpoint = daemon::existing_mountpoint(&paths, &config, &home_dir()?, None);
@@ -1338,10 +1507,20 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             CacheCommand::Wipe { path } => {
                 let config = Config::load(&paths.config_file())?;
                 let mountpoint = daemon::existing_mountpoint(&paths, &config, &home_dir()?, None);
-                let path = path
-                    .map(|p| access::mount_relative(&p, &mountpoint))
-                    .transpose()?;
-                cache::wipe(&paths, path).await
+                // An absolute path may be in any mount, which the daemon
+                // knows; a relative one is My Files' (M6.0.10).
+                let absolute = path.as_ref().is_some_and(|path| path.is_absolute());
+                let path = match path {
+                    Some(path) if absolute => Some(
+                        std::path::absolute(&path)?
+                            .to_str()
+                            .ok_or_else(|| anyhow::anyhow!("the path is not valid UTF-8"))?
+                            .to_owned(),
+                    ),
+                    Some(path) => Some(access::mount_relative(&path, &mountpoint)?),
+                    None => None,
+                };
+                cache::wipe(&paths, path, absolute).await
             }
         },
         Command::Doctor => {

@@ -35,6 +35,8 @@ const MIGRATIONS: &[&str] = &[
     include_str!("0002.sql"),
     include_str!("0003.sql"),
     include_str!("0004.sql"),
+    include_str!("0005.sql"),
+    include_str!("0006.sql"),
 ];
 /// The sync thread checkpoints the WAL once no commit came for
 /// [`CHECKPOINT_IDLE`], or after [`CHECKPOINT_WRITES`] writes under steady
@@ -128,8 +130,9 @@ impl Store {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "wal_autocheckpoint", 0)?;
         conn.pragma_update(None, "foreign_keys", "OFF")?;
-        // The writes' `prepare_cached` statements (`rows.rs`, `cache/`: 10)
-        // fit SQLite's default statement cache of 16 per connection.
+        // The writes' `prepare_cached` statements (`rows.rs`, `cache/`, the
+        // journal's, the Photos rows': 18) fit the statement cache.
+        conn.set_prepared_statement_cache_capacity(32);
         migrate(&mut conn, path)?;
 
         let reader = Connection::open(path)?;
@@ -865,7 +868,7 @@ mod tests {
                 Ok((version, detail, other, indexes))
             })
             .expect("read");
-        assert_eq!((version, detail, other, indexes), (4, None, None, 1));
+        assert_eq!((version, detail, other, indexes), (6, None, None, 1));
     }
 
     #[test]
@@ -889,7 +892,79 @@ mod tests {
                 ))
             })
             .expect("read");
-        assert_eq!((version, rows), (4, 1));
+        assert_eq!((version, rows), (6, 1));
+    }
+
+    #[test]
+    fn migration_0005_adds_the_found_signatures() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).expect("open");
+        for sql in &MIGRATIONS[..4] {
+            conn.execute_batch(sql).expect("migration");
+        }
+        conn.pragma_update(None, "user_version", 4)
+            .expect("version");
+        conn.execute("INSERT INTO queued VALUES (5, 1000)", [])
+            .expect("old row");
+        drop(conn);
+        let store = Store::open(&path).expect("migrate");
+        let (version, queued, found): (i64, i64, i64) = store
+            .read(|conn| {
+                conn.execute(
+                    "INSERT INTO signatures(link_id, parts, signer, digest, first_seen)
+                     VALUES ('l', 1, 'anonymous', 'name:00', 1)",
+                    [],
+                )?;
+                Ok((
+                    conn.pragma_query_value(None, "user_version", |row| row.get(0))?,
+                    conn.query_row("SELECT COUNT(*) FROM queued", [], |row| row.get(0))?,
+                    conn.query_row("SELECT COUNT(*) FROM signatures", [], |row| row.get(0))?,
+                ))
+            })
+            .expect("read");
+        assert_eq!((version, queued, found), (6, 1, 1));
+    }
+
+    #[test]
+    fn migration_0006_marks_the_old_conflicts_as_notified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).expect("open");
+        for sql in &MIGRATIONS[..5] {
+            conn.execute_batch(sql).expect("migration");
+        }
+        conn.pragma_update(None, "user_version", 5)
+            .expect("version");
+        conn.execute(
+            "INSERT INTO conflicts(id, kind, ino, orig_name, local_device, created_at, state)
+             VALUES (7, 'edit_edit', 5, 'a', 'dev', 1, 'open')",
+            [],
+        )
+        .expect("old row");
+        drop(conn);
+        let store = Store::open(&path).expect("migrate");
+        let (version, old, new): (i64, Option<i64>, Option<i64>) = store
+            .read(|conn| {
+                conn.execute(
+                    "INSERT INTO conflicts(id, kind, ino, orig_name, local_device, created_at, state)
+                     VALUES (8, 'edit_edit', 6, 'b', 'dev', 2, 'open')",
+                    [],
+                )?;
+                Ok((
+                    conn.pragma_query_value(None, "user_version", |row| row.get(0))?,
+                    conn.query_row("SELECT notified_at FROM conflicts WHERE id = 7", [], |row| {
+                        row.get(0)
+                    })?,
+                    conn.query_row("SELECT notified_at FROM conflicts WHERE id = 8", [], |row| {
+                        row.get(0)
+                    })?,
+                ))
+            })
+            .expect("read");
+        assert_eq!(version, 6);
+        assert!(old.is_some_and(|at| at > 1_700_000_000), "{old:?}");
+        assert_eq!(new, None, "a row made after the migration is unnotified");
     }
 
     #[test]

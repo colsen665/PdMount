@@ -48,6 +48,8 @@ pub struct ScanGuard {
     count: AtomicUsize,
     members: parking_lot::Mutex<HashMap<u64, EvictBlock>>,
     next_seat: AtomicU64,
+    /// Reads a user waits on for long, in every tree (D137).
+    slow: crate::slow::SlowReads,
 }
 
 /// The most recently opened different files, oldest first, at most
@@ -90,6 +92,7 @@ impl ScanGuard {
             count: AtomicUsize::new(0),
             members: parking_lot::Mutex::default(),
             next_seat: AtomicU64::new(1),
+            slow: crate::slow::SlowReads::default(),
         })
     }
 
@@ -130,6 +133,11 @@ impl ScanGuard {
             scan: detector.scanning,
             began: detector.scanning && !was,
         }
+    }
+
+    /// The session's reads a user has waited on for long (D137).
+    pub fn slow_reads(&self) -> &crate::slow::SlowReads {
+        &self.slow
     }
 
     /// Whether a scan runs (as of the last open).

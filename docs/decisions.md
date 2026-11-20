@@ -102,7 +102,7 @@ Rules for this log:
 | D068 | `FUSE_HANDLE_KILLPRIV_V2` is not requested; the kernel keeps asking for `security.capability` | accepted | claude | 2026-10-30 |
 | D069 | The relist queue is kept in the store until each listing succeeds | accepted | claude | 2026-10-29 |
 | D070 | Security threat model and review method (first review, M4.0.1) | accepted | claude | 2026-10-27 |
-| D071 | The sign-in link is never logged or put in a notification (supersedes part of D042) | accepted | claude | 2026-10-27 |
+| D071 | The sign-in link is never logged or put in a notification (supersedes part of D042); amended (M6.0.3 V-2): nor is the session-fork selector, failed polls are retried and an abandoned selector is invalidated | accepted (amended 2026-11-18) | claude | 2026-10-27, 2026-11-18 |
 | D072 | Directory pages stay in the kernel cache while the entries are unchanged | accepted | claude | 2026-10-30 |
 | D073 | Milestones: M5 user services and flush, M6 conflict notifications, M7 upstream and crypto (was M5) | accepted | user | 2026-10-30 |
 | D074 | OpenRC and systemd user services, next to the autostart entry (supersedes part of D059) | accepted | user | 2026-10-30 |
@@ -142,9 +142,9 @@ Rules for this log:
 | D109 | A service start that fails before readiness is final: the OpenRC script stops its supervisor, the systemd unit does not restart on the start-failure exit code; a crash after readiness is still restarted (finding 5; amends D094) | merged into D094 | user | 2026-11-14 |
 | D110 | Further trees: one engine per tree with its own state under `trees/<key>/`, one profile-wide disk cap and one set of session limits, a router only for mounts with several trees, a write gate beside the access rules, one poller per volume with per-tree cursors, `[[roots]]` with a test-only kind; roots mount in the background after the readiness report (or a keyring wait), per-mount states so `status` never waits, an outside or forced unmount is noticed, dead mounts cleared; the stop drains and stops all mounts at once, a second signal hurries it; a gone share's engine retired, its cleanup tracked, a removed tree answers ENOENT/EIO, `reset --orphan-trees`; the session's gate queues turns only, the event sync's turns wait for users at most 2 s, turns hold metadata only (pins' blocks and thumbnails on the prefetch slot); the refresh task is a background task that ends when the root is gone | accepted | user | 2026-11-14 |
 | D111 | Bulk-read guard: one per session over all trees; 10 different files opened within 5 s begin a scan, an open after which at most one was opened within the window ends it; the first 8 MiB read through a handle opened during a scan are scan reads: one download at a time over the session, starts 100 ms apart, none while a user's request is in flight, at most 20 s of waiting, no readahead; a user's read of the same block raises it to interactive; scan blocks fill at most 10 % of the disk cap, the oldest evicted first, and are forgotten when they leave the disk or another read downloads them; `[scan]` keys | accepted | user | 2026-11-15 |
-| D112 | Shared-with-me: one tree per share from the listing, read at the mount and on the core stream's `DriveShareRefresh`; other users' volumes polled every 10 min, 30 s for the share in use (amends D080); a shown name stays with its share, later or renamed shares get `<name> (<owner>)`, kept in `shared-names.json`; shared files in `Shared files`; trees in never-reused slots; a share goes on the listing or its root's first "not found" (degraded is not absent); at most 32 shares | accepted | user | 2026-11-13 |
+| D112 | Shared-with-me: one tree per share from the listing, read at the mount and on the core stream's `DriveShareRefresh`; other users' volumes polled every 10 min, 30 s for the share in use until 5 min without a use (amends D080); a shown name stays with its share, later or renamed shares get `<name> (<owner>)`, kept in `shared-names.json`; shared files in `Shared files`; trees in never-reused slots; a share goes on the listing or its root's first "not found" (degraded is not absent); at most 32 shares | accepted (amended 2026-11-19) | user | 2026-11-13, 2026-11-19 |
 | D113 | Photos: a read-only tree that is not an engine (`ReadOnlyTree`, `RoFs`) on the session's gate and bulk-read guard; folders in stages (timeline in PdMount's own types, read to its real end; names when a month is opened, in batches of 50, a user's request fetching its batch; events with a cursor that always moves and `pending`); its own `photos` table; Live Photos' videos beside their photo. Backends: degraded is not absent (`get_nodes_checked`, `shared_listing`), one session per Photos call, tasks restarted after a panic | accepted | user | 2026-11-15 |
-| D114 | Writes in shares: the gate follows the listing's role; a lost right or a refusal holds the queue; a share takes only the profile's `.pdignore`, never its own `/.pdignore`; a gone share's queued changes and local-only files go to `orphaned/`, its state purged only when all were exported; the marker per root, nameless in shares; `TARGET=share` for the scenarios | accepted | user | 2026-11-15 |
+| D114 | Writes in shares: the gate follows the listing's role; a lost right or a refusal holds the queue; a share takes only the profile's `.pdignore`, never its own `/.pdignore`; a gone share's queued changes and staged content not uploaded (local-only files, edits in a local-only folder) go to `orphaned/`, its state purged only when all were exported; the marker per root, nameless in shares; `TARGET=share` for the scenarios | accepted (amended 2026-11-18) | user | 2026-11-15, 2026-11-18 |
 | D115 | Photos' stored thumbnails: only Proton's 512 px WebP, as PNG, never the 1920 px preview (amends D081); PdMount checks each against its revision's signed manifest (the SDK's `enumerate_thumbnails` checks nothing), a listing per photo on the session's gate, `normal`/`large`/`x-large` scaled down, GLib's URI escaping, files kept while their URI and mtime match, notes per session; every WebP frame's size read from its own header and checked before decoding | accepted | user | 2026-11-13 |
 | D116 | Journal waits: a folder's trash that waits for a child depends on the child's entry instead of a doubling back-off; a dependency made only by a wait that leaves at once wakes nothing; waits are counted apart from failed attempts and keep a change made meanwhile; a deleted folder whose child went into a local-only folder is kept; cycles of nodes waiting for each other's places are broken through `.pdmount-swap-<ino>`, a node found at its own swap name is its own move aside whose reply was lost (V-7); a moved-aside tombstone keeps its name in `queue`; a hold covers entries made while it lasts and keeps other park reasons | accepted | user | 2026-11-15 |
 | D117 | Cycles of nodes waiting for each other's places are broken through `.pdmount-swap-<ino>`: a node with a remote place whose dependencies lead back to it moves there first (any length, not only a swap of two); a folder whose trash waits while a local node is placed at its remote name moves there first and is trashed under it. Amended (M5.8, V-7): a node found at its own `.pdmount-swap-<ino>` in its known folder is its own move aside whose reply was lost; only its remote state takes that name, never its local one | merged into D116 | user | 2026-11-15, 2026-11-16 |
@@ -160,6 +160,18 @@ Rules for this log:
 | D127 | A pdmount mount is stale only when dead (`statfs` answers ENOTCONN); another profile's live mount is never detached and refuses `--clear-stale`, `--if-stale`, `mount` and `unmount`; mounts are `fsname=pdmount:<profile>`; `service install` refuses and `doctor` warns when profiles share a mountpoint (V-6) | merged into D093 | user | 2026-11-17 |
 | D128 | A clean file removed remotely (trash, a move it cannot follow) and then written or truncated through a handle opened before comes back as a new local node with its removed folders still in memory, under its old name or a conflict name, into the root if its folder is no longer known; `RemoteDeleteLocalEdit` recorded; a locally unlinked file stays gone | accepted | user | 2026-11-17 |
 | D129 | At a milestone's publication its commits become one commit (D090) and its decisions are consolidated: amendments folded in, related entries merged under one ID, `merged into Dnnn` stubs for the rest | accepted | user | 2026-11-17 |
+| D130 | Security review V-3 (M6.0.3): an event page that every tree fails with a non-transient error is given up at its third failure, every tree of the volume refreshing from a fresh cursor; in the fork's P13 batch a node under an undecryptable parent is degraded, not a failure of the batch | accepted | user | 2026-11-19 |
+| D132 | Nodes that do not decrypt or verify (fork P26, P27, M6.0.6): a listing names its degraded children apart; a known one keeps its entry, an unknown one is not shown, and a folder deleted locally whose remote copy holds one is kept; a node whose signatures do not verify is found when decoded, kept in a `signatures` table (schema 5) with a digest per failed part, and refused (EACCES for opening, changing, renaming, moving, deleting; nothing created or moved into a folder whose key failed) in My Files, Photos and own test roots until `pdmount signatures accept <id>`, only reported in shares (`signatures = "refuse" \| "warn"` per root); `signatures list`, `signatures check`, a notification per tree at most every 10 min, a `status` line | accepted | user | 2026-11-19 |
+| D133 | Crypto time (M6.0.7, V-8, V-9): every signature is verified at server time, as keys and signatures are made (fork P29); the offset comes from the Drive API host only, the first within a day, a change of more than a minute after a second answer (P19 amended); `doctor`'s clock line shows the mount's offset | accepted | user | 2026-11-19 |
+| D134 | Choices D132 left open for unverified signatures (M6.0.6): the digest per failed part over its claimed signer and the name or the link; an accept covers the same failures or fewer; found nodes in a `signatures` table beside the `remote` rows; ids from the link's hash; a folder's open, chmod, truncate and utimes refused too, and a rename within a folder whose key failed; test roots by volume; `check` through the tree, path in My Files only | merged into D132 | claude | 2026-11-19 |
+| D135 | Large-file reads (M6.0.11): block lists read by range, in pages of 20 (the JS SDK's), the layout from the claimed block sizes, a listed target kept 10 min and listed again with its page alone; the manifest still verified before a block is given, its other pages listed beside the first download; a video's thumbnail checked as the official clients check one; readahead only once reads in order cross into the next block, and for Photos too, on the session's readahead permits | accepted | user | 2026-11-19 |
+| D136 | `cache wipe` reaches every mount (M6.0.10): no path wipes every tree's cache; a relative path is My Files', an absolute one is resolved by the mount it is in (My Files, Photos, a share); the reply names what each tree freed. Amends D110's "path commands reach My Files only" for this command | accepted | user | 2026-11-20 |
+| D137 | A slow-download notification (M6.4): after a user's read has waited 5 s for a file's blocks, a notification names the file and its size; one per file per 10 min, summed beyond three per 30 s, closed when the wait ends; `notify.downloads` (default `true`) turns it off | accepted | user | 2026-11-20 |
+| D138 | The notification client (M6.1): zbus on a runtime of its own, one connection per bus, capabilities per connection and again when the service changes owner (M6.5 V-4), handles of bus and id, `notify-send` removed, stub server `pdmount fake notifications` for the scenarios | accepted | user | 2026-11-20 |
+| D139 | Conflict notifications (M6.2): one announcer per daemon (three per 30 s for the profile, `notify::Burst`), conflicts looked up when sent and only while `open`, path and plain words per kind; one rule for names in notifications (`clean_name`: control, bidirectional and invisible characters, blanks that are letters, slash look-alikes); **Show** by `FileManager1.ShowItems`, `xdg-open` on the folder only on the bus's error reply (absolute `PATH` directories, in `/`, without `NOTIFY_SOCKET`), once per notification; notified when the server took it (M6.5 V-2, V-3, V-6, V-8, V-9) | accepted | user | 2026-11-20 |
+| D140 | Conflicts missed while no desktop ran (M6.3): `conflicts.notified_at` (store schema 6, old rows migrate as notified), set when the service took the notification; unshown `open` conflicts of every tree go out when the daemon starts or the notification service or its bus appears (`NameOwnerChanged`, a bus tried again every 60 s), up to three on their own, more in one summary; with `notify.conflicts = false` they are marked without a notification | accepted | user | 2026-11-20 |
+| D141 | The M6 notifications after their security review (M6.5): **Show** opens the folder through `xdg-open` only on the bus's error reply, never after a lost connection or a timeout, and once per notification; capabilities asked again when the service changes owner; `clean_name` also replaces invisible characters, blanks that are letters and slash look-alikes; `xdg-open` from an absolute `PATH` directory, in `/`, without `NOTIFY_SOCKET`; the desktop checks by hand as X21 | merged into D138 (capabilities), D139 (**Show**, `clean_name`, `xdg-open`) and D142 (X21) | claude | 2026-11-20 |
+| D142 | M6's checks by hand on GNOME and KDE (X21, `scripts/repro/m6-desktop.sh` on a fake drive, its steps tested by `m6desktop.sh`) not run: the user accepts the risk (no machine to install on); the stubs on private buses (X6, X20) are M6's evidence, the script kept for a later check | accepted | user | 2026-11-20 |
 
 ---
 
@@ -1724,7 +1736,18 @@ Rules for this log:
   reports); a D-Bus notification library to keep the link out of argv (a dependency, and the log question remains).
 - **Consequences:** A user who sees the notification runs one command to get the link; a headless service user reads
   `pdmount status` instead of the log.
+- **Amended 2026-11-18 by claude for M6.0.3 V-2, a fix the user chose:** the session-fork selector, which alone collects
+  a completed sign-in's tokens, is kept out of logs and error texts as the link is. A failed poll's error named the
+  request URL, which ends with the selector, and the daemon logged it, kept it as `sign_in_error` and `login` printed it.
+  - The SDK fork (P16) names the path template `auth/v4/sessions/forks/<selector>` in a poll's errors, never the URL.
+  - A poll that fails in transport, takes over 30 s, or answers 408, 429 or 5xx is retried at the 5 s interval (after
+    `Retry-After` when longer) until the 10 min limit, instead of ending the sign-in.
+  - A sign-in that ends without a session (timeout, any other error) invalidates the selector on the server
+    (`DELETE auth/v4/sessions/forks/<selector>`), best effort, so no abandoned fork stays collectable.
+  - PdMount redacts `/sessions/forks/<segment>` to `/sessions/forks/<redacted>` in the sign-in error before it is
+    logged, kept for `status` or printed by `login`.
 - **Refs:** DESIGN.md §12.2; docs/security/2026-10-27-review/verification.md S-2; docs/plans/m4.md M4.0.2.1; D042. Accepted by user 2026-11-01.
+  Amendment: docs/security/2026-11-18-review/verification.md V-2; docs/sdk-patches.md P16; M6.0.4.2.
 
 ## D072 — Directory pages stay in the kernel cache while the entries are unchanged
 - **Status:** accepted
@@ -2422,6 +2445,13 @@ Rules for this log:
     it is stored, shown or logged. A marker that fails is logged with its device id and not read again until its revision
     changes. A fetch that fails (network, server) is tried again at the next pass, and the revision stays remembered as
     announced meanwhile. The reader loop catches a panic of a pass, logs it and goes on.
+    - **Amended (M6.0.4.17, security review V-12; D126's cap):** "already shown" lived only in memory, empty after a start
+      and cleared when the gate closes, so sixteen planted markers with low ids kept the user's other devices out after
+      every start. The devices whose markers passed the checks are now also kept in the store (`meta.incoming_devices`,
+      oldest known first, at most 64; a store without the key knows none). The cap's order: devices shown at the last
+      pass, then known devices, oldest first, then the rest by id. When the list is full, a new device takes the place of
+      the newest known one not read in that pass, so planted markers in numbers only replace each other; a share member
+      who was known before the user's other device still comes first.
   - **Notifications.** Each marker revision is announced once, remembered in the store (`meta.incoming_notified`, pruned to
     the markers present), so a remount does not repeat it and a new unfinished stop of the same device notifies again. A
     stale marker (over 7 days) is shown in `status` but not announced. The engine sends one notice per tree and pass for the
@@ -2475,6 +2505,7 @@ Rules for this log:
     supervised (C5-5); only the marker reader catches its panics.
 - **Refs:** DESIGN.md §13.2, §14.4, §14.5, §15.3 (X4, X12, X16), App. B; docs/plans/m5.md M5.2, M5.7;
   docs/security/2026-11-15-review/verification.md (V-4, V-8), area1.md (C1-3), area4.md (C4-3, C4-5);
+  docs/security/2026-11-18-review/verification.md (V-12);
   docs/security/threat-model.md; `crates/pdmount-core/src/engine/marker.rs`, `crates/pdmount/src/flush.rs`,
   `crates/pdmount/src/incoming.rs`, `crates/pdmount/src/status.rs`; `tests/scenarios/x12.sh`, `tests/scenarios/x16.sh`;
   D019, D027, D062, D070, D075, D076, D091, D114.
@@ -2484,7 +2515,7 @@ Rules for this log:
 ## D097 — Release archives with cargo-dist, built by GitHub Actions; a quick CI workflow on GitHub; a tag per milestone push
 - **Status:** accepted
 - **Decided by:** user
-- **Date:** 2026-11-12
+- **Date:** 2026-11-12; amended 2026-11-18 by claude for M6.0.3 V-4 and V-15, a fix the user chose
 - **Context:** The only way to install PdMount is `cargo install --path crates/pdmount`, which needs Go, clang, protoc and the
   Rust toolchain. The user asked for one command that makes a `.tar.gz` of the release build, using cargo-dist, and for CI on
   GitHub now that the repository is public. D089 kept hosted CI and Actions off.
@@ -2499,6 +2530,10 @@ Rules for this log:
     `scripts/ci.sh` on demand and weekly, on the fake backend only. Actions are pinned by commit, permissions are read-only
     except the release job's `contents: write`, no secrets beyond `GITHUB_TOKEN`, no `pull_request_target`, never the real
     account (D028, D030).
+  - **Build attestations** (amended 2026-11-18, M6.0.3 V-4, V-15): `github-attestations = true` in `dist-workspace.toml`.
+    The build job attests the archive and runs with `contents: read` (plus `attestations` and `id-token: write`), so
+    build scripts and proc-macros never hold the write token; only dist's `plan`, `build-global-artifacts`, `host` and `announce` jobs keep
+    `contents: write`. A Release is checked with `gh attestation verify` as well as `sha256sum -c`.
   - **Versions and tags:** the workspace version follows the milestone (M5 → 0.5.0); every milestone push to `master`
     (one commit per milestone, D090) gets the tag `v0.<milestone>.0` and so a Release.
   - The local full CI before every push stays (D084); the GitHub CI is in addition to it. Pushing still needs the user's
@@ -2508,7 +2543,8 @@ Rules for this log:
   needs a manual step each time.
 - **Consequences:** cargo-dist, cargo-about, the GitHub runner image and the pinned actions join the build-time supply chain
   (threat model, reviewed in M5.8). The binary needs `libdbus-1` and `fusermount3` at run time and glibc ≥ 2.35. The GitHub
-  repository needs Actions enabled and workflow permissions that let the release job write. Work is planned as M5.15.
+  repository needs Actions enabled; `release.yml` asks for its write permission itself, so the default workflow
+  permissions stay read-only (corrected 2026-11-19; the settings that limit the token are in the threat model). Work is planned as M5.15.
 - **Refs:** docs/plans/m5.md M5.15; DESIGN.md §15.1, §16; D023, D070, D084, D089, D090.
 
 ## D098 — `scripts/ci.sh` runs every step with one scenario root per checkout; multi-task requests follow `docs/multi-task-runs.md`
@@ -3182,9 +3218,9 @@ Rules for this log:
     scan download, scan blocks follow the disk (claude, 2026-11-15, accepted by user 2026-11-15).
 
 ## D112 — Shared-with-me: a tree per share, other volumes' polling, sticky names, trees that come and go, revocation
-- **Status:** accepted
+- **Status:** accepted; amended by the user 2026-11-19 (parity E2, below)
 - **Decided by:** user
-- **Date:** 2026-11-13; consolidated 2026-11-17
+- **Date:** 2026-11-13; consolidated 2026-11-17; amended 2026-11-19
 - **Context:** M5.12 (`docs/plans/m5.md`, "M5.11–M5.13") mounts the shared-with-me listing on the shape of D110. The M5.9
   probe (Outcome) answered what D080 had assumed:
   - New shares, role changes and revocations arrive on the core event stream (`DriveShareRefresh`, polled every 30 s).
@@ -3212,7 +3248,8 @@ Rules for this log:
     the first listing.
   - **Other users' volumes** (amends D080): one poller per volume, every 10 min. The volume of the share last used through
     the mount (a lookup, an open or a listing under it) is polled every 30 s, one volume at a time, as the official
-    client's foreground scope. Each share joins its owner's volume poller.
+    client's foreground scope, until 5 min pass without such a use (amendment below). Each share joins its owner's
+    volume poller.
   - **Trees:** one engine tree per share (D110's unit), its write gate set from the role (D114); at most one `shared` root
     per profile (its trees' state is keyed by volume and root); at most 32 shares opened, oldest first, because each tree
     keeps a 16 MiB RAM pool. The nodes under a share pass the engine's bounds as My Files' do (S-5, S-6: sizes and block
@@ -3286,6 +3323,22 @@ Rules for this log:
   - A share root that cannot be decrypted stays as it was known, possibly stale, until it can be read.
   - Real-account check: that `get_nodes_uncached` reports `direct_role` of share roots as `get_node` did in M5.9, and
     whether a revoked share's volume stream is refused.
+- **Amended (user, 2026-11-19, parity E2, M6.0.8):** the volume in use goes back to 10 min after a quiet period of
+  5 min without a use (`pdmount_core::poller::QUIET_PERIOD`), as the official scheduler's `setBackground` does when a
+  share's view is left. Before, nothing sent it back: the last share touched, by a person or once by an indexer, polled
+  every 30 s until the daemon stopped. A use after the quiet period brings it forward again and polls it at once if its
+  last pass is older than 30 s, as a change of the volume in use does.
+  - Why 5 min, the top of the 2–5 min range: a mount sees only requests, not a view being left, and a person working in
+    a share pauses between them (reading a file, editing between saves); 5 min keeps the 30 s through such pauses. The
+    cost is at most ten polls of a share no longer used, and a return after a longer pause polls at once anyway.
+  - Alternatives: 2 min (fewer polls after use, but more falls back during work, each return one extra poll); a
+    setting (one more key for a constant the official client does not expose).
+- **Amended (claude, 2026-11-19, M6.0.9, parity F1; a note):** the listing's pages are read by PdMount's own client
+  (`SharedApi` in `proton.rs`, as the timeline's own types in D113) with the share target type as a number. The SDK's
+  closed `ShareTargetType` failed a whole page for one link of a new type, so the listing failed and a Shared mount stayed
+  empty; now such a link alone is left out, with a warning once per type, as the official clients skip it
+  (`cs/client/js/src/internal/sharing/apiService.ts:191-194`). Types 0 and 3–5 are left out as before. A page without
+  `Links` is an error, never an empty listing.
 - **Refs:** DESIGN.md §9.2, §13.1, §14.5, §15.1, §15.3 (X15), App. B; docs/plans/m5.md M5.9 (Outcome), M5.10,
   M5.11–M5.13; docs/security/2026-11-15-review/verification.md (V-3), area1.md (C1-2); D070, D080, D110, D113, D114,
   D118; `crates/pdmount-backend/src/shared.rs`, `crates/pdmount-fuse/src/trees.rs`, `crates/pdmount/src/roots/shared.rs`,
@@ -3437,7 +3490,7 @@ Rules for this log:
 ## D114 — Writes in shares: the role's gate, lost rights, only the profile's `.pdignore`, orphaned changes, marker, tests
 - **Status:** accepted
 - **Decided by:** user
-- **Date:** 2026-11-15; consolidated 2026-11-17
+- **Date:** 2026-11-15; consolidated 2026-11-17; amended 2026-11-18
 - **Context:** M5.14 (`docs/plans/m5.md`) opens the write gate of shares and Computers (D080); the user split it, and
   M5.14a covers shares only. D080 fixes the rule (`Editor`, `Admin` writable; `Viewer` and shared single files EROFS; a
   lost right parks; staged data to `orphaned/<tree>/` once the share is gone) and D076 the marker per tree, opt-in per
@@ -3537,8 +3590,23 @@ Rules for this log:
     `get_membership_address`) and the owner seeing the content and author in the official client; that a revoked share's
     queued changes land in `orphaned/`. The rules and local-only export need none: the change is local; x16 covers it on
     the fake.
+- **Amended (claude, 2026-11-18, for M6.0.3 V-1, a fix the user chose):** the M6.0.3 review
+  (`docs/security/2026-11-18-review/verification.md`, V-1, High; area4.md C4-1) found a third class of staged content the
+  export missed: an uploaded file moved into a local-only folder and edited there. Its edit is staged but never queued
+  (the planner has nothing to do inside a local-only folder, D121), and the node is not `local_only` because it has a
+  remote, so the count was 0 and `trees/<key>/` was purged with the edit, or, with other changes queued, the export
+  skipped it. The export no longer depends on why a staged file is not queued: `Engine::unqueued_staged` (replacing
+  `local_only_staged`) lists every staged inode not in the journal whose node is an attached, not deleted file that is
+  `local_only` or has content not uploaded (`content_pending`); `Engine::changes_to_keep` adds them to the queued and
+  parked entries for `SharedRoot::remove`'s count, and `export_queued` exports the union with the journal's inodes, each
+  once. The manifest keeps `local-only` for a file without a remote and lists one with a remote as `not-uploaded`. A
+  staged file whose content the drive already has is still not exported (the alternative above). The planner is not
+  changed (the review's third point, not adopted): such a file keeps its old remote place and its edits stay local
+  (DESIGN §7.7). Tests: `engine/tests.rs` (`an_edit_in_a_local_only_folder_is_exported_as_not_uploaded`,
+  `an_edit_in_a_local_only_folder_counts_as_a_change_to_keep`, `a_queued_staged_file_is_exported_once`), `x16.sh`.
 - **Refs:** DESIGN.md §7.7, §11.2, §13.1, §14.5, §15.3 (X8, X16), App. B; docs/plans/m5.md M5.14; docs/user-guide.md;
-  docs/security/2026-11-15-review/verification.md (V-1, V-2), area1.md (C1-1); D019, D028, D061, D070, D076, D080, D096,
+  docs/security/2026-11-15-review/verification.md (V-1, V-2), area1.md (C1-1);
+  docs/security/2026-11-18-review/verification.md (V-1), area4.md (C4-1); D019, D028, D061, D070, D076, D080, D096,
   D110, D112, D118, D121, D126; `crates/pdmount-core/src/engine/rights.rs`, `crates/pdmount-core/src/engine/orphan.rs`,
   `crates/pdmount-core/src/engine/ignore.rs`, `crates/pdmount/src/roots.rs`, `crates/pdmount/src/roots/shared.rs`,
   `tests/scenarios/x16.sh`.
@@ -3876,5 +3944,555 @@ Rules for this log:
   - The amendment trail of a milestone's decisions is gone from the repository once it is published, as its commits are.
     `docs/handoff-log.md` keeps the sessions' account of when and why each change was made.
   - M5: 37 entries became 20 surviving entries and 17 stubs. See the "Merged from" lines.
+  - M6: 12 entries became 10 surviving entries and 2 stubs. See the "Merged from" lines.
   - Hashes of the milestone's commits cited in documents resolve nowhere once it is published, as with D090.
 - **Refs:** docs/decisions.md (rules at the top); AGENTS.md "Release"; D090.
+
+## D130 — An event page that keeps failing is given up for a refresh; a node under an undecryptable parent is degraded
+- **Status:** accepted (user, 2026-11-19)
+- **Decided by:** claude, accepted by user
+- **Date:** 2026-11-18
+- **Context:** The M6.0.3 security review (V-3, `docs/security/2026-11-18-review/verification.md`) found that one node
+  whose parent folder cannot be decrypted failed the whole P13 batch (`get_fresh_nodes_metadata` resolved each link's
+  parent key with `?`), so `get_nodes` failed for every link of the request. The poller retried a page that every tree
+  failed with back-off and without limit (§9.2), and the stored cursor stayed before the page, so the tree stopped
+  following remote changes for good, across restarts. A share member can cause this with a client of their own; it also
+  happens without malice whenever a known node's parent becomes undecryptable. The user chose the proposed fix on
+  2026-11-18.
+- **Decision:**
+  - **Fork (P13 amended):** a link whose parent key cannot be had because the parent, or a folder above it, does not
+    decrypt is returned degraded ("Parent folder key is degraded") and the batch goes on; PdMount sees it as
+    `NodeLookup::Degraded` (D113). A failed request or an API error still fails the call. The two are told apart by type
+    (`UndecryptableNodeError`), not by message text.
+  - **Poller:** a page that every tree fails to read or apply is counted by its cursor when the error is the page's
+    (`BackendError::is_permanent`). At the third such failure the pass logs a warning naming the volume, takes a fresh
+    cursor, refreshes every tree of the volume from it (§9.4) and goes on, as for a server's `refresh`. Transport
+    failures, 429 and 5xx (`Transient`, `RateLimited`), `Offline`, `Unauthorized` and errors that are not the backend's
+    neither count nor reset the count.
+- **Alternatives:**
+  - Skip only the failing page (cursor to its `next`) and refresh the trees: the same refresh, but a later page that names
+    the same node fails three more times; a fresh cursor skips them all.
+  - Give up after the first failure: a page error that a second try would not see (a node read in the middle of a move)
+    would cost a full refresh.
+  - Count transient failures too, or let them reset the count: either refreshes during an outage, or lets a broken page
+    that alternates with 5xx answers stay for ever.
+  - The fork fix alone: other page errors (a node that fails to decrypt by itself, R1's remainder) would still stall.
+- **Consequences:**
+  - A broken page costs three polls (about a minute and a half at 30 s) and a refresh of every tree of its volume; the
+    changes between the old and the fresh cursor reach the trees through the refresh's listings. The cursor is stored
+    once the refresh succeeds, so a restart before that meets the page again.
+  - A folder listing with a child that fails to decrypt still fails through `NodeBatchLoader` (upstream code), and so does
+    a refresh that lists it; that is `docs/sdk-parity.md` R1's remainder (P26), not covered here.
+  - Tested by the fork's `a_link_under_a_degraded_parent_is_degraded_and_the_batch_goes_on`, the poller's
+    `a_page_that_keeps_failing_is_given_up_for_a_refresh` and `transient_failures_do_not_give_a_page_up`, and E1's live
+    step with `pdmount fake fault broken-nodes`.
+- **Refs:** DESIGN.md §9.2, §9.4; docs/sdk-patches.md P13; docs/sdk-parity.md R1; D034, D035, D110, D113.
+
+## D132 — Nodes that do not decrypt or verify: degraded children kept, unverified nodes refused or reported per root, `pdmount signatures`
+- **Status:** accepted
+- **Decided by:** user
+- **Date:** 2026-11-19; consolidated 2026-11-20
+- **Context:** Parity finding R1 (`docs/sdk-parity.md`): a node that failed to decrypt by itself (its passphrase, key,
+  name, hash key or content key) was an error in the SDK's converter, so one such child failed the listing of its whole
+  folder, and every event page and refresh that named it (D130 covered only a node under an undecryptable parent). The
+  fork's P26 (M6.0.4.9) returns such a node degraded in folder listings, the trash listing and P13's batch, as the
+  official SDKs do. PdMount's adapter then dropped degraded children from a listing, and the engine takes a known child
+  missing from a listing for one removed remotely: it would delete the local entry (or, with local changes inside,
+  upload it again), and the trash pre-check of a folder deleted locally would not see the child.
+  Parity finding R8: the fork's P27 (M6.0.4.10) keeps signature verification failures of a node's name, key and content
+  key on the node, as the official SDKs do, where before nothing reported them. PdMount needed to choose what to do
+  with such a node; the official clients show it with a warning and still open it. The first proposal did the same and
+  only logged it; the user chose instead to make such nodes visible and, on the user's own volumes, refused until
+  accepted, of three options (only a mount flag `--accept-invalid-signatures`; commands `list`, `accept` and `delete`;
+  a mode per root with `list` and `accept`): the third, without `delete`, and added `check`. M6.0.6 built it.
+- **Decision:**
+  - **Degraded nodes:**
+    - `Backend::list_children_checked` returns `Listing { children, degraded }`: the children that were read, and the
+      links of those the server lists but whose metadata cannot be decrypted. `list_children` keeps returning the
+      readable ones; the default `list_children_checked` knows no degraded children; wrappers forward it.
+    - A directory listing (`Engine::list_now`, and so every refresh) keeps a known child named degraded as it was:
+      degraded is not absent (D119). An unknown degraded child is not shown (it has no name to show); the adapter logs
+      it at WARN at each listing.
+    - The trash pre-check of a folder deleted locally counts each degraded child as one the delete does not account
+      for: the folder is kept (`LocalDeleteRemoteChildren`, §8) instead of trashing a child nobody here can read.
+  - **Unverified signatures, mode per root:** `signatures = "refuse" | "warn"` in the profile config (My Files' only)
+    and in each `[[roots]]` entry, with a default per root: `refuse` for My Files, Photos and a `test` root on the
+    user's own volume (the signer is the user, with keys unlocked by the user's own password), `warn` for shared roots
+    and a `test` root on another user's volume (other members' keys come from the server, and former members' deleted
+    keys make harmless failures likely).
+  - *Found* whenever the adapter decodes a node from the server (a folder listing, an event batch, a single fetch). The
+    adapter logs it at WARN once per node and process (link and which signatures; at most 10 000 nodes remembered,
+    then the set starts again). The tree keeps it in a `signatures` table of its store (schema 5) with the claimed
+    signer, the parts that failed, the digest and the first-seen time, written in the same store write as the node's
+    `remote` row and joined to it at load, so the tree's remote state carries the failures and the refusals need no
+    lookup but a small map of accepted digests; a remote state the executor builds from its own change keeps the
+    failures it had. The row goes when the node verifies or its remote state goes. A node decoded but not placed in
+    the tree (an event of a folder never listed) is not recorded; it is found when its folder is listed.
+  - *Digest:* one token per failed part, the first 16 hex digits of a SHA-256 over the part, its claimed signer and what
+    the signature covers as PdMount sees it: the decrypted name for the name; the link for the key and the content key,
+    which do not change for a node's life. The SDK does not give the signed packets or the signatures, so this is what an
+    accept can be bound to without a fork change.
+  - *Ids:* the first 8 hex digits of the BLAKE3 hash of the link: stable across remounts and trees, short to type; an id
+    that names two nodes is refused rather than guessed.
+  - *Refused node* (in `refuse` mode, until accepted): listed under its name, `stat` works; opening it (a folder's
+    `opendir` too), renaming, moving and deleting it, and a change of its mode, size or mtime, answer EACCES, so tools
+    report it and delete nothing elsewhere (hiding it would make `rsync --delete` from the mount remove it from a
+    backup). Replacing it by a rename is a delete of it. Renames and moves are refused because PdMount signs a name it
+    changes with the user's key, which would make a name nobody could verify look valid to every client. Nothing is
+    created in, moved into or renamed within a folder whose key (or hash key) did not verify, since what is written
+    there, the new name included, is encrypted to a key not proven to be the owner's; a folder whose name alone failed
+    takes new entries.
+  - *`pdmount signatures list [--json]`:* id, root, path (the name marked unverified when its own signature failed),
+    claimed signer, failed parts, first seen. *`pdmount signatures accept <id>`:* the node is handled as verified on this
+    device and profile while every failed part's token is among the accepted ones: a part that verifies later keeps the
+    accept (PdMount's own rename signs the name, which then verifies); a new part, another claimed signer or another name
+    asks again. The accept is stored with the found node and goes with it: a node that verifies, or whose remote state
+    goes, is forgotten, and failing again later asks again. No `delete`: after an accept, `rm` works, and a delete by id
+    would act on the server without the file being looked at.
+  - *`pdmount signatures check [<path>]`* (added by the user): lists every folder under the path, or the whole mount,
+    from the server and checks every node in it, through the tree's own listings (`Engine::list`), so what it finds is
+    applied as any listing and the folders stay listed. Paced as a refresh (D027), on background turns. A path is in My
+    Files (as other path commands, D110); without one, every tree of every mount, Photos by reading every photo's node
+    again. One check runs in the daemon at a time; the command polls it each second, prints progress every 10 s, and at
+    the end the folders and nodes checked and the unverified nodes found, which then appear in `signatures list`.
+  - *Reported:* a desktop notification per tree at most every 10 minutes with the count of nodes newly found (counted
+    when a batch's rows are persisted; the count of what came in between) and the command to run, never node names
+    (they are unverified remote text); the tree's name in it is cleaned by `notify::clean_name` (D139). A `status`
+    line `Signatures: N unverified, M refused`; the WARN log line.
+  - *Limit:* a node is checked only when it is decoded: a folder never listed on this device, or a node unchanged since
+    its listing, is not checked again until a refresh (DESIGN §9.4) or `check` lists it.
+- **Alternatives:**
+  - Keep dropping degraded children: a node that stops decrypting would be deleted locally at the next listing.
+  - A `degraded` flag on `RemoteNode`: every consumer of a listing would have to filter it; a separate list keeps the
+    readable children as they were.
+  - Show an unknown degraded child under a placeholder name: no name hash or size to build a stable entry from, and
+    nothing could be read from it.
+  - Show and read every unverified node with a WARN only, as the official clients (the first proposal): not what the
+    user chose for the user's own volumes, where the signer is the user; it stays the `warn` mode of shares.
+  - Hide a refused node, or answer EIO: `rsync --delete` from the mount would remove it from a backup, and a key lookup
+    that fails for a while would hide the author's files.
+  - Only a mount flag `--accept-invalid-signatures`, or a `delete` command: not chosen by the user; a delete by id acts
+    on the server without the file being looked at.
+  - A `user.pdmount.*` xattr per node: more surface; `signatures list` names them.
+  - A digest over the signatures themselves: needs a fork change to expose them; the name and signer cover the cases an
+    accept should not survive.
+  - One digest for all parts, accepted only when equal: PdMount's own rename of an accepted node would ask again.
+  - Numeric ids per tree: they collide across trees and change with a reset.
+  - `check` over the backend without the tree: it would find nodes the tree does not place, with nowhere to show them
+    and nothing to refuse.
+- **Consequences:**
+  - A child that stops decrypting stays visible with its last known name and attributes; reading it fails at the block
+    level as before. One that never decrypted is invisible on this device, as before P26.
+  - A folder holding a degraded child cannot be deleted from this device (it comes back, with the conflict recorded).
+  - Not covered: a create that finds its name taken looks for the occupant by name (`journal.rs`, the name is free
+    again); a degraded occupant is not found, so the create is retried until the occupant is readable or gone.
+  - A wrong verification rule in the fork would show as refused nodes in My Files and Photos, which `accept` recovers,
+    and as warnings in shares; on the test account no node fails (0 of 3,720).
+  - A server that swaps a node's key and its signature without changing the claimed signer is not asked about again
+    after an accept; the content's own signatures (the manifest, P2, P17) still fail on read.
+  - A store from before schema 5 has no found nodes until its nodes are decoded again (a listing, a refresh, `check`).
+  - `check` makes every folder of the tree listed in memory and in the store, as browsing all of it would.
+  - Tests: no scenario for degraded nodes (the fake marks a node degraded only in its own process, `set_degraded`); the
+    fork's `a_listed_child_that_does_not_decrypt_is_degraded_and_the_listing_goes_on` and
+    `a_fresh_link_that_does_not_decrypt_by_itself_is_degraded`, the tree's `a_degraded_child_stays_and_a_missing_one_goes`,
+    the poller's `a_refresh_with_a_degraded_child_finishes_and_keeps_it` and the engine's
+    `a_local_folder_delete_keeps_a_remote_child_that_does_not_decrypt`; the adapter's logging by
+    `an_unverified_node_is_logged_once_and_shown`; the refusals, `list`, `accept` and `check` by X18 (`x18.sh`, with
+    `pdmount fake unverified`).
+- **Known gaps (accepted by the user, 2026-11-19; recommendation by claude):**
+  - *An accept survives a later swap of the node's key or content key* that keeps the claimed signer: their digest
+    covers the link and signer only. The content stays protected (a swapped content key fails the manifest, P2, P17,
+    which the server cannot re-sign), so the exposure is the node's key, which children's names and keys are encrypted
+    to. Recommendation: fix in M7, as a fork change that exposes a digest of the signed packets (a P27 amendment), with
+    the upstream work; low priority while no node fails (0 of 3,720 on the test account).
+  - *A node seen only in an event of a folder never listed is found when the folder is listed.* No gap in protection:
+    the node cannot be opened before its folder is listed, and that listing finds and refuses it; only `list`, `status`
+    and the notification learn of it later. Recommendation: no fix.
+  - *A full `check` lists every folder of the tree*, as browsing all of it would, and stays listed afterwards; on the
+    real account it is a long-running test (D030). Recommendation: no fix; the pacing is a refresh's.
+  - *If My Files' root folder fails, the whole mount is refused* (its `opendir`) until it is accepted; the CLI still
+    works, so `signatures list` and `accept` recover it. Recommendation: no fix; one sentence in the user guide's
+    section when it is next edited.
+- **Refs:** DESIGN.md §3, §6.3, §8, §9.2, §13.2, §14.2, Appendix A, Appendix B, §15.3 (X18); docs/sdk-patches.md P26,
+  P27; docs/sdk-parity.md R1, R8; docs/user-guide.md; D027, D030, D110, D113 (D119), D130, D139.
+  - Merged from: D132 (claude, 2026-11-19, accepted by user 2026-11-19; the handling of unverified signatures amended
+    by the user 2026-11-19, `check` added by the user), D134 (claude, 2026-11-19, accepted by user 2026-11-19, with its
+    known gaps).
+
+## D133 — Crypto time: signatures verified at server time, a bounded offset from the Drive API
+- **Status:** accepted (user, 2026-11-19), with the known gaps below
+- **Decided by:** claude (the design of the bounds, V-9, by the user in `docs/plans/m6.md`)
+- **Date:** 2026-11-19
+- **Context:** Security review findings V-8 and V-9 (`docs/security/2026-11-18-review/verification.md`). V-8: the fork
+  dates keys and signatures at server time (the device clock plus the offset from the API's `Date`, P19) but verified
+  them at the device clock, and rPGP refuses a signature dated after the verification time. On a device whose clock is
+  slow, anything signed in its last seconds failed: a manifest with EIO, node metadata as an unverified author, which
+  M6.0.6 refuses (D132). V-9: any answer of any client (API, block storage, Photos, public links) set the offset, without
+  a bound; once verification takes server time, a wrong offset also makes fresh signatures fail or future-dated ones
+  pass. The user added M6.0.7 (`docs/plans/m6.md`) with the design of the bounds; this entry records how both were
+  built and the choices the plan left open.
+- **Decision:**
+  - Every signature verification in the fork takes `server_time::check_now()` (P29): manifests (P2, P17), the content
+    key (P27), the decryptor behind names, passphrases, hash keys, extended attributes, share passphrases and names and
+    URL passwords, and memberships (P24).
+  - `proton-sdk-rs2` verifies address key tokens and has no server clock: it gets `crypto_time::set_source`, which
+    `ProtonDriveClient` calls with the SDK's clock when it is built; before that, the device clock.
+  - `proton-srp`'s modulus signature check stays at the device clock: a third-party crate without a date parameter,
+    over a signature years old.
+  - The offset comes only from answers to the Drive API's scheme, host and port (P19 amended): the Drive API client and
+    the Photos API client (same host). Not from block storage, not from the public-link clients (the same host, but
+    the account's own clients suffice and the plan excludes them), not from `create_client_with_timeout`, which has no
+    host of its own.
+  - The first offset after a start is adopted within a day (86 400 s) of the device clock, else refused with a WARN
+    (once per refused value) and the device clock is used. Later, a change of more than 60 s waits for a second answer
+    whose offset is within 2 s of it; until then the old offset stays, with a WARN per pending value; an answer that
+    confirms nothing replaces the pending value, one that agrees with the current offset clears it. Changes from 2 to
+    60 s are adopted at once, as before; P19's floor stays.
+  - `doctor`'s clock line adds the SDK's offset: the running daemon's (`status` reply field `server_time_offset`), with
+    a `WARN` when it is more than a minute from what doctor's own request measured (a change being held, or a wrong
+    answer adopted); without a daemon, the offset the SDK adopts from doctor's own answer, or that it refuses it.
+- **Alternatives:**
+  - Verify at the device clock with a tolerance: rPGP has none, and a tolerance would also accept signatures dated
+    ahead of the server.
+  - Move the server clock into `proton-sdk-rs2`: a larger upstream change for one check of old signatures.
+  - Bound every adopted offset to a day, not only the first: a device clock stepped wrongly by more than a day after
+    the start could then not be corrected; the plan bounds the first only.
+  - Confirm by the same answer's `x-pm-date` and `Date`: both come from one server answer, so they do not confirm each
+    other.
+  - A `status` line for the offset: `doctor` is where the clock is checked; `status --json` carries the field.
+- **Consequences:**
+  - The official clients verify at server time too (C# through its PGP library's process-wide time provider, JS
+    through its CryptoProxy), so the fork now agrees with them; it still differs in which server time (P19's offset,
+    bounded, where C# takes the latest `Date` seen without a bound).
+  - A device more than a day off the server's clock signs and verifies at its own clock; when it is ahead, the API
+    rejects its new keys, as before upstream's offset existed. The WARN in the log and `doctor` say so.
+  - A real correction of more than a minute takes effect at the second answer after it; one answer's worth of keys
+    and signatures is dated with the old offset.
+  - Two agreeing wrong answers still move the offset after the start; `doctor` shows it.
+  - PdMount's code only reads the offset (`pdmount-backend`'s `server_time_offset`, `observe_server_time` for
+    `doctor`); V-8's EIO window closes with the pin move. On the fake backend the daemon adopts no offset, which the
+    `ops` scenario checks in `doctor`'s line.
+- **Known gaps (accepted by the user, 2026-11-19; recommendation by claude):**
+  - *Two agreeing wrong answers move the offset after the start.* Only the Drive API host, over TLS, sets it, and that
+    host is trusted for the time anyway; `doctor` shows the offset. Recommendation: no fix; reconsider if a wrong
+    offset is ever seen.
+  - *A device clock more than a day off signs and verifies at its own time,* and if it is ahead the API rejects its new
+    keys. A misset clock; the WARN and `doctor` say so. Recommendation: no fix.
+- **Refs:** DESIGN.md §6.3, §14.2; docs/sdk-patches.md P19, P29; docs/plans/m6.md M6.0.7; docs/security/2026-11-18-review/
+  verification.md V-8, V-9.
+
+## D134 — Unverified signatures: the choices D132 left open (M6.0.6)
+- **Status:** merged into D132 (2026-11-20, D129)
+
+## D135 — Large-file reads: block lists by range (M6.0.11)
+- **Status:** accepted (user, 2026-11-19), with the manifest verified before the first byte and video thumbnails
+  checked by decryption only
+- **Decided by:** claude (block lists by range chosen by the user in `docs/plans/m6.md`)
+- **Date:** 2026-11-19
+- **Context:** the user's large phone video took minutes to appear from the Photos mount. The fake reproduced 1–12 s
+  (the rate, not the size) and found, among other causes, that the adapter lists every block of a revision in pages of
+  10 before its first byte (17 requests for 650 MiB, 126 for 4.9 GiB), again after the map's 10 min mid-read while its
+  lock holds the file's other downloads, and that the thumbnail task lists every block of every video. The user chose
+  "block lists by range" (`docs/plans/m6.md`, M6.0.11).
+- **Decision:**
+  - *Page size 20:* the official JS SDK's `BLOCKS_PAGE_SIZE` (`cs/client/js/src/internal/download/apiService.ts:7`),
+    the larger of the official clients' (C# `RevisionReader.DefaultBlockPageSize` is 10). The API documents no maximum
+    (`GetRevisionQueryParameters.PageSize`, `driveTypes.ts`); a page that answers fewer blocks than asked for, not past
+    the end, is followed by a listing from the block read, so a capped server still finds every block.
+  - *By range:* the layout comes from the node's claimed block sizes (fork P4), without a listing; a read lists its
+    block's page only (fork P30 `get_block_page`), as the JS SDK's seekable stream lists one block at its index with
+    offsets from the claimed block sizes (`fileDownloader.ts` `getSeekableStream`, `blockIndex.ts`). A file without
+    claimed sizes, or an older revision, is listed whole as before, in pages of 20.
+  - *Expiry per page:* a listed target is used for 10 min, then listed again with its page alone, under that page's
+    lock; the verified hashes stay, so the new page needs no manifest, only the same hashes.
+  - *The manifest still first:* the first read of a revision lists the other pages in order, one at a time, beside its
+    own download, and gives its bytes only once the manifest verified (P30 `verify_listed_block_hashes`). S-4 (P17)
+    stays closed: no byte of a block whose listed hash the manifest does not cover is ever given or cached.
+  - *Thumbnails:* one request per photo, the first page without URLs (`NoBlockUrls`); its manifest is verified when that
+    page is the whole listing (fewer than 20 blocks); a larger revision's thumbnail is checked by decryption, as the
+    official clients check every thumbnail (`thumbnailDownloader.ts` checks no digest).
+  - *Fork:* P30 on `0.5/feat/block-list-range` from `pdmount-0.5`: `get_block_page`, `check_block_page`,
+    `verify_block_hashes`, `verify_listed_block_hashes`, `listed_block_sizes`; `get_block_map` unchanged.
+  - *Fake:* the adapter's logic lives in `pdmount-backend/src/block_lists.rs`, which the fake uses too, a round trip
+    per page listed, so the fake measures the adapter's listing.
+  - *Photos readahead:* the Photos tree's reads get the engine's detector and readahead (`readahead.rs`), with the
+    session's readahead permits (2, shared with every engine tree, D110), none for scan reads (D111), as the engine's.
+  - *Readahead held until the pattern is known:* a handle's readahead starts once its reads in order (each starting
+    where the one before ended) cross into the next block: 2 blocks ahead, 4 once they crossed two. Before, two adjacent
+    reads started it, which the kernel's 128 KiB reads make at once, so blocks 1–2 competed with a player's jump to the
+    index in the last block. A copy crosses its first boundary after one block; the crossing read starts the readahead
+    before waiting for its own block, so the next block's download starts with it, not after.
+- **Alternatives:**
+  - Readahead after N bytes in order (1 MiB, say): a player's probe of the head can read that much before its jump;
+    a block boundary is what readahead fetches by anyway.
+  - The official clients' order, the manifest last: C# and JS write a download's blocks out and verify the manifest at
+    the end (`RevisionReader.cs`, `fileDownloader.ts` `internalDownloadToStream`); the JS seekable stream never
+    verifies it and skips the block hash too. For a mount this would give, and cache, bytes the manifest may later
+    reject, reopening S-4; the gain is the listing's time on a large file's first read only.
+  - The other pages in parallel: fewer seconds for a 4.9 GiB file's first read, but the official clients list pages
+    one at a time, and the session's request rate is shared with first-party clients (`cs/README.md`).
+  - The pages without URLs for the manifest (`NoBlockUrls`): cheaper for the server, but a sequential read then lists
+    its pages a second time.
+  - A video's thumbnail with its whole listing, as before: one request per 20 blocks per video in the background,
+    which D115 (§14.5) meant to be one per photo.
+- **Consequences:**
+  - A revision's first read waits for max(its page and its download, the whole listing at one request per 20 blocks);
+    later reads, and reads of a revision whose listing expired, wait for one page at most.
+  - The verified hashes of up to 256 revisions stay in RAM (32 bytes per block).
+  - A video's thumbnail is no longer tied to its revision by the manifest: a server could give the thumbnail of
+    another revision of the same file (the same content key). It is a picture in the file manager's cache, not file
+    content.
+  - A copy waits for its second block without readahead (it is fetched by the read that crosses into it, with the
+    readahead of the two after it); measured on the fake: `scripts/bench/read.sh` the same within noise.
+  - Measured on the fake (80 ms, a 633 MiB 34 Mbit/s video, mpv): first frame at 20 MB/s 2.2–2.7 s before, 1.5–2.0 s
+    after; at 5 MB/s 4.2–6.0 s, 3.4–4.0 s; at 2 MB/s, where the transfer dominates, within noise (7–9 s); 10 s of
+    playback 0.4–1.2 s sooner at 20 and 5 MB/s; a 256 MiB copy from Photos 21.7 → 15.8 s at 20 MB/s.
+  - Real account (2026-11-19): a ~633 MiB MP4 with its index at the end, uploaded to `pdmount-test/` and read from My
+    Files, its blocks wiped and the daemon fresh before each run: every page of 20 answered 20 blocks, 73–400 ms per
+    page; first frame (mpv) 1.5–4.0 s, median 2.6 (7 runs), against 2.4–7.3 s, median 4.5 (9 runs) on `10a4471`; 10 s of
+    playback 12.3 s against 14.1 s; a full copy 43–44 s against 36–51 s; no 429. The test account's Photos holds no
+    video, so neither a Photos video nor a video thumbnail of 20 blocks or more was checked; the three photos'
+    thumbnails, made again, were byte-identical.
+- **Refs:** DESIGN.md §5.3, §6.1, §14.5, §15.1; docs/sdk-patches.md P30; D115; S-4 (P17).
+
+## D136 — `cache wipe` reaches every mount (M6.0.10)
+- **Status:** accepted (user, 2026-11-20)
+- **Decided by:** claude
+- **Date:** 2026-11-19
+- **Context:** the user asked for repeated cold-cache runs of the slow-video diagnosis. Photos and each share have a block cache of
+  their own; `cache wipe` reached My Files' only (D110: path commands reach My Files only), so a Photos video stayed cached.
+- **Decision:**
+  - `cache wipe` without a path wipes the cache of every mounted tree: My Files, Photos, each share and test tree.
+  - With a path, a relative one is My Files' (as every path command), and an absolute one is resolved by the mount it is in:
+    My Files, a Photos mount (`<mount>/2024`, `<mount>/2024/06`, `<mount>/2024/06/<name>`: a year or month wipes every named
+    photo below it), or a Shared mount (`<mount>/<share>/<path>`; the files folder, or a shared file below it, wipes the shared
+    files' trees; the mount root wipes all its trees). A path outside every mount, or one that names nothing, is refused and
+    nothing is wiped by it.
+  - The reply names what each tree freed (the root as `signatures list` names it) and what is left of the profile's cache; the
+    new fields are optional, so older peers parse it. Pinned and protected blocks stay, as before. `cache gc` stays My Files'
+    (D110 amended).
+- **Alternatives:** a `--all` flag instead of the no-path default: the no-path form wiped My Files only until now, and the user
+  asked for every tree. A mount named by an option: the path says it already.
+- **Consequences:** a relative path in a Photos or Shared mount is not taken from the shell's directory (relative paths stay My
+  Files'); give an absolute one. A subfolder wipe reaches only the files the tree has listed, as it did in My Files. A
+  daemon from before M6.0.10 answers the new client's absolute path with "no such file or directory" and wipes nothing
+  (seen in the M6.0.11 real-account check); restart the daemon after an upgrade.
+- **Refs:** DESIGN.md §14.2, §14.5, §15.3 (X19); D009, D110; docs/user-guide.md.
+
+## D137 — A slow-download notification with the file's name (M6.4)
+- **Status:** accepted
+- **Decided by:** user (claude: the 5 s wait, the limits, the setting's name)
+- **Date:** 2026-11-20
+- **Context:** the user opened a ~650 MiB phone video from the Photos mount in a file manager and waited minutes with
+  nothing on screen. M6.0.11 made the first frame sooner, but a large file on a slow link still takes as long as its
+  blocks take. The question left open was whether a notification may show the file's name.
+- **Decision:**
+  - When a read the user waits for (not a scan read, D081, D111) has waited 5 s for a file's blocks, in any tree, a
+    notification "PdMount: downloading" names the file (not its path) and its size, cleaned and escaped like every
+    remote name (D070, D139).
+  - At most one per file per 10 minutes and three per 30 s (`notify::Burst`), the rest summed in one, which counts as
+    one of the three; closed when the wait ends, where the notification service supports it, and every one still open
+    when the daemon stops.
+  - `notify.downloads` in the `[notify]` table (Appendix B), default `true`; `false` turns it off: the daemon then does
+    not subscribe, and the engine measures nothing. `notify.conflicts` and `notify.conflict_names` (D139) are in the
+    same table.
+  - Sent over D-Bus (D138), so the name is not in a process's arguments as it would be with `notify-send`.
+- **Alternatives:** no name ("a file is downloading"): says too little when several files open; the name only when
+  `notify.conflict_names` allows: ties two kinds of notification to one setting; a progress bar: the notification
+  spec's `value` hint is not widely shown.
+- **Consequences:** a file's name can appear on screen, and on a lock screen that shows notifications; set
+  `notify.downloads = false` to avoid that. A thumbnailer or indexer reading files does not cause notifications.
+- **Refs:** docs/plans/m6.md M6.4; DESIGN.md §6.4, §14.4, §15.3 (X20), Appendix B; D070, D077, D081, D111, D135, D138,
+  D139; `crates/pdmount-core/src/slow.rs`, `crates/pdmount/src/downloads.rs`. Accepted by user 2026-11-20: the file's
+  name shown, a setting to turn it off, on by default; the timing and limits proposed by claude.
+
+## D138 — The notification client: zbus on a runtime of its own, handles, one stub for the tests (M6.1)
+- **Status:** accepted
+- **Decided by:** user
+- **Date:** 2026-11-20; consolidated 2026-11-20
+- **Context:** D077 replaces `notify-send` with `org.freedesktop.Notifications` over zbus, so that actions, closing and
+  `replaces_id` become possible (M6.2, M6.4) and no notification text appears in `/proc/<pid>/cmdline` (D071). The callers
+  are synchronous and asynchronous, on short-lived runtimes (`bus.rs`'s blocking helpers run one call each). The M6.5
+  security review (`docs/security/2026-11-20-review/verification.md`, V-4) found that capabilities asked once per
+  connection outlive a change of the server behind the name.
+- **Decision:**
+  - One connection per bus address (the route of D102 amended: the attached bus or the process's own), checked as every bus
+    connection is (the peer's uid, `bus::connect`), kept on a runtime of its own with one worker, made again after a
+    failure (one retry when a send or a close fails on an old connection), and made outside the lock of the table of
+    connections, so a bus that does not answer holds up no call on another. A call has the 2 s of `BUS_TIMEOUT`;
+    `desktop_sent` at most 10 s in all, because a server that D-Bus starts at the first call needs time.
+  - `GetCapabilities` once per connection and again after the service's `NameOwnerChanged` (another server, or one
+    restarted with another configuration), so a server that reads markup never gets an unescaped body because an
+    earlier one did not (V-4): buttons only with `actions`, the body escaped only with `body-markup`.
+  - A notification is named by a `Handle` (bus and id), not an id alone: ids belong to one server, and the route can change
+    between a send and a close. `subscribe()` is a broadcast of `ActionInvoked` and `NotificationClosed` for ids this
+    process sent (a bounded set per connection).
+  - `desktop` queues in order (bounded, the rest dropped) instead of one thread per message; the first failure is
+    logged once at INFO, the following at debug level until one goes out.
+  - `deliverable()` asks the bus whether the name is owned or activatable (as before, without the tool check); `doctor`
+    gets a `notifications` line from the same question.
+  - Tests: `pdmount fake notifications serve|invoke` (and the same module in unit tests) is a server on a private bus
+    that logs every call as JSON and sends `ActionInvoked` or `NotificationClosed` on request; the scenarios use it
+    through `lib.sh`, and D-Bus activation starts it in `x13`.
+- **Alternatives:** a connection per call (a handshake each, no signals); the caller's runtime (a connection dies with a
+  blocking helper's runtime); `notify-send` kept for the plain ones (two paths, names still in arguments); asking
+  `GetCapabilities` before every send (one more call per notification, for a change that is rare).
+- **Consequences:** a notification that is queued when the process exits may not be sent (`notify-send` outlived the
+  daemon); the notices that matter at an exit (the flush's) are sent before the flush. The signals reach a listener only
+  while the connection lives. No new crate or feature: `zbus` stays `default-features = false, features = ["tokio"]`
+  (M5.1); the proxy and interface macros are in `zbus_macros`, already in the tree.
+- **Refs:** docs/plans/m6.md M6.1; DESIGN.md §14.4, §15.3; docs/security/2026-11-20-review/verification.md V-4; D042,
+  D071, D077, D091, D102, D106, D137, D139.
+  - Merged from: D138 (claude, 2026-11-20, accepted by user 2026-11-20), D141 in part: capabilities asked again after
+    an owner change (claude, 2026-11-20, from the M6.5 review, accepted by user 2026-11-20).
+
+## D139 — Conflict notifications: one announcer per daemon, the text, Show with a fallback on the bus's error (M6.2)
+- **Status:** accepted
+- **Decided by:** user
+- **Date:** 2026-11-20; consolidated 2026-11-20
+- **Context:** D077 asks for a notification per `open` conflict with the file's name, what happened and a **Show**
+  action; the plan (M6.2) sets three per 30 s with the rest summed, `notify.conflicts` and `notify.conflict_names`.
+  Before, each tree announced on its own: My Files "N new conflicts" at most every 30 s, each further tree one
+  "conflict in <tree>" per conflict without a limit. The M6.5 security review of the notifications
+  (`docs/security/2026-11-20-review/verification.md`, two areas, nothing above Low) found that **Show**'s fallback
+  also ran on a bus that did not answer (V-6), that any process of the session could invoke **Show** without limit
+  (V-9), that names could still hide or fake text (V-2, V-3), and that the `xdg-open` child inherited a `PATH` lookup
+  in the working directory and `NOTIFY_SOCKET` (V-8); the rules below include their fixes.
+- **Decision:**
+  - **One announcer per daemon** (`conflict_notify.rs`): every tree's conflicts go through one task, so the limit is
+    the profile's, not each tree's. Its limiter is `notify::Burst` (three of their own per 30 s; once one is held,
+    later ones wait with it; the sum counts as one of the three), not `Coalescer`, which allows one per gap.
+  - **Looked up when sent:** a conflict is announced only while it is `open` (`Engine::conflict_view`), so the text
+    has the copy's current path and a conflict resolved in the meantime is not shown. Held ones are looked up again
+    when the sum goes out; a sum of one becomes that conflict's own notification. Conflicts a lagging receiver missed
+    are counted in the sum unseen.
+  - **The text:** summary "PdMount: conflict"; body the file's path in its tree (the original name beside the copy;
+    for `local_delete_remote_edit`, the file that came back), prefixed with the tree ("My Files: ", a share's name)
+    when the profile has further roots, then one sentence per kind. `notify.rs` escapes the markup.
+    `notify.conflict_names = false` leaves out the whole first line, the tree included (a share's name can say as much
+    as a file's).
+  - **One rule for names in notifications,** `notify::clean_name` (DESIGN.md §14.4), used by every notification that
+    shows a name (conflicts, downloads D137, the unverified-signatures summary D132): a name from another device must
+    not reorder, split or hide the text or read as a path (D070). It replaces with U+FFFD the control characters, the
+    line and paragraph separators (U+2028, U+2029), the bidirectional formatting characters, the invisible characters
+    of the device-name rule (`marker::is_hidden`) and further ones (U+034F, U+180B–U+180D), the tag characters and the
+    supplementary variation selectors, the blanks that are letters (U+115F, U+1160, U+3164, U+FFA0, U+2800) and the
+    slash look-alikes (U+2044, U+2215, U+29F8, U+FF0F); emoji's variation selectors (U+FE00–U+FE0F) stay.
+  - **Show:** offered when the server has `actions` and a copy is in the tree. `ShowItems` on the bus the
+    notification went to, through the user check of every bus connection, with 10 s for a file manager that D-Bus
+    starts. Only when that bus answers the call with an error (no file manager, a failed activation; the answer came
+    over the connection that passed the check) does `xdg-open <folder>` run, with that bus and the display of the last
+    attach (D102; none once the attached bus was dropped). A connection that fails during the call, or no answer within
+    the 10 s, opens nothing, and the bus is dropped if it no longer answers `GetId` (V-6: a logout's bus whose address
+    another user may take; it also ends the double opening after a slow activation). A bus that cannot be reached or
+    fails the check gets neither (logged at WARN): its address must not go to a program.
+  - **The `xdg-open` child:** looked up in the absolute directories of `PATH` only, run in `/` and without
+    `NOTIFY_SOCKET` (V-8), in a process group of its own, not waited for.
+  - **Show acts once per notification:** the first `ActionInvoked` for it removes it from the open ones (V-9: any
+    process of the session can send the signal; servers send it once). The announcer subscribes to the signals only
+    while it has notifications with **Show** on screen (at most 64 remembered), and forgets one at its
+    `NotificationClosed`.
+  - **Notified:** a conflict counts as notified when the server took the notification that names or sums it
+    (`conflict_notify::notified`), the point where D140 records `notified_at`.
+- **Alternatives:** the limit per tree (several shares could each send three); the text at record time (a path from
+  before the copy's rename, and conflicts resolved within the 30 s still shown); `xdg-open` only (it opens the folder
+  without selecting the copy); `ShowFolders` (no selection either); waiting for `xdg-open` (some implementations run the
+  file manager in the foreground); a re-check of the bus just before `xdg-open` (adds nothing after an error reply on
+  the checked connection); `chdir("/")` for the whole daemon (would change how relative paths in commands resolve; the
+  child alone is enough).
+- **Consequences:**
+  - A desktop without a file manager service and without `xdg-open` gets nothing from **Show** (logged at WARN). A
+    **Show** clicked after the daemon restarted does nothing: the new daemon does not know the old ids. A click on
+    **Show** while the desktop logs out or the file manager starts slowly opens nothing (the file manager, once
+    started, shows the folder itself). A second click on the same notification's **Show** does nothing.
+  - `xdg-open` and a file manager it starts are in a process group of their own, so a signal to the daemon's group does
+    not end them; under systemd they stay in the service's cgroup, and a stop of the service (its default
+    `KillMode=control-group`) ends them. `systemd-run --user --scope` would move them out; it is not used until it can
+    be tested under systemd (review of M6, 2026-11-20).
+  - Names with ZWJ emoji sequences show U+FFFD between the emoji, as device names already did.
+  - Open for M7 or no fix (the user's choice): V-1 (a renamed share keeps its old name in its notifications), V-5
+    (names that look like addresses become links on some servers), V-10, V-11 of the review.
+- **Refs:** docs/plans/m6.md M6.2, M6.3; DESIGN.md §10.8, §14.4, §15.3 (X6), Appendix B;
+  docs/security/2026-11-20-review/ (V-2, V-3, V-6, V-8, V-9); D070, D077, D102, D132, D137, D138, D140, D142.
+  - Merged from: D139 (claude, 2026-11-20, accepted by user 2026-11-20), D141 in part: **Show**'s fallback, once per
+    notification, `clean_name`, the `xdg-open` child (claude, 2026-11-20, from the M6.5 review, accepted by user
+    2026-11-20).
+
+## D140 — Conflicts missed while no desktop ran (M6.3)
+- **Status:** accepted (user, 2026-11-20)
+- **Decided by:** claude (the plan's M6.3; the choices below)
+- **Date:** 2026-11-20
+- **Context:** D077 wants a conflict recorded while nobody was logged in (or no notification service ran) to be shown
+  later, once. M6.2 (D139) left the point where a conflict counts as notified, `conflict_notify::notified`.
+- **Decision:**
+  - **Store schema 6** (`store/0006.sql`): `conflicts.notified_at INTEGER NULL`, unix seconds. The migration marks every
+    existing row notified (now), so nothing old pops up after the upgrade. `store_conflict` is an upsert that writes
+    `notified_at` only for a new row (the plain `INSERT OR REPLACE` would unmark a conflict whenever its other copy
+    turned up); `store_notified` sets it, once. The engine queues its conflict writes under the registry's lock
+    (`record_conflict`, `set_conflict_other`, `mark_conflicts_notified`: queueing is below every lock), so a mark is
+    never queued before the row it marks.
+  - **Marked** when the `Notify` call was answered, for the conflict's own notification and for the ones a summary
+    names. A write that is lost to a crash within the commit window shows the conflict once more at the next start:
+    at most once is the rule for a clean run, not a guarantee against `kill -9`.
+  - **Shown when a service is there.** `notify_watch.rs` runs a task per daemon: it watches the bus notifications are
+    routed to (the attached bus, else the process's own; with neither owning the name, whichever exists, so a server that
+    starts later is seen) for `NameOwnerChanged` of `org.freedesktop.Notifications` with a new owner, and runs a callback at
+    the start when the name is owned or activatable, and at each new owner. The bus is chosen again every 60 s and at once
+    after an attach or a drop (`bus::attach_changes`, a generation every watcher sees); a daemon with no reachable bus tries to connect every 60 s (one
+    cached lookup, debug-level log only). The announcer then takes the `open`, unshown conflicts of every followed tree
+    (each from its own store, `Engine::unnotified_conflicts`): a tree followed while a service is up does the same at
+    once. A conflict resolved meanwhile is not shown (`Tree::pending`: open and unshown at its turn).
+  - **How many:** up to three go out on their own (each with **Show**, its text as a live one); more than three, one
+    notification "PdMount: conflicts" with "N conflicts were recorded while no desktop was listening; see `pdmount
+    conflicts list`" at once, counted as one of the window's three (with the window full, they are held for its "N more
+    conflicts"). Not "3 now and the rest after 30 s", which would make a user who comes back to five conflicts wait half
+    a minute for the fourth.
+  - **A send the server did not take does not use up the window** (`Burst::retract`): conflicts that arrive while no
+    service runs are tried, fail, and wait, unmarked, for the catch-up instead of filling the window and being summed
+    later. **It is tried again** 60 s later, whether or not the service is seen to restart (a timeout or an error while it
+    runs sends no `NameOwnerChanged`): the retry takes every followed tree's unshown conflicts as an appearance does; a sum
+    that failed keeps its held conflicts and its count of missed ones for the next try (review of M6, 2026-11-20).
+  - **`notify.conflicts = false`:** nothing is sent, and the conflicts are marked notified without a notification, at the
+    start, as they are recorded, and when a lagging receiver missed some (every followed tree's unshown ones). The plan said "nothing is marked", but also that turning the setting on later must
+    show nothing old; the two cannot both hold, and the second is what a user who turned them off expects (a
+    notification weeks later about a conflict they chose not to hear of is noise). The conflicts stay in `conflicts
+    list` and `status`. With the setting off no watcher runs.
+- **Alternatives:** a timestamp compared with the daemon's start (misses a conflict made while the daemon ran without a
+  service, and shows one twice after a restart); a `notified` boolean (no time to look at when debugging); showing the
+  missed ones as three plus a delayed sum; leaving the unmarked ones pending forever with the setting off (they all
+  appear on the day it is turned on).
+- **Consequences:** a downgrade to a binary that knows schema 5 refuses the database (the existing rule, `reset
+  --keep-login`). A service that is started and stopped repeatedly shows nothing twice. A conflict counted unseen by a
+  lagging receiver (D139) is shown, on its own, at the next start or appearance, since it was never marked.
+- **Refs:** docs/plans/m6.md M6.3; DESIGN.md §10.8, §13.2, §15.3 (X6); D077, D102, D105, D138, D139. Accepted by user
+  2026-11-20; on the `notify.conflicts = false` choice the user noted that old conflicts not notified after the setting
+  is turned on again is acceptable, since `pdmount conflicts list` shows them.
+
+## D141 — The M6 notifications after their security review (M6.5)
+- **Status:** merged into D138 (capabilities), D139 (**Show**, `clean_name`, `xdg-open`) and D142 (X21) (2026-11-20, D129)
+
+## D142 — M6's checks by hand on GNOME and KDE (X21): defined, not run for M6 (risk accepted)
+- **Status:** accepted
+- **Decided by:** user
+- **Date:** 2026-11-20; consolidated 2026-11-20
+- **Context:** M6's exit criteria (§16) include X21, the notification checks by hand on GNOME and KDE. The user cannot
+  install a test build on those desktops.
+- **Decision:**
+  - X21 is the check by hand on the user's desktops, GNOME and KDE: run by the user with `scripts/repro/m6-desktop.sh`
+    on a fake drive (a test build, the daemon started from a terminal of the desktop session; checklist in
+    `docs/plans/m6.md`, "Running the M6 checks"). The script's steps are tested without a desktop
+    (`tests/scenarios/m6desktop.sh`).
+  - X21 is not run for M6; the user accepts the risk. M6's exit rests on the automated checks: X6, X20 and the test of
+    `scripts/repro/m6-desktop.sh`, against the stub notification server, file manager and `xdg-open` on private buses,
+    plus the security review (2026-11-20). The script and its checklist stay for a later check.
+- **Alternatives:** wait with the M6 release until a desktop is available (not possible now); run X21 on another
+  desktop (none named).
+- **Consequences:** not seen on a real desktop: how GNOME Shell and Plasma show the text (the two lines, escaping, how
+  long a notification stays), **Show** through Files or Dolphin (`FileManager1.ShowItems`, the copy selected), a missed
+  conflict at a real login, and V-5 (names that look like addresses become links), whose fix needs a desktop to choose.
+  A desktop that differs from the stubs may show a notification badly or open nothing on **Show**; a conflict is still
+  listed by `pdmount conflicts list` and `status` (D140).
+- **Refs:** DESIGN.md §15.3 (X21), §16; docs/plans/m6.md, "Running the M6 checks"; docs/security/2026-11-20-review/;
+  D139, D140.
+  - Merged from: D142 (user, 2026-11-20), D141 in part: X21 as the checks by hand and the test of its script (claude,
+    2026-11-20, accepted by user 2026-11-20).

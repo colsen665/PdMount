@@ -99,6 +99,10 @@ impl Backend for Deferred {
         self.inner()?.list_children(folder).await
     }
 
+    async fn list_children_checked(&self, folder: &LinkId) -> Result<pdmount_backend::Listing> {
+        self.inner()?.list_children_checked(folder).await
+    }
+
     async fn get_nodes(&self, ids: &[LinkId]) -> Result<Vec<Option<RemoteNode>>> {
         self.inner()?.get_nodes(ids).await
     }
@@ -679,7 +683,7 @@ async fn sleep_until(at: Option<Instant>) {
 }
 
 /// The one notification of a wait, once it has reached a desktop. Only a
-/// `notify-send` that succeeded counts: a name that is only activatable on
+/// notification the server took counts: a name that is only activatable on
 /// the daemon's own bus (a desktop not yet attached) can fail to start
 /// there, and the attach that follows must still get its notification.
 async fn notify_once(paths: &ProfilePaths, notified: bool) -> bool {
@@ -715,6 +719,7 @@ pub async fn handle_attach(address: String, display: crate::bus::Display, late: 
         Err(error) => return control::failed(format!("cannot use that bus: {error}")),
     };
     let display = checked_display(display, "session attach sent");
+    crate::bus::remember_display(&display);
     if same {
         crate::bus::set_attached(None);
         tracing::debug!("the desktop uses the daemon's own session bus");
@@ -763,6 +768,7 @@ pub async fn restore_saved_attach(paths: &ProfilePaths) {
         }
     }
     let display = checked_display(saved.display, "the saved attach holds");
+    crate::bus::remember_display(&display);
     crate::bus::set_attached(Some(saved.address.clone()));
     tracing::info!(
         address = saved.address,
@@ -800,6 +806,7 @@ pub async fn restore_late_attach(late: &Late) {
         }
     }
     let display = checked_display(saved.display, "the saved attach holds");
+    crate::bus::remember_display(&display);
     crate::bus::set_attached(Some(saved.address.clone()));
     tracing::info!(
         address = saved.address,

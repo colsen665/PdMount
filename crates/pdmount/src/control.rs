@@ -123,9 +123,26 @@ pub enum Request {
     CacheGc {
         target: Option<u64>,
     },
-    /// `path` is relative to the mount root; `None`: the whole cache.
+    /// `path`: `None` wipes every tree's cache; relative to My Files' mount
+    /// root, or with `absolute` a path of the machine inside any mount of
+    /// the profile (M6.0.10).
     CacheWipe {
         path: Option<String>,
+        #[serde(default)]
+        absolute: bool,
+    },
+    /// Nodes whose signatures do not verify, in every tree (D132).
+    SignaturesList,
+    /// Handle a found node as verified on this device (D132).
+    SignaturesAccept {
+        id: String,
+    },
+    /// `start`: begin a check, of `path` in My Files (relative to its
+    /// mount root) or, without one, of every tree; otherwise only report
+    /// the running or last check (D132).
+    SignaturesCheck {
+        path: Option<String>,
+        start: bool,
     },
 }
 
@@ -203,6 +220,16 @@ pub struct StatusReply {
     /// The further roots (M5.10, D110); absent from older daemons.
     #[serde(default)]
     pub roots: Vec<RootReply>,
+    /// The daemon's adopted server time offset in seconds (D133), `None` before
+    /// the first Drive API answer, on the fake backend and from older daemons.
+    #[serde(default)]
+    pub server_time_offset: Option<i64>,
+    /// My Files' nodes whose signatures do not verify, and of them the
+    /// ones refused (D132).
+    #[serde(default)]
+    pub signatures_found: u64,
+    #[serde(default)]
+    pub signatures_refused: u64,
 }
 
 /// One further root in `StatusReply`.
@@ -249,6 +276,11 @@ pub struct TreeReply {
     /// Why the tree's changes wait, e.g. the server refused one (D114).
     #[serde(default)]
     pub note: Option<String>,
+    /// Nodes whose signatures do not verify, and the refused ones (D132).
+    #[serde(default)]
+    pub signatures_found: u64,
+    #[serde(default)]
+    pub signatures_refused: u64,
 }
 
 /// The profile's disk cache: one cap for My Files and every further tree
@@ -355,6 +387,46 @@ pub struct AccessEffectiveReply {
     pub mode: AccessMode,
     /// The deciding rule's path; `None`: the default.
     pub rule: Option<String>,
+}
+
+/// `SignaturesList`: the found nodes of every tree.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SignaturesReply {
+    pub nodes: Vec<SignatureReply>,
+}
+
+/// One found node: its tree and what the tree knows of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureReply {
+    /// `My Files`, or a further root's mountpoint and the tree's name.
+    pub root: String,
+    /// The tree's mode: `refuse` or `warn`.
+    pub mode: String,
+    #[serde(flatten)]
+    pub node: pdmount_core::signatures::FoundView,
+}
+
+/// `SignaturesAccept`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SignatureAcceptReply {
+    pub node: SignatureReply,
+}
+
+/// `SignaturesCheck`: the running check, or the last one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignaturesCheckReply {
+    /// A check runs now.
+    pub running: bool,
+    /// This request started it.
+    pub started: bool,
+    /// Trees checked so far, of how many.
+    pub trees_done: u64,
+    pub trees: u64,
+    pub counts: pdmount_core::signatures::CheckCounts,
+    /// Found nodes in the trees checked, after the check.
+    pub found: u64,
+    /// Why the last check failed, if it did.
+    pub error: Option<String>,
 }
 
 /// `ConflictsList`.
@@ -561,6 +633,19 @@ pub struct CacheFreedReply {
     /// The profile's total afterwards; absent from older daemons.
     #[serde(default)]
     pub profile: Option<CacheProfileReply>,
+    /// `CacheWipe`: what each tree freed, My Files first; empty from older
+    /// daemons and for `CacheGc`.
+    #[serde(default)]
+    pub trees: Vec<CacheTreeFreed>,
+}
+
+/// What `CacheWipe` freed in one tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheTreeFreed {
+    /// `My Files`, or the tree as `signatures list` names its root.
+    pub name: String,
+    pub blocks: u64,
+    pub bytes: u64,
 }
 
 /// `Unmount`, and requests that answer only whether they worked.
@@ -748,6 +833,22 @@ pub fn remove(socket: &PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `absolute` and `trees` are new in M6.0.10: older peers parse without them.
+    #[test]
+    fn cache_wipe_parses_with_and_without_its_new_fields() {
+        let parse = |line: &str| serde_json::from_str::<Request>(line).expect("parse");
+        assert_eq!(
+            parse(r#"{"cmd":"cache_wipe","path":"/a"}"#),
+            Request::CacheWipe {
+                path: Some("/a".into()),
+                absolute: false
+            }
+        );
+        let reply: CacheFreedReply =
+            serde_json::from_str(r#"{"blocks":2,"bytes":9,"left_bytes":1}"#).expect("reply");
+        assert!(reply.trees.is_empty() && reply.profile.is_none());
+    }
 
     /// `force` is new in D108: an older client's `login` parses without it.
     #[test]

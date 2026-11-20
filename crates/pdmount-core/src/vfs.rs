@@ -19,7 +19,7 @@
 
 use crate::conflicts::{ConflictKind, ConflictNote, Namer};
 use crate::errors::CoreError;
-use pdmount_backend::{LinkId, NameHash, NodeKind, RemoteNode, RevisionId};
+use pdmount_backend::{LinkId, NameHash, NodeKind, RemoteNode, RevisionId, Unverified};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -59,6 +59,9 @@ pub struct RemoteState {
     pub mode: Option<u32>,
     pub sha1: Option<[u8; 20]>,
     pub name_hash: Option<NameHash>,
+    /// Signatures that did not verify at the last decode (D132); kept in
+    /// the store's `signatures` table.
+    pub unverified: Option<Unverified>,
 }
 
 impl RemoteState {
@@ -73,12 +76,14 @@ impl RemoteState {
             mode: node.mode.map(|mode| mode & 0o7777),
             sha1: node.sha1,
             name_hash: node.name_hash.clone(),
+            unverified: node.unverified.clone(),
         }
     }
 
     /// This state with the placement (parent, name, name hash) of `fresh`,
     /// which is the same node. The content fields stay: a newer revision is
-    /// a matter of the upload rules.
+    /// a matter of the upload rules. So do the failed signatures: only a
+    /// whole decode ([`RemoteState::from_remote`]) replaces them.
     pub fn with_placement_of(&self, fresh: &RemoteNode) -> Self {
         Self {
             parent_link: fresh.parent_link_id.clone(),
@@ -808,6 +813,7 @@ impl Tree {
                     && known.parent_link == remote.parent_link_id
                     && known.name == remote.name
                     && (remote.kind == NodeKind::Folder || known.rev == remote.active_revision)
+                    && known.unverified == remote.unverified
             })
     }
 
@@ -1144,16 +1150,19 @@ impl Tree {
         children: &[RemoteNode],
         new_inos: &mut Vec<Ino>,
     ) -> std::result::Result<Changes, ApplyError> {
-        self.apply_listing_at(dir, children, new_inos, u64::MAX)
+        self.apply_listing_at(dir, children, &[], new_inos, u64::MAX)
     }
 
     /// [`Tree::apply_listing`] for a listing fetched at clock `fetched_at`:
     /// nodes the executor changed since, and links it trashed since, are
     /// left alone, because the listing does not show those changes yet.
+    /// Known children whose link is `degraded` (listed, but their metadata
+    /// cannot be decrypted) stay as they are: degraded is not absent (D132).
     pub fn apply_listing_at(
         &mut self,
         dir: Ino,
         children: &[RemoteNode],
+        degraded: &[LinkId],
         new_inos: &mut Vec<Ino>,
         fetched_at: u64,
     ) -> std::result::Result<Changes, ApplyError> {
@@ -1289,7 +1298,10 @@ impl Tree {
                 .as_ref()
                 .filter(|r| r.parent_link.as_ref() == Some(&dir_link));
             match remote_here {
-                Some(remote) if !incoming_links.contains_key(&remote.link) => {
+                Some(remote)
+                    if !incoming_links.contains_key(&remote.link)
+                        && !degraded.contains(&remote.link) =>
+                {
                     if self.subtree_has_pending(ino) {
                         // Gone remotely (or moved) with local changes
                         // inside: the engine decides which (§10.5).
@@ -1348,8 +1360,17 @@ impl Tree {
                         fx.changes.remote_newer.push(ino);
                         fx.changes.changed.push(ino);
                     }
+                    let signatures_changed = self
+                        .nodes
+                        .get(&ino)
+                        .and_then(|node| node.remote.as_ref())
+                        .is_none_or(|known| known.unverified != remote.unverified);
                     self.set_remote(ino, Some(remote.clone()));
                     self.refresh_attrs(ino, &remote, &mut fx);
+                    if signatures_changed {
+                        // Its row carries them (D132).
+                        push_unique(&mut fx.changes.changed, ino);
+                    }
                     if !follows.contains(&ino) {
                         // A tombstone, or placed locally elsewhere.
                         continue;
@@ -2279,6 +2300,7 @@ mod tests {
             mode: None,
             sha1: None,
             name_hash: None,
+            unverified: None,
         }
     }
 
@@ -2296,6 +2318,7 @@ mod tests {
             sha1: None,
             name_hash: None,
             trashed: false,
+            unverified: None,
         }
     }
 
@@ -3230,6 +3253,34 @@ mod tests {
         tree.check_invariants().expect("consistent");
     }
 
+    /// D132: a child the server lists but cannot decrypt is not gone; a
+    /// child missing from the same listing is.
+    #[test]
+    fn a_degraded_child_stays_and_a_missing_one_goes() {
+        let mut tree = listed_tree(
+            &[
+                remote("a", "a", NodeKind::File, 1),
+                remote("b", "b", NodeKind::File, 1),
+            ],
+            2,
+        );
+        let listed = [remote("c", "c", NodeKind::File, 1)];
+        let changes = tree
+            .apply_listing_at(
+                ROOT_INO,
+                &listed,
+                &[LinkId::new("a")],
+                &mut inos(4..5),
+                u64::MAX,
+            )
+            .expect("apply");
+        assert_eq!(changes.removed, vec![3], "b is gone");
+        assert_eq!(tree.child(ROOT_INO, "a").expect("dir"), Some(2), "a stays");
+        assert_eq!(tree.child(ROOT_INO, "b").expect("dir"), None);
+        assert_eq!(tree.child(ROOT_INO, "c").expect("dir"), Some(4));
+        tree.check_invariants().expect("consistent");
+    }
+
     #[test]
     fn a_listing_fetched_before_a_stamp_leaves_the_node_alone() {
         let mut tree = listed_tree(&[remote("a", "a", NodeKind::File, 1)], 2);
@@ -3237,11 +3288,11 @@ mod tests {
         let fresh = RemoteState::from_remote(&remote("a", "b", NodeKind::File, 1));
         tree.set_remote_at(2, Some(fresh.clone()), 5);
         let stale = [remote("a", "a", NodeKind::File, 1)];
-        tree.apply_listing_at(ROOT_INO, &stale, &mut Vec::new(), 4)
+        tree.apply_listing_at(ROOT_INO, &stale, &[], &mut Vec::new(), 4)
             .expect("apply");
         assert_eq!(tree.get(2).expect("a").remote.as_ref(), Some(&fresh));
         // A listing fetched after the stamp applies.
-        tree.apply_listing_at(ROOT_INO, &stale, &mut Vec::new(), 5)
+        tree.apply_listing_at(ROOT_INO, &stale, &[], &mut Vec::new(), 5)
             .expect("apply");
         let remote_name = tree
             .get(2)

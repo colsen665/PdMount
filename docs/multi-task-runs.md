@@ -74,7 +74,7 @@ Agents run with `isolation: worktree` and the model of the plan's Model column. 
 
 - Agents run the quick CI. The orchestrator runs the full `scripts/ci.sh` on the integration tip once per wave or
   batch of waves, after fast-forwarding the main worktree to it, as D084 requires for `[full]` tasks and before anything
-  is pushed. One full run covers every task merged so far; per-task full runs in the agents would cost about 35 minutes
+  is pushed. One full run covers every task merged so far; per-task full runs in the agents would cost about an hour
   each and the merged result still needs its own run.
 - `scripts/ci.sh` runs every step and reports all failures at the end (D098), so a failing unit test no longer hides the
   scenarios; use `--fail-fast` only for quick loops.
@@ -108,5 +108,6 @@ one commit (`Mn review: <what>`). Then the final full CI.
 - After merging, remove the agents' worktrees and branches, after checking that each is clean (`git status
   --porcelain`) and its commit is on the integration branch (cherry-picked commits have new hashes). Remove the
   integration worktree and branch.
-- Remove `/dev/shm/pdmount-ci-*` (and the `.lock` files) of removed worktrees when nothing is mounted under them.
+- Remove `/dev/shm/pdmount-ci-*` of removed worktrees when nothing is mounted under them (each holds its `.lock`; older
+  runs left a `pdmount-ci-*.lock` beside it, removed too).
 - Leave the user's untracked files alone.

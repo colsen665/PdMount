@@ -377,6 +377,17 @@ impl Backend for TimedBackend {
             .await
     }
 
+    async fn list_children_checked(
+        &self,
+        folder: &LinkId,
+    ) -> pdmount_backend::Result<pdmount_backend::Listing> {
+        self.timed(
+            Op::BackendListChildren,
+            self.inner.list_children_checked(folder),
+        )
+        .await
+    }
+
     async fn get_nodes(&self, ids: &[LinkId]) -> pdmount_backend::Result<Vec<Option<RemoteNode>>> {
         self.timed(Op::BackendGetNodes, self.inner.get_nodes(ids))
             .await

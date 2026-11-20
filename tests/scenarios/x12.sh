@@ -2,12 +2,14 @@
 # X12 (DESIGN.md §15.3, D076): the pending marker, two daemons on one fake
 # drive. Device A, with `sync.pending_marker` on, runs out of grace with
 # changes left and leaves .pdmount/<device id>.pending in the root. Device B
-# shows `Incoming:` in status and gets one notification (notify-send stub);
+# shows `Incoming:` in status and gets one notification (a stub notification
+# server on a private session bus);
 # .pdmount is read-only in its mount. A's next mount drains and trashes the
 # marker, and B's `Incoming:` goes. A flush that finishes after leaving the
 # marker trashes it in the same stop (D096). Fake with the network profile.
 source "$(dirname "$0")/lib.sh"
 [[ $BACKEND == fake ]] || { echo "x12 writes outside pdmount-test/ (D028); fake only, skipped for BACKEND=$BACKEND"; exit 0; }
+need_dbus_daemon x12
 x_live_only
 ensure_dataset
 ensure_fake_drive
@@ -17,11 +19,10 @@ grace=16
 # B's poll interval (30 s) and a pass, with room for the network profile.
 limit=90
 
-saved_path=$PATH
 x12_cleanup() {
     x_restore
-    # B must not keep the stub for the scenarios after this one.
-    if is_mounted_second; then PATH=$saved_path pd2 unmount "$MNT2" >/dev/null 2>&1 || true; fi
+    # B must not keep the stub's bus for the scenarios after this one.
+    if is_mounted_second; then pd2 unmount "$MNT2" >/dev/null 2>&1 || true; fi
     scenario_cleanup
 }
 trap x12_cleanup EXIT
@@ -40,14 +41,13 @@ wait_until() { # <seconds> <what> <command...>
 incoming_b() { pd2 status 2>/dev/null | grep -E '^Incoming: +dev-a: [0-9]+ changes? \(' ; }
 no_incoming_b() { ! pd2 status 2>/dev/null | grep -q '^Incoming:'; }
 
-step "B mounted with a notify-send stub"
+step "B mounted with a notification stub on its own session bus"
 if is_mounted_second; then pd2 unmount "$MNT2"; fi
 notify_log=$work/notify.log
 : >"$notify_log"
-# The stub lives in the repository, since SCENARIO_ROOT may be noexec; a
-# session bus address only has to be set.
-PATH=$repo/tests/scenarios/stubs:$PATH X11_NOTIFY_LOG=$notify_log \
-    DBUS_SESSION_BUS_ADDRESS=unix:path=$work/no-session-bus mount_second
+start_session_bus x12
+start_notify_stub "$bus_address" "$notify_log"
+DBUS_SESSION_BUS_ADDRESS=$bus_address mount_second
 ls "$MNT2" >/dev/null
 
 step "A: the marker on, a grace of $grace s"

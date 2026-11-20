@@ -4,7 +4,10 @@
 # read before. The mount shows all three without a remount, through the
 # event stream (polled every 30 s, D033): the old names are gone from the
 # kernel's caches and the file reads its new content. Second client: the
-# fake's own CLI (BACKEND=fake only).
+# fake's own CLI (BACKEND=fake only). In live mode, a page that keeps failing
+# with an error that is not transient (node fetches broken, as for a node
+# under a folder that cannot be decrypted, M6.0.3 V-3) is given up after
+# three polls and the tree lists again: the change still shows.
 source "$(dirname "$0")/lib.sh"
 [[ $BACKEND == fake ]] || { echo "E1 needs a second client; skipped for BACKEND=$BACKEND"; exit 0; }
 [[ $VERIFY_MODE != second ]] || { echo "E1 has one device; skipped in second mode"; exit 0; }
@@ -34,10 +37,30 @@ until [[ -d "$area/moved" && ! -e "$area/dir" && ! -e "$area/g" && "$(cat "$area
 done
 echo "visible after $((SECONDS - start)) s"
 [[ "$(cat "$area/moved/f")" == old ]] || fail "the moved directory lost its content"
+c_final=after
+
+if [[ $VERIFY_MODE == live ]]; then
+    step "E1 [live]: a page that keeps failing is given up"
+    need_uid_a
+    log_mark
+    fake_fault broken-nodes --client "$uid_a"
+    printf again >"$work/c"
+    "$PDMOUNT" fake write --path /pdmount-test/e1/c --from "$work/c" "$FAKE_DIR"
+    start=$SECONDS
+    # Three failed polls, 30 s apart (§9.2: back-off 1, 1), then a refresh.
+    until [[ "$(cat "$area/c")" == again ]]; do
+        ((SECONDS - start < 150)) || fail "the change did not show after 150 s with node fetches broken"
+        sleep 2
+    done
+    echo "visible after $((SECONDS - start)) s"
+    log_since_mark | grep -q "an event page keeps failing" || fail "no warning about the page that was given up"
+    fake_fault clear
+    c_final=again
+fi
 
 verify_cycle
 area=$TEST_ROOT/e1
 [[ "$(ls "$area")" == "$(printf 'c\nmoved')" ]] || fail "unexpected entries after $VERIFY_MODE: $(ls "$area")"
-[[ "$(cat "$area/c")$(cat "$area/moved/f")" == afterold ]] || fail "content changed after $VERIFY_MODE"
+[[ "$(cat "$area/c")$(cat "$area/moved/f")" == "${c_final}old" ]] || fail "content changed after $VERIFY_MODE"
 check_hot_path
 echo "E1 [$VERIFY_MODE]: PASS"

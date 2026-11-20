@@ -291,6 +291,8 @@ impl Auth {
         let this = Arc::clone(self);
         tokio::spawn(async move {
             if let Err(error) = this.run_login(reason).await {
+                // `status` returns `login_error`, and `login` prints it (D071).
+                let error = session::redact_fork_selector(&error);
                 tracing::warn!(%error, "no new session");
                 *this.login_error.lock() = Some(error);
             }
@@ -333,7 +335,8 @@ impl Auth {
         let session = tokio::time::timeout(SIGN_IN_TIME + Duration::from_secs(30), begin)
             .await
             .map_err(|_| "the sign-in link expired; `pdmount login` starts a new one".to_owned())?
-            .map_err(|error| format!("sign-in did not complete: {error:#}"))?;
+            // The text starts with "sign-in did not complete" and has no selector.
+            .map_err(|error| session::redact_fork_selector(&format!("{error:#}")))?;
         self.adopt(session).await
     }
 
@@ -523,12 +526,8 @@ mod tests {
 
         for reason in [SignInReason::Rejected, SignInReason::Requested] {
             let (summary, body) = sign_in_notice(&profile, reason);
-            let argv = notify::argv(summary, &body);
-            assert!(argv.iter().any(|arg| arg.contains("pdmount login")));
-            assert!(
-                !argv.iter().any(|arg| arg.contains("proton.me")),
-                "{argv:?}"
-            );
+            assert!(body.contains("pdmount login"), "{body}");
+            assert!(!summary.contains("proton.me") && !body.contains("proton.me"));
         }
     }
 

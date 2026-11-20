@@ -177,6 +177,9 @@ pub async fn run_foreground(
     // keyring wait My Files keeps its own event task, and the further trees
     // get the pollers of their volumes when the wait ends.
     let pollers = Arc::new(pdmount_core::poller::Pollers::new());
+    // One announcer for the conflicts of every tree (§10.8, M6.2).
+    let conflicts =
+        crate::conflict_notify::Announcer::start(crate::conflict_notify::Settings::of(config));
     let roots = (!config.roots.is_empty()).then(|| {
         crate::roots::Roots::new(
             crate::roots::RootsContext {
@@ -189,6 +192,7 @@ pub async fn run_foreground(
                 budget,
                 read_only,
                 home: home.clone(),
+                conflicts: conflicts.clone(),
             },
             Arc::clone(&pollers),
         )
@@ -220,10 +224,28 @@ pub async fn run_foreground(
         None if start.waiting.is_some() => {}
         None => watch_fake_session(Arc::clone(engine.health())),
     }
-    let notices = tokio::spawn(announce_conflicts(engine.subscribe_conflicts()));
+    let notices = conflicts.follow(
+        None,
+        crate::conflict_notify::Place::my_files(mountpoint, !config.roots.is_empty()),
+        &engine,
+    );
     let incoming = tokio::spawn(crate::incoming::announce(engine.subscribe_incoming()));
+    let signatures = tokio::spawn(crate::signatures::announce(
+        None,
+        engine.subscribe_signatures(),
+    ));
     let textfile = textfile.map(|path| {
         crate::stats::spawn_textfile(Arc::clone(&engine), path, paths.profile.to_string())
+    });
+    // Slow downloads in every tree of the session (D137); off, the engine
+    // measures nothing. At the stop it closes what it has on screen.
+    let downloads = config.notify.downloads.then(|| {
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(crate::downloads::announce(
+            engine.scan_guard().slow_reads().subscribe(),
+            stopped,
+        ));
+        (task, stop)
     });
     tracing::info!(mountpoint = %mountpoint.display(), "mounted");
 
@@ -320,9 +342,15 @@ pub async fn run_foreground(
     notices.abort();
     resumed.abort();
     incoming.abort();
+    signatures.abort();
     if let Some(textfile) = textfile {
         textfile.abort();
     }
+    // The slow-download notifications close beside the rest of the stop.
+    let downloads = downloads.map(|(task, stop)| {
+        let _ = stop.send(());
+        task
+    });
     control::remove(&socket);
     if let Some(roots) = &roots {
         roots.shutdown(deadline).await;
@@ -338,6 +366,15 @@ pub async fn run_foreground(
     )
     .await;
     hurry.abort();
+    if let Some(mut downloads) = downloads {
+        // Each close has the bus calls' 2 s; a bus that hangs is not waited for.
+        if tokio::time::timeout(Duration::from_secs(3), &mut downloads)
+            .await
+            .is_err()
+        {
+            downloads.abort();
+        }
+    }
     flusher.end();
     crate::flush::log_left(&engine);
     let _ = std::fs::remove_file(&pid_file);

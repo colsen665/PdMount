@@ -66,6 +66,7 @@ impl Engine {
     /// snapshot could fill the cache after a change (§5.4).
     pub fn opendir(self: &Arc<Self>, ino: Ino) -> Result<(u64, bool)> {
         self.ensure_allowed(ino, MAY_READ)?;
+        self.ensure_verified(ino)?;
         let entries = self.tree.read().dir_entries(ino)?;
         let digest = {
             let mut hasher = std::hash::DefaultHasher::new();
@@ -152,6 +153,7 @@ impl Engine {
             return Ok((self.masked(attr), handle));
         }
         self.ensure_entry_writable(parent, name)?;
+        self.ensure_key_verified(parent)?;
         let ino = self.allocate_ino()?;
         let ignored = self.is_ignored(parent, name, false);
         // Staging first: a node never exists without its content.
@@ -184,6 +186,7 @@ impl Engine {
     pub fn mkdir(&self, parent: Ino, name: &[u8], mode: u32) -> Result<Attr> {
         let name = crate::vfs::validate_name(name)?;
         self.ensure_entry_writable(parent, name)?;
+        self.ensure_key_verified(parent)?;
         let ino = self.allocate_ino()?;
         let ignored = self.is_ignored(parent, name, true);
         let attr = {
@@ -208,6 +211,7 @@ impl Engine {
     pub(super) fn remove(&self, parent: Ino, name: &[u8], dir: bool) -> Result<()> {
         let name = crate::vfs::validate_name(name)?;
         self.ensure_entry_writable(parent, name)?;
+        self.ensure_child_verified(parent, name)?;
         let (ino, droppable, relist) = {
             let mut tree = self.tree.write();
             let ino = tree.remove_entry(parent, name, dir, now())?;
@@ -243,6 +247,14 @@ impl Engine {
         if let Some(target) = target {
             self.ensure_writable(target)?;
         }
+        // D132: a refused node is not renamed, moved or replaced, and
+        // nothing moves into, or gets a new name in, a folder whose key did
+        // not verify (the name is encrypted to it).
+        self.ensure_child_verified(parent, name)?;
+        if let Some(target) = target {
+            self.ensure_verified(target)?;
+        }
+        self.ensure_key_verified(new_parent)?;
         if parent != new_parent {
             // A directory moved elsewhere has its `..` rewritten (POSIX).
             let source = self.tree.read().child(parent, name)?;
@@ -343,6 +355,10 @@ impl Engine {
         let kind = self.tree.read().get(ino).ok_or(CoreError::NotFound)?.kind;
         if change != &SetAttr::default() {
             self.ensure_writable(ino)?;
+        }
+        if change.mode.is_some() || change.size.is_some() || change.mtime.is_some() {
+            // D132: changing it uploads a revision or its attributes.
+            self.ensure_verified(ino)?;
         }
         if change.size.is_some() && !self.writable_handle(ino, change.handle) {
             self.ensure_allowed(ino, MAY_WRITE)?;

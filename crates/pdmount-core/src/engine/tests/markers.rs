@@ -180,3 +180,44 @@ async fn an_adopted_marker_renamed_or_moved_is_not_trashed() {
         engine.shutdown().await.expect("shutdown");
     }
 }
+
+/// After a restart the cap still prefers a device whose marker was read
+/// before: twenty markers with lower ids, planted while the daemon was
+/// stopped, do not keep it out; nor does a write gate that closes and opens
+/// again (V-12).
+#[tokio::test]
+async fn a_device_read_before_a_restart_stays_within_the_cap() {
+    let backend = marker_drive().await;
+    upload_marker(&backend, "z-laptop", &body("z-laptop")).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = reader(&backend, dir.path()).await;
+    engine.scan_markers().await.expect("scan");
+    assert_eq!(engine.incoming_markers().len(), 1);
+    engine.shutdown().await.expect("shutdown");
+    drop(engine);
+
+    for n in 0..20 {
+        let name = format!("a{n:02}");
+        upload_marker(&backend, &name, &body(&name)).await;
+    }
+    let shows_laptop = |engine: &Engine| {
+        engine
+            .incoming_markers()
+            .iter()
+            .any(|m| m.device.as_deref() == Some("z-laptop"))
+    };
+    let engine = reader(&backend, dir.path()).await;
+    engine.sync_events().await.expect("events");
+    engine.scan_markers().await.expect("scan");
+    assert_eq!(engine.incoming_markers().len(), marker::MAX_MARKERS_READ);
+    assert_eq!(engine.incoming_not_read(), 5);
+    assert!(shows_laptop(&engine), "{:?}", engine.incoming_markers());
+
+    engine.set_write_gate(false);
+    engine.scan_markers().await.expect("scan");
+    assert!(engine.incoming_markers().is_empty());
+    engine.set_write_gate(true);
+    engine.scan_markers().await.expect("scan");
+    assert!(shows_laptop(&engine), "{:?}", engine.incoming_markers());
+    engine.shutdown().await.expect("shutdown");
+}

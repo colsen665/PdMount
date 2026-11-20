@@ -2,15 +2,16 @@
 //! (DESIGN.md §14.5; D080, D114, D124).
 //!
 //! A share that is revoked while changes to it are queued, or while it holds
-//! local-only files, leaves the mount, but nothing staged is deleted (RQ3):
-//! before its engine stops, the daemon asks it to write the content of every
-//! queued file and every local-only file (`.pdignore`d, §7.7: never in the
-//! journal, its content only in the staging) to
-//! `orphaned/<tree>/files/<path in the tree>` and to list each in
-//! [`MANIFEST`]. A file's content is read the way an upload reads it, from
-//! the staging file and the base blocks it builds on (block cache, then the
-//! server); one whose content cannot be written is listed with the reason,
-//! and the daemon keeps the tree's raw state beside it.
+//! staged content no entry uploads, leaves the mount, but nothing staged is
+//! deleted (RQ3): before its engine stops, the daemon asks it to write the
+//! content of every queued file and every other staged file the drive does
+//! not have (a local-only file, or an edit of an uploaded file in a
+//! local-only folder, §7.7: never in the journal, its content only in the
+//! staging) to `orphaned/<tree>/files/<path in the tree>` and to list each
+//! in [`MANIFEST`]. A file's content is read the way an upload reads it,
+//! from the staging file and the base blocks it builds on (block cache, then
+//! the server); one whose content cannot be written is listed with the
+//! reason, and the daemon keeps the tree's raw state beside it.
 
 use super::queue::{QueueKind, entry_path, kind_of};
 use super::*;
@@ -22,6 +23,9 @@ pub const MANIFEST: &str = "pdmount-orphaned.json";
 pub const FILES_DIR: &str = "files";
 /// [`OrphanEntry::change`] of a local-only file (D124).
 pub const LOCAL_ONLY: &str = "local-only";
+/// [`OrphanEntry::change`] of a file with a remote whose staged content
+/// was never queued: an edit in a local-only folder (§7.7, M6.0.3 V-1).
+pub const NOT_UPLOADED: &str = "not-uploaded";
 const MANIFEST_VERSION: u64 = 1;
 
 /// One queued change of an export.
@@ -30,7 +34,9 @@ pub struct OrphanEntry {
     /// Its path in the tree.
     pub path: String,
     /// What was queued: `upload`, `create-folder`, `move`, `trash`,
-    /// `metadata`; or [`LOCAL_ONLY`]: a file that was never to upload.
+    /// `metadata`; or, for a staged file no entry uploads, [`LOCAL_ONLY`]
+    /// (no remote: it was never to upload) or [`NOT_UPLOADED`] (a remote
+    /// file whose staged edit stayed local, in a local-only folder).
     pub change: String,
     /// Where its content is, relative to the export's directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -87,6 +93,15 @@ impl OrphanManifest {
     }
 }
 
+/// An attached file with content the drive does not have, if no journal
+/// entry uploads it: local-only, or staged content not uploaded.
+fn is_unqueued_content(node: &crate::vfs::Node) -> bool {
+    node.kind == NodeKind::File
+        && node.attached
+        && !node.deleted
+        && (node.local_only || node.content_pending())
+}
+
 /// A file that never uploads: local-only, attached, no remote (§7.7).
 fn is_local_only_file(node: &crate::vfs::Node) -> bool {
     node.kind == NodeKind::File
@@ -109,29 +124,41 @@ fn relative(path: &str) -> Option<PathBuf> {
 }
 
 impl Engine {
-    /// Staged files that stay local-only (§7.7, D124): attached, never
-    /// uploaded, matched by the rules or in a local-only folder. They are
-    /// never in the journal, so the queue's counts leave them out; their
-    /// content is only in the staging.
-    pub fn local_only_staged(&self) -> Vec<Ino> {
+    /// Staged files whose content no journal entry will upload (§7.7,
+    /// D114): attached files, not in the journal, with a local-only flag or
+    /// content not uploaded, whatever the reason they are not queued (a
+    /// local-only file, an edit in a local-only folder). The queue's counts
+    /// leave them out; their content is only in the staging.
+    pub fn unqueued_staged(&self) -> Vec<Ino> {
+        let queued: std::collections::HashSet<Ino> = self.journal.inos().into_iter().collect();
         let mut staged: Vec<Ino> = self.staged.lock().keys().copied().collect();
+        staged.retain(|ino| !queued.contains(ino));
         let tree = self.tree.read();
-        staged.retain(|ino| tree.get(*ino).is_some_and(is_local_only_file));
+        staged.retain(|ino| tree.get(*ino).is_some_and(is_unqueued_content));
         staged
     }
 
-    /// Writes the content of every queued file and every local-only file
-    /// ([`Engine::local_only_staged`]) under `dir`/[`FILES_DIR`] at its path
-    /// in the tree, makes the folders queued for creation, and returns every
-    /// queued change and local-only file. A staged file of the tree whose
-    /// content could not be written has an [`OrphanEntry::error`]. Hold the
-    /// queue first ([`Engine::withdraw_write_access`]), so no step runs
-    /// meanwhile.
+    /// The changes a gone tree must not delete: the queued ones and
+    /// [`Engine::unqueued_staged`]. With none, its state may go (§14.5).
+    pub fn changes_to_keep(&self) -> usize {
+        let counts = self.queue_counts();
+        counts.pending + counts.parked + self.unqueued_staged().len()
+    }
+
+    /// Writes the content of every queued file and every staged file no
+    /// entry uploads ([`Engine::unqueued_staged`]) under `dir`/[`FILES_DIR`]
+    /// at its path in the tree, makes the folders queued for creation, and
+    /// returns every queued change and unqueued file, each once: a
+    /// [`LOCAL_ONLY`] file has no remote, a [`NOT_UPLOADED`] one has. A
+    /// staged file of the tree whose content could not be written has an
+    /// [`OrphanEntry::error`]. Hold the queue first
+    /// ([`Engine::withdraw_write_access`]), so no step runs meanwhile.
     pub async fn export_queued(self: &Arc<Self>, dir: &Path) -> Result<Vec<OrphanEntry>> {
         let files = dir.join(FILES_DIR);
         std::fs::create_dir_all(&files)?;
         let mut inos = self.journal.inos();
-        inos.extend(self.local_only_staged());
+        let unqueued: std::collections::HashSet<Ino> = self.unqueued_staged().into_iter().collect();
+        inos.extend(unqueued.iter().copied());
         inos.sort_unstable();
         inos.dedup();
         let mut out = Vec::new();
@@ -159,6 +186,8 @@ impl Engine {
                 path,
                 change: if local_only {
                     LOCAL_ONLY.to_owned()
+                } else if unqueued.contains(&ino) {
+                    NOT_UPLOADED.to_owned()
                 } else {
                     kind.as_str().to_owned()
                 },

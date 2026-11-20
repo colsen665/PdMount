@@ -262,6 +262,9 @@ pub struct Conflict {
     /// Unix seconds.
     pub created_at: i64,
     pub state: ConflictState,
+    /// Unix seconds when the notification service accepted this conflict's
+    /// desktop notification (M6.3); `None`: not shown yet.
+    pub notified_at: Option<i64>,
 }
 
 /// How `conflicts resolve` settles a conflict (§10.8).
@@ -322,7 +325,7 @@ impl Conflicts {
     pub fn load(conn: &Connection) -> rusqlite::Result<Self> {
         let mut statement = conn.prepare(
             "SELECT id, kind, ino, other_ino, link_id, orig_name, conflict_name, local_rev, remote_rev,
-                    local_device, detail, created_at, state
+                    local_device, detail, created_at, state, notified_at
              FROM conflicts",
         )?;
         let mut by_id = BTreeMap::new();
@@ -347,6 +350,7 @@ impl Conflicts {
                     detail: row.get(10)?,
                     created_at: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
                     state: ConflictState::Open,
+                    notified_at: row.get(13)?,
                 },
             ))
         })?;
@@ -389,6 +393,7 @@ impl Conflicts {
             detail: note.detail,
             created_at: at,
             state: note.kind.initial_state(),
+            notified_at: None,
         };
         self.by_id.insert(id, conflict.clone());
         conflict
@@ -411,6 +416,28 @@ impl Conflicts {
 
     pub fn get(&self, id: i64) -> Option<&Conflict> {
         self.by_id.get(&id)
+    }
+
+    /// Notes that conflict `id` was shown at `at` (unix seconds); false when
+    /// it is unknown or was shown before.
+    pub fn mark_notified(&mut self, id: i64, at: i64) -> bool {
+        match self.by_id.get_mut(&id) {
+            Some(conflict) if conflict.notified_at.is_none() => {
+                conflict.notified_at = Some(at);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The ids of the conflicts that wait for the user (`open`) and whose
+    /// notification was not shown yet, oldest first.
+    pub fn unnotified_open(&self) -> Vec<i64> {
+        self.by_id
+            .values()
+            .filter(|c| c.state == ConflictState::Open && c.notified_at.is_none())
+            .map(|c| c.id)
+            .collect()
     }
 
     /// The conflicts that are not resolved and name `ino` as either inode,
@@ -448,12 +475,20 @@ impl Conflicts {
     }
 }
 
-/// Stores a conflict, replacing the row with the same id.
+/// Stores a conflict, updating the row with the same id. `notified_at` is
+/// written only with a new row: [`store_notified`] changes it later, and a
+/// row written from an older copy must not undo that.
 pub fn store_conflict(conn: &Connection, conflict: &Conflict) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO conflicts(id, kind, ino, other_ino, link_id, orig_name, conflict_name,
-             local_rev, remote_rev, local_device, detail, created_at, state)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        "INSERT INTO conflicts(id, kind, ino, other_ino, link_id, orig_name, conflict_name,
+             local_rev, remote_rev, local_device, detail, created_at, state, notified_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+         ON CONFLICT(id) DO UPDATE SET
+             kind = excluded.kind, ino = excluded.ino, other_ino = excluded.other_ino,
+             link_id = excluded.link_id, orig_name = excluded.orig_name,
+             conflict_name = excluded.conflict_name, local_rev = excluded.local_rev,
+             remote_rev = excluded.remote_rev, local_device = excluded.local_device,
+             detail = excluded.detail, created_at = excluded.created_at, state = excluded.state",
         params![
             conflict.id,
             conflict.kind.as_str(),
@@ -468,7 +503,18 @@ pub fn store_conflict(conn: &Connection, conflict: &Conflict) -> rusqlite::Resul
             conflict.detail,
             conflict.created_at,
             conflict.state.as_str(),
+            conflict.notified_at,
         ],
+    )
+    .map(drop)
+}
+
+/// Records that conflict `id` was shown at `at`; a row shown before keeps
+/// its time.
+pub fn store_notified(conn: &Connection, id: i64, at: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE conflicts SET notified_at = ?2 WHERE id = ?1 AND notified_at IS NULL",
+        params![id, at],
     )
     .map(drop)
 }

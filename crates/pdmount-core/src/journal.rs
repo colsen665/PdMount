@@ -1570,6 +1570,7 @@ impl Engine {
                         mode: None,
                         sha1: None,
                         name_hash: None,
+                        unverified: None,
                     },
                 );
                 Ok(())
@@ -2042,12 +2043,13 @@ impl Engine {
             }
             NodeKind::Folder => {
                 check_not_hot(&self.metrics, "list_children");
-                let kids = match self.backend.list_children(&fresh.link_id).await {
-                    Ok(kids) => kids,
-                    // The folder is gone; the trash call says so.
-                    Err(BackendError::NotFound) => return Ok(TrashCheck::Trash),
-                    Err(error) => return Err(error),
-                };
+                let (kids, unreadable) =
+                    match self.backend.list_children_checked(&fresh.link_id).await {
+                        Ok(listing) => (listing.children, listing.degraded.len()),
+                        // The folder is gone; the trash call says so.
+                        Err(BackendError::NotFound) => return Ok(TrashCheck::Trash),
+                        Err(error) => return Err(error),
+                    };
                 // Kids the local tree knows: moved elsewhere (wait for the
                 // move), or deleted too (their own entries trash them; wait
                 // for deleted folders). A wait depends on the kid's entry,
@@ -2057,7 +2059,9 @@ impl Engine {
                     let tree = self.tree.read();
                     kids.iter().map(|kid| tree.by_link(&kid.link_id)).collect()
                 };
-                let mut foreign = 0usize;
+                // A kid that cannot be decrypted cannot be checked: it counts
+                // as one the delete does not account for (D132).
+                let mut foreign = unreadable;
                 for (kid, held) in kids.iter().zip(known) {
                     let Some(held) = held else {
                         foreign += 1;
@@ -2894,6 +2898,7 @@ impl Engine {
                     mode: Some(snapshot.mode),
                     sha1: Some(snapshot.sha1),
                     name_hash: uploaded.name_hash.clone(),
+                    unverified: None,
                 }),
             );
             let Some(node) = tree.get_mut(ino) else {

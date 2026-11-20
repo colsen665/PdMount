@@ -32,6 +32,7 @@ use pdmount_backend::NodeKind;
 use pdmount_backend::shared::{
     OnGone, ShareRole, ShareTree, SharedEntry, SharedListing, SharedWithMe,
 };
+use pdmount_core::config::SignatureMode;
 use pdmount_core::poller::{Pollers, ShareListener, VolumeUse};
 use pdmount_fuse::{TreePlace, TreeSet};
 use std::collections::{BTreeMap, BTreeSet};
@@ -436,9 +437,14 @@ pub(super) struct SharedRoot {
     session: Session,
     source: Arc<dyn SharedWithMe>,
     set: TreeSet,
+    /// Where the root is mounted: its trees are folders of it, its shared
+    /// files are in [`FILES_FOLDER`].
+    mountpoint: std::path::PathBuf,
     read_only: bool,
     /// `pending_marker` of the root (D076, D114).
     pending_marker: bool,
+    /// The root's mode for unverified signatures (D132).
+    signatures: SignatureMode,
     /// Where the shown names are kept between mounts (D125).
     names_file: std::path::PathBuf,
     /// Held through a refresh or a drop, so they run one at a time.
@@ -464,8 +470,10 @@ impl SharedRoot {
         roots: &Arc<Roots>,
         session: Session,
         set: TreeSet,
+        mountpoint: &std::path::Path,
         read_only: bool,
         pending_marker: bool,
+        signatures: SignatureMode,
     ) -> Arc<Self> {
         let source = session.source.shares();
         let (gone, mut gone_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -480,8 +488,10 @@ impl SharedRoot {
             session,
             source: Arc::clone(&source),
             set,
+            mountpoint: mountpoint.to_owned(),
             read_only,
             pending_marker,
+            signatures,
             names_file,
             inner: tokio::sync::Mutex::new(inner),
             view: parking_lot::Mutex::default(),
@@ -748,6 +758,7 @@ impl SharedRoot {
             own,
             writable: may_write(entry),
             pending_marker: self.pending_marker,
+            signatures: self.signatures,
         };
         let on_gone: OnGone = {
             let gone = self.gone.clone();
@@ -809,7 +820,16 @@ impl SharedRoot {
             })
         };
         engine.follow_write_refusals(refused);
-        super::announce_tree(&shown.name, &engine);
+        let place = match entry.kind {
+            NodeKind::Folder => {
+                crate::conflict_notify::Place::folder(&shown.name, &self.mountpoint)
+            }
+            NodeKind::File => crate::conflict_notify::Place::file(
+                &shown.name,
+                self.mountpoint.join(FILES_FOLDER).join(&shown.name),
+            ),
+        };
+        super::announce_tree(&roots, &shown.name, place, &engine);
         engine.start_background_polled();
         roots.pollers.add(&entry.volume, own, Arc::clone(&engine));
         Ok(OpenShare {
@@ -819,6 +839,7 @@ impl SharedRoot {
                 volume: entry.volume.clone(),
                 own,
                 engine,
+                file: entry.kind == NodeKind::File,
             },
             shown: shown.clone(),
         })
@@ -861,10 +882,10 @@ impl SharedRoot {
                     "an event pass over a gone share still runs; it changes nothing any more"
                 );
             }
-            // Local-only files count as changes to keep: their content is
-            // only in the staging this removal would delete (RQ3, D124).
-            let counts = engine.queue_counts();
-            let queued = counts.pending + counts.parked + engine.local_only_staged().len();
+            // Staged content no entry uploads (local-only files, edits in a
+            // local-only folder) counts as changes to keep: it is only in
+            // the staging this removal would delete (RQ3, D114).
+            let queued = engine.changes_to_keep();
             let kept = match weak.upgrade() {
                 Some(roots) if queued > 0 => roots.orphan(&name, &engine, reason).await,
                 _ => None,
@@ -945,11 +966,15 @@ impl SharedRoot {
 }
 
 /// A desktop notification that a share's changes wait (D114). The share's
-/// name is plain text in the summary; the body may be read as markup.
+/// name is plain text in the summary, cleaned (`notify::clean_name`); the
+/// body may be read as markup.
 fn notify_held(name: &str, held: usize) {
     let noun = if held == 1 { "change" } else { "changes" };
     crate::notify::desktop(
-        &format!("PdMount: {held} {noun} to {name} wait"),
+        &format!(
+            "PdMount: {held} {noun} to {} wait",
+            crate::notify::clean_name(name)
+        ),
         "The share no longer allows changes; they are kept. See `pdmount status`.",
     );
 }

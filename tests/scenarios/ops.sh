@@ -58,6 +58,12 @@ for _ in {1..80}; do
 done
 status_text | grep -q '^Events: *last poll [0-9]* s ago' || fail "no event line: $(status_text)"
 
+step "doctor's clock line has the mount's server time offset (D133)"
+# The fake answers no Drive API requests, so the daemon has adopted none.
+clock_line=$(pd doctor 2>/dev/null | grep '^\[[^]]*\] clock ' || true)
+[[ $clock_line == *"the mount has adopted no server time offset"* ]] \
+    || fail "doctor's clock line: ${clock_line:-none}"
+
 step "mount -o ro"
 pd unmount "$MNT"
 pd mount "${backend_flag[@]}" -o ro "$MNT"

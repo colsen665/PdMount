@@ -152,7 +152,40 @@ pub async fn begin_web_login(
     let options = client_options(paths, &Credentials::new(paths))?;
     ProtonAPISession::begin_via_web(app_version(), options, on_sign_in)
         .await
-        .context("sign-in did not complete")
+        .map_err(|error| {
+            // Flattened so that no layer of the chain can show the selector.
+            anyhow::anyhow!(
+                "sign-in did not complete: {}",
+                redact_fork_selector(&format!("{error:#}"))
+            )
+        })
+}
+
+/// Replaces the selector in `…/sessions/forks/<selector>` with `<redacted>`: the
+/// selector alone collects a sign-in's tokens (D071). A second layer behind the
+/// SDK fork's error texts (P16).
+pub fn redact_fork_selector(text: &str) -> String {
+    const MARKER: &str = "/sessions/forks/";
+    let ends_segment = |c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                ')' | '(' | '?' | '#' | '"' | '\'' | ',' | ';' | ':' | '<' | '>' | '[' | ']' | '`'
+            )
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(MARKER) {
+        let (head, tail) = rest.split_at(start + MARKER.len());
+        out.push_str(head);
+        let end = tail.find(ends_segment).unwrap_or(tail.len());
+        if end > 0 {
+            out.push_str("<redacted>");
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Stores a new session (D029 modes).
@@ -362,6 +395,7 @@ pub async fn proton_backend(
     )
     .await?;
     backend.set_photos(photos_clients(&logged_in.session, device, limits));
+    backend.set_shared_api(&logged_in.session);
     Ok(backend)
 }
 
@@ -435,6 +469,7 @@ pub fn proton_backend_offline(
         pdmount_backend::LinkId::new(known.root.clone()),
     );
     backend.set_photos(photos_clients(&logged_in.session, device, limits));
+    backend.set_shared_api(&logged_in.session);
     Ok(backend)
 }
 
@@ -604,6 +639,37 @@ mod tests {
         assert!(needs_login(&locked));
         assert!(!needs_login(&anyhow::Error::from(BackendError::NotFound)));
         assert!(!needs_login(&anyhow::anyhow!("other")));
+    }
+
+    /// M6.0.3 V-2: a sign-in error never shows a session-fork selector.
+    #[test]
+    fn sign_in_errors_hide_the_fork_selector() {
+        let error = anyhow::anyhow!(
+            "error sending request for url (https://drive-api.proton.me/auth/v4/sessions/forks/Sel3ctor-x_Y)"
+        )
+        .context("polling the session fork failed")
+        .context("sign-in did not complete");
+        let text = redact_fork_selector(&format!("{error:#}"));
+        assert!(!text.contains("Sel3ctor"), "{text}");
+        assert_eq!(
+            text,
+            "sign-in did not complete: polling the session fork failed: error sending request for \
+             url (https://drive-api.proton.me/auth/v4/sessions/forks/<redacted>)"
+        );
+        assert_eq!(
+            redact_fork_selector(
+                "for auth/v4/sessions/forks/<selector>: GET /sessions/forks/abc d"
+            ),
+            "for auth/v4/sessions/forks/<selector>: GET /sessions/forks/<redacted> d"
+        );
+        assert_eq!(
+            redact_fork_selector("/sessions/forks/a/b?x=1 and /sessions/forks/"),
+            "/sessions/forks/<redacted>?x=1 and /sessions/forks/"
+        );
+        assert_eq!(
+            redact_fork_selector("auth/v4/sessions/forks"),
+            "auth/v4/sessions/forks"
+        );
     }
 
     fn stored(access: &str) -> proton_drive_sdk::proton_sdk_rs2::ser::StoredCredentials {

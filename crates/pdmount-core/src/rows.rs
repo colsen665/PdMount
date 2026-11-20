@@ -1,9 +1,10 @@
 //! Inode rows in the store (DESIGN.md §13.2): the `inodes` table holds the
 //! local state of every attached node and tombstone, `remote` the last
-//! known remote state, keyed by link.
+//! known remote state, keyed by link, and `signatures` the failed
+//! signatures of that state (D132), next to it.
 
 use crate::vfs::{Gens, Ino, NodeRow, RemoteState, ns_to_system_time, system_time_to_ns};
-use pdmount_backend::{LinkId, NameHash, NodeKind, RevisionId};
+use pdmount_backend::{LinkId, NameHash, NodeKind, RevisionId, Unverified};
 use rusqlite::{Connection, params};
 
 /// Inode numbers stay far below `i64::MAX`; SQLite integers are signed.
@@ -102,15 +103,21 @@ pub fn write_rows(conn: &Connection, rows: &[(Ino, Option<NodeRow>)]) -> rusqlit
                 remote.mode,
                 remote.sha1.map(|digest| digest.to_vec()),
             ])?;
+            crate::signatures::write(conn, &remote.link, remote.unverified.as_ref())?;
         }
     }
-    // Remote rows nobody refers to any more.
+    // Remote rows nobody refers to any more, with their signatures.
     let mut orphaned = conn.prepare_cached(
         "DELETE FROM remote WHERE link_id = ?1
            AND NOT EXISTS (SELECT 1 FROM inodes WHERE inodes.link_id = ?1)",
     )?;
+    let mut orphaned_signatures = conn.prepare_cached(
+        "DELETE FROM signatures WHERE link_id = ?1
+           AND NOT EXISTS (SELECT 1 FROM inodes WHERE inodes.link_id = ?1)",
+    )?;
     for link in old_links {
-        orphaned.execute([link])?;
+        orphaned.execute([&link])?;
+        orphaned_signatures.execute([&link])?;
     }
     Ok(())
 }
@@ -141,8 +148,9 @@ pub fn load_rows(conn: &Connection) -> rusqlite::Result<Vec<NodeRow>> {
                 i.local_only, i.deleted, i.content_gen, i.meta_gen, i.uploaded_content_gen,
                 i.uploaded_meta_gen, i.deferred_error,
                 r.link_id, r.parent_link, r.name, r.name_hash, r.active_rev, r.size, r.mtime_ns, r.mode, r.sha1,
-                i.atime_ns, i.remote_newer
-         FROM inodes i LEFT JOIN remote r ON r.link_id = i.link_id",
+                i.atime_ns, i.remote_newer, s.parts, s.signer, s.digest
+         FROM inodes i LEFT JOIN remote r ON r.link_id = i.link_id
+              LEFT JOIN signatures s ON s.link_id = r.link_id",
     )?;
     let rows = statement
         .query_map([], |row| {
@@ -160,6 +168,14 @@ pub fn load_rows(conn: &Connection) -> rusqlite::Result<Vec<NodeRow>> {
                     sha1: row
                         .get::<_, Option<Vec<u8>>>(24)?
                         .and_then(|digest| <[u8; 20]>::try_from(digest).ok()),
+                    unverified: match row.get::<_, Option<u8>>(27)? {
+                        Some(parts) => Unverified::from_stored(
+                            parts,
+                            row.get::<_, Option<String>>(28)?.unwrap_or_default(),
+                            row.get::<_, Option<String>>(29)?.unwrap_or_default(),
+                        ),
+                        None => None,
+                    },
                 }),
                 None => None,
             };

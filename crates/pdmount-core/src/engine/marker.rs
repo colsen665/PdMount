@@ -9,7 +9,10 @@
 //! (its write gate is open: My Files, an editor's or admin's share; D126):
 //! after each event pass the engine reads the markers of other devices in
 //! `.pdmount/`, at most [`MAX_MARKERS_READ`] of them, and keeps them for
-//! `status` and one notification per pass that found new ones.
+//! `status` and one notification per pass that found new ones. The cap
+//! prefers the devices read at the last pass, then those whose markers were
+//! read before, also in an earlier run (`meta.incoming_devices`, oldest
+//! first), and then the rest by device id (D126, V-12).
 //!
 //! A marker comes from another device, so it is untrusted input (D070): its
 //! size is capped before it is fetched and parsed, its fields are checked
@@ -30,7 +33,7 @@ use bytes::Bytes;
 use pdmount_backend::{BackendError, FileMeta, LinkId, NodeKind, RevisionId, UploadSource};
 use serde::{Deserialize, Serialize};
 use sha1::Digest;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -48,6 +51,9 @@ pub const STALE_AFTER: Duration = Duration::from_secs(7 * 24 * 3600);
 /// At most this many markers of other devices are read per pass; the rest
 /// are counted, logged once and not fetched (D126).
 pub const MAX_MARKERS_READ: usize = 16;
+/// At most this many devices whose markers were read are remembered for the
+/// cap's order (V-12).
+pub const MAX_KNOWN_DEVICES: usize = 4 * MAX_MARKERS_READ;
 /// Device names are cut to this many characters.
 const MAX_DEVICE_CHARS: usize = 64;
 const MARKER_VERSION: u64 = 1;
@@ -55,6 +61,9 @@ const MARKER_VERSION: u64 = 1;
 const META_OWN: &str = "pending_marker";
 /// `meta` key: the marker revisions already announced, as a JSON list.
 const META_NOTIFIED: &str = "incoming_notified";
+/// `meta` key: the devices whose markers were read, oldest known first, as
+/// a JSON list of device ids (V-12). A store without it knows none.
+const META_KNOWN: &str = "incoming_devices";
 /// Markers are read after each event pass, and at least this often.
 const SCAN_FALLBACK: Duration = Duration::from_secs(120);
 /// How often the drain watcher looks at the queue.
@@ -281,6 +290,10 @@ pub(crate) struct Markers {
     seen: parking_lot::Mutex<BTreeMap<String, Seen>>,
     /// Marker revisions already announced (link/revision).
     notified: parking_lot::Mutex<HashSet<String>>,
+    /// Devices whose markers were read, in this run or an earlier one,
+    /// oldest known first; at most [`MAX_KNOWN_DEVICES`]. Kept when the
+    /// write gate closes.
+    known: parking_lot::Mutex<Vec<uuid::Uuid>>,
     /// Markers beyond [`MAX_MARKERS_READ`] at the last pass, not read.
     not_read: AtomicU64,
     /// The marker leaves out the device name (a share's tree, D076).
@@ -300,6 +313,10 @@ impl Markers {
             .meta_get(META_NOTIFIED)?
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default();
+        let known = store
+            .meta_get(META_KNOWN)?
+            .map(|text| parse_known(&text))
+            .unwrap_or_default();
         Ok(Self {
             own: parking_lot::Mutex::new(own),
             own_generation: AtomicU64::new(0),
@@ -308,12 +325,58 @@ impl Markers {
             trashed: parking_lot::Mutex::default(),
             seen: parking_lot::Mutex::default(),
             notified: parking_lot::Mutex::new(notified),
+            known: parking_lot::Mutex::new(known),
             not_read: AtomicU64::new(0),
             anonymous: AtomicBool::new(false),
             scan: tokio::sync::Notify::new(),
             notices: tokio::sync::broadcast::channel(16).0,
         })
     }
+}
+
+/// The stored known devices: canonical ids only, each once, at most
+/// [`MAX_KNOWN_DEVICES`]; anything else (an older store's absence, a value
+/// that does not parse) knows none.
+fn parse_known(text: &str) -> Vec<uuid::Uuid> {
+    let ids: Vec<String> = serde_json::from_str(text).unwrap_or_default();
+    let mut known = Vec::new();
+    for id in ids {
+        let Ok(parsed) = uuid::Uuid::parse_str(&id) else {
+            continue;
+        };
+        if parsed.hyphenated().to_string() == id && !known.contains(&parsed) {
+            known.push(parsed);
+        }
+        if known.len() == MAX_KNOWN_DEVICES {
+            break;
+        }
+    }
+    known
+}
+
+/// Adds the devices `read` in a pass to `known` (oldest first). When it is
+/// full, a new device takes the place of the newest known one not read in
+/// this pass, so the devices known longest keep theirs and markers planted
+/// in numbers cannot push them out (V-12). Whether `known` changed.
+fn remember_known(known: &mut Vec<uuid::Uuid>, read: &HashSet<uuid::Uuid>) -> bool {
+    let mut new: Vec<uuid::Uuid> = read
+        .iter()
+        .filter(|id| !known.contains(id))
+        .copied()
+        .collect();
+    new.sort();
+    let changed = !new.is_empty();
+    for id in new {
+        if known.len() >= MAX_KNOWN_DEVICES {
+            // A pass reads at most `MAX_MARKERS_READ`, fewer than fit.
+            let Some(index) = known.iter().rposition(|old| !read.contains(old)) else {
+                break;
+            };
+            known.remove(index);
+        }
+        known.push(id);
+    }
+    changed
 }
 
 /// What [`Engine::leave_pending_marker`] did.
@@ -619,10 +682,23 @@ impl Engine {
             self.adopt_own_marker(link);
         }
         let previous = self.markers.seen.lock().clone();
-        // The cap (D126): devices already known first, so markers planted
-        // later cannot push them out, then by id.
+        let known: HashMap<uuid::Uuid, usize> = self
+            .markers
+            .known
+            .lock()
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (*id, index))
+            .collect();
+        // The cap (D126): the devices shown first, then those read before,
+        // also in an earlier run, oldest known first, so markers planted
+        // later cannot push them out (V-12), then by id.
         files.sort_by_cached_key(|(id, ..)| {
-            (!previous.contains_key(&id.hyphenated().to_string()), *id)
+            (
+                !previous.contains_key(&id.hyphenated().to_string()),
+                known.get(id).copied().unwrap_or(usize::MAX),
+                *id,
+            )
         });
         let not_read = files.len().saturating_sub(MAX_MARKERS_READ) as u64;
         files.truncate(MAX_MARKERS_READ);
@@ -666,7 +742,7 @@ impl Engine {
 
     /// The write gate is closed: no marker is shown. What was announced
     /// stays remembered, so a gate that opens again does not announce the
-    /// same markers twice.
+    /// same markers twice, and so do the known devices.
     fn forget_seen(&self) {
         self.markers.seen.lock().clear();
         self.markers.not_read.store(0, Ordering::SeqCst);
@@ -688,9 +764,27 @@ impl Engine {
     /// not announced before, in one notice, and remembers them in the
     /// store. The revisions in `unread` are on the drive but could not be
     /// fetched: they stay remembered as announced if they were. The cap
-    /// left `not_read` markers out.
+    /// left `not_read` markers out. The devices whose markers passed the
+    /// checks become known (V-12).
     fn replace_seen(&self, seen: BTreeMap<String, Seen>, unread: &HashSet<String>, not_read: u64) {
         let now = self.clock()();
+        let read: HashSet<uuid::Uuid> = seen
+            .iter()
+            .filter(|(_, entry)| entry.marker.is_some())
+            .filter_map(|(id, _)| uuid::Uuid::parse_str(id).ok())
+            .collect();
+        let known = {
+            let mut known = self.markers.known.lock();
+            remember_known(&mut known, &read).then(|| {
+                let list: Vec<String> =
+                    known.iter().map(|id| id.hyphenated().to_string()).collect();
+                serde_json::to_string(&list).unwrap_or_default()
+            })
+        };
+        if let Some(value) = known {
+            self.store
+                .write(move |conn| meta_set(conn, META_KNOWN, &value));
+        }
         let mut keys: HashSet<String> = seen.values().map(Seen::key).collect();
         keys.extend(unread.iter().cloned());
         let mut fresh = Vec::new();
@@ -1093,6 +1187,85 @@ mod tests {
         ] {
             assert_eq!(marker_device_id(&name), None, "{name}");
         }
+    }
+
+    fn uuid(n: u128) -> uuid::Uuid {
+        uuid::Uuid::from_u128(n)
+    }
+
+    /// A full set of known devices keeps the oldest: a new device takes the
+    /// place of the newest one not read in that pass (V-12).
+    #[test]
+    fn known_devices_are_bounded_and_keep_the_oldest() {
+        let mut known: Vec<uuid::Uuid> = (100..100 + MAX_KNOWN_DEVICES as u128).map(uuid).collect();
+        assert!(!remember_known(
+            &mut known,
+            &HashSet::from([uuid(100), uuid(150)])
+        ));
+        // The newest known one is read in this pass: the one before it goes.
+        let newest = uuid(99 + MAX_KNOWN_DEVICES as u128);
+        let before = uuid(98 + MAX_KNOWN_DEVICES as u128);
+        assert!(remember_known(
+            &mut known,
+            &HashSet::from([uuid(1), uuid(2), newest])
+        ));
+        assert_eq!(known.len(), MAX_KNOWN_DEVICES);
+        assert_eq!(known[0], uuid(100), "the oldest stays");
+        assert!(known.contains(&newest));
+        assert!(!known.contains(&before));
+        assert_eq!(&known[MAX_KNOWN_DEVICES - 2..], &[uuid(1), uuid(2)]);
+        // Planted devices in numbers only take each other's place.
+        for round in 0..10u128 {
+            let planted: HashSet<uuid::Uuid> = (0..MAX_MARKERS_READ as u128)
+                .map(|n| uuid(1000 + 100 * round + n))
+                .collect();
+            remember_known(&mut known, &planted);
+            assert_eq!(known.len(), MAX_KNOWN_DEVICES);
+        }
+        assert_eq!(&known[..10], &(100..110).map(uuid).collect::<Vec<_>>()[..]);
+    }
+
+    /// The stored form: canonical ids, each once, at most the bound; a value
+    /// that does not parse knows none.
+    #[test]
+    fn stored_known_devices_are_checked() {
+        let id = uuid::Uuid::parse_str(ID).expect("uuid");
+        let text = serde_json::json!([ID, 7]).to_string();
+        assert!(parse_known(&text).is_empty(), "not a list of strings");
+        let text = serde_json::json!([ID, ID.to_uppercase(), "x", ID]).to_string();
+        assert_eq!(parse_known(&text), vec![id]);
+        assert!(parse_known("{").is_empty());
+        let many: Vec<String> = (0..200u128)
+            .map(|n| uuid(n).hyphenated().to_string())
+            .collect();
+        let known = parse_known(&serde_json::to_string(&many).expect("json"));
+        assert_eq!(known.len(), MAX_KNOWN_DEVICES);
+        assert_eq!(known[0], uuid(0));
+    }
+
+    /// A store written before the known devices were kept (only
+    /// `incoming_notified`) loads: what was announced is kept, no device is
+    /// known (V-12).
+    #[tokio::test]
+    async fn a_store_without_known_devices_loads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = crate::store::Store::open(&dir.path().join("state.db")).expect("open");
+        store
+            .write_durable(|conn| meta_set(conn, META_NOTIFIED, r#"["link-1/rev-1"]"#))
+            .await
+            .expect("write");
+        let markers = Markers::load(&store).expect("load");
+        assert_eq!(
+            *markers.notified.lock(),
+            HashSet::from(["link-1/rev-1".to_owned()])
+        );
+        assert!(markers.known.lock().is_empty());
+        // A value that does not parse knows none, and the store still loads.
+        store
+            .write_durable(|conn| meta_set(conn, META_KNOWN, "not json"))
+            .await
+            .expect("write");
+        assert!(Markers::load(&store).expect("load").known.lock().is_empty());
     }
 
     #[test]

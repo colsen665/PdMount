@@ -16,7 +16,7 @@
 # By default a representative set of scenarios runs in `live` and `crash`
 # mode, four of them also in `second` mode (a second device receives what the
 # first one did), and the two-device scenarios m1..m7 and e1/e2, queue, ops
-# and the stop-flush scenarios x1..x4, x11, the pending marker x12, the desktop bus x13, the further roots x14, the Shared mount x15, writes into shares x16 and the Photos mount x17 in `live` mode, and r1 and g1 in a share's tree (TARGET=share; with --full r1 g1 n1 m1 m3 in every mode). Scenarios run over the fake backend (BACKEND=fake, D030), with
+# and the stop-flush scenarios x1..x4 and x11, the conflict notifications x6, the pending marker x12, the desktop bus x13, the further roots x14, the Shared mount x15, writes into shares x16, the Photos mount x17, unverified signatures x18, `cache wipe` in every mount x19 and the slow-download notification x20 in `live` mode, the test of `scripts/repro/m6-desktop.sh` (`m6desktop`), and r1 and g1 in a share's tree (TARGET=share; with --full r1 g1 n1 m1 m3 in every mode). Scenarios run over the fake backend (BACKEND=fake, D030), with
 # profiles, mountpoints and a fake drive of their own in tmpfs (SCENARIO_ROOT).
 # Unless SCENARIO_ROOT is set, each checkout gets its own root,
 # /dev/shm/pdmount-ci-<checksum of the checkout's path>, so runs in different
@@ -154,7 +154,17 @@ if ((quick == 0)); then
         fi
     fi
     export SCENARIO_ROOT
-    exec 9>"$SCENARIO_ROOT.lock"
+    # The lock lives inside the root, made private first as lib.sh's
+    # private_root does: a lock file beside it would be a name in /dev/shm
+    # that another user could take first (V-13).
+    # shellcheck disable=SC2174
+    mkdir -p -m 0700 "$SCENARIO_ROOT"
+    if [[ -L $SCENARIO_ROOT || ! -O $SCENARIO_ROOT ]]; then
+        echo "refusing SCENARIO_ROOT=$SCENARIO_ROOT: it is a symlink or belongs to another user" >&2
+        exit 1
+    fi
+    chmod 0700 "$SCENARIO_ROOT"
+    exec 9>"$SCENARIO_ROOT/.lock"
     if ! flock -n 9; then
         echo "another scripts/ci.sh uses SCENARIO_ROOT=$SCENARIO_ROOT; wait for it or set SCENARIO_ROOT" >&2
         exit 1
@@ -176,10 +186,11 @@ if ((quick == 0)); then
         run_after "fake-backend build" "scenarios, second" \
             env R_FILES=200 R_BIG_MIB=10 G3_COMMITS=30 MODES="second" tests/scenarios/run-all.sh r1 r3 g3 a1
         run_after "fake-backend build" "scenarios, live" \
-            env MODES="live" tests/scenarios/run-all.sh e1 e2 m1 m3 m4 m5 m6 m7 queue ops svc x1 x2 x3 x4 x11 x12 x13 x14 x15 x16 x17
+            env MODES="live" tests/scenarios/run-all.sh e1 e2 m1 m3 m4 m5 m6 m7 queue ops svc x1 x2 x3 x4 x6 x11 x12 x13 x14 x15 x16 x17 x18 x19 x20
         run_after "fake-backend build" "scenarios in a share, live" \
             env TARGET=share R_FILES=200 R_BIG_MIB=10 MODES="live" tests/scenarios/run-all.sh r1 g1
     fi
+    run_after "fake-backend build" "m6-desktop script" tests/scenarios/m6desktop.sh
     run_after "fake-backend build" "kill9" kill9
     run_after "fake-backend build" "clean-up" clean_up
 fi

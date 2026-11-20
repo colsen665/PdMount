@@ -17,7 +17,10 @@
 #   2a. Rules (D124): `Gone`'s owner put `*` in the share's `/.pdignore`; it
 #      keeps nothing of the member's local-only (a new file uploads). A file
 #      the profile's own `.pdignore` keeps local-only is exported to
-#      orphaned/ at the revocation with the queued changes.
+#      orphaned/ at the revocation with the queued changes. An uploaded file
+#      moved into a folder the profile's rules keep local-only keeps its
+#      remote place, and its edit stays local (§7.7); the revocation exports
+#      it as `not-uploaded` (M6.0.3 V-1).
 #   3. Marker (D076): A's Shared root has `pending_marker`; A runs out of
 #      grace with changes in `Edit` and leaves a marker there that names no
 #      device; B shows `Incoming:` under the share; A's My Files, with its
@@ -31,6 +34,7 @@
 TARGET=my-files
 source "$(dirname "$0")/lib.sh"
 [[ $BACKEND == fake ]] || { echo "x16 needs a fake drive of its own; skipped for BACKEND=$BACKEND"; exit 0; }
+need_dbus_daemon x16
 x_live_only
 make_workdir
 
@@ -50,17 +54,21 @@ local_rules=$XDG_CONFIG_HOME/pdmount/$PROFILE.pdignore
 # (30 s, the least); a change shows within one poll plus the listing.
 CORE_WAIT=${CORE_WAIT:-45}
 grace=16
-saved_path=$PATH
+# A and B each have a session bus with a notification stub (lib.sh).
 notify_log=$work/notify.log
 notify_log_b=$work/notify-b.log
-: >"$notify_log"
-: >"$notify_log_b"
+start_session_bus x16-a
+bus_a=$bus_address
+start_notify_stub "$bus_a" "$notify_log"
+start_session_bus x16-b
+bus_b=$bus_address
+start_notify_stub "$bus_b" "$notify_log_b"
 
 mounted_at() { awk -v mnt="$1" '$2 == mnt { found = 1 } END { exit !found }' /proc/self/mounts; }
 x16_cleanup() {
     "$PDMOUNT" fake profile clear "$FAKE_DIR" >/dev/null 2>&1 || true
-    if is_mounted; then PATH=$saved_path pd unmount "$MNT" >/dev/null 2>&1 || true; fi
-    if is_mounted_second; then PATH=$saved_path pd2 unmount "$MNT2" >/dev/null 2>&1 || true; fi
+    if is_mounted; then pd unmount "$MNT" >/dev/null 2>&1 || true; fi
+    if is_mounted_second; then pd2 unmount "$MNT2" >/dev/null 2>&1 || true; fi
     local mnt
     for mnt in "$SHARED" "$SHARED2"; do
         if mounted_at "$mnt"; then fusermount3 -u "$mnt" 2>/dev/null || fusermount3 -uz "$mnt" || true; fi
@@ -121,15 +129,9 @@ mountpoint = "$SHARED"
 pending_marker = true
 EOF
 }
-# A and B with the notify-send stub, the way x12 does it.
-mount_a() {
-    PATH=$repo/tests/scenarios/stubs:$saved_path X11_NOTIFY_LOG=$notify_log \
-        DBUS_SESSION_BUS_ADDRESS=unix:path=$work/no-session-bus mount_now
-}
-mount_b() {
-    PATH=$repo/tests/scenarios/stubs:$saved_path X11_NOTIFY_LOG=$notify_log_b \
-        DBUS_SESSION_BUS_ADDRESS=unix:path=$work/no-session-bus mount_second
-}
+# A and B on their own session buses, the way x12 does it.
+mount_a() { DBUS_SESSION_BUS_ADDRESS=$bus_a mount_now; }
+mount_b() { DBUS_SESSION_BUS_ADDRESS=$bus_b mount_second; }
 
 step "a fake drive of its own with shares from three users; A mounts My Files and Shared"
 if is_mounted; then pd unmount "$MNT"; fi
@@ -156,6 +158,7 @@ for folder in sys.argv[1:]:
 PY
 printf gone >"$work/gone/g.txt"
 printf 'old\n' >"$work/gone/old.txt"
+printf 'uploaded\n' >"$work/gone/up.txt"
 # The share's owner keeps everything local-only, were it applied (D124).
 printf '*\n' >"$work/gone/.pdignore"
 "$PDMOUNT" fake seed --from "$work/seed" "$FAKE_DIR"
@@ -164,8 +167,8 @@ rm -f "$config_a" "$config_b"
 fake_config "$PROFILE" dev-x16a "$MNT"
 fake_config "$PROFILE2" dev-x16b "$MNT2"
 saved_a=$(cat "$config_a")
-# A's own rules: `*.local` stays on this device, in every tree.
-printf '*.local\n' >"$local_rules"
+# A's own rules: `*.local` and `build/` stay on this device, in every tree.
+printf '*.local\nbuild/\n' >"$local_rules"
 config_a 1s
 printf '\n[[roots]]\nkind = "shared"\nmountpoint = "%s"\n' "$SHARED2" >>"$config_b"
 pd reset --keep-login >/dev/null
@@ -185,6 +188,19 @@ printf 'a\n' >"$SHARED/Gone/a.txt"
 wait_queue_empty
 uploaded=$(fake_changes "$mark" | awk '$2 == "created-file" && $4 == "a.txt"' | wc -l)
 expect_eq "uploads of Gone/a.txt" "$uploaded" 1
+
+step "an uploaded file moved into a local-only folder keeps its remote place; its edit stays local (§7.7)"
+xattr() { python3 -I -c 'import os, sys; print(os.getxattr(sys.argv[2], sys.argv[1]).decode())' "$@"; } # <name> <path>
+up_link=$(xattr user.pdmount.link_id "$SHARED/Gone/up.txt")
+mark=$(fake_change_mark)
+mkdir "$SHARED/Gone/build"
+mv "$SHARED/Gone/up.txt" "$SHARED/Gone/build/up.txt"
+printf 'edited in build' >"$SHARED/Gone/build/up.txt"
+wait_queue_empty
+sleep 2
+remote=$(fake_changes "$mark" | awk -v link="$up_link" '$3 == link || ($2 == "created-folder" && $4 == "build")')
+expect_eq "remote changes of up.txt and build/" "$remote" ""
+expect_eq "build/up.txt's state" "$(xattr user.pdmount.state "$SHARED/Gone/build/up.txt")" pending
 
 step "an editor writes; a viewer gets EROFS; a rename between shares is EXDEV"
 tree_line Edit 'writable \(editor\), ' || fail "Edit: $(status_text)"
@@ -286,6 +302,7 @@ expect_eq "n1.txt" "$(cat "$dir/files/n1.txt")" n1
 expect_eq "d/n2.txt" "$(cat "$dir/files/d/n2.txt")" n2
 expect_eq "g.txt" "$(cat "$dir/files/g.txt")" "gone edited"
 expect_eq "keep.local (local-only)" "$(cat "$dir/files/keep.local")" "kept locally"
+expect_eq "build/up.txt (not-uploaded)" "$(cat "$dir/files/build/up.txt")" "edited in build"
 [[ ! -e $dir/state ]] || fail "the raw state was kept although every content was exported"
 python3 -I - "$dir/pdmount-orphaned.json" <<'PY' || fail "the manifest is not as expected"
 import json, sys
@@ -295,11 +312,13 @@ changes = {e["path"]: e for e in m["entries"]}
 # A delete is not debounced: old.txt went to the trash before the revocation.
 assert all(e["change"] != "trash" or "file" not in e for e in m["entries"]), m
 assert changes["/d"]["change"] == "create-folder", m
-for path in ("/n1.txt", "/d/n2.txt", "/g.txt", "/keep.local"):
+for path in ("/n1.txt", "/d/n2.txt", "/g.txt", "/keep.local", "/build/up.txt"):
     assert changes[path]["file"] == "files" + path and "error" not in changes[path], m
 # The share's `*` made nothing local-only; the profile's rule did (D124).
 assert changes["/n1.txt"]["change"] == "upload", m
 assert changes["/keep.local"]["change"] == "local-only", m
+# Uploaded, then edited in a local-only folder: never queued (M6.0.3 V-1).
+assert changes["/build/up.txt"]["change"] == "not-uploaded", m
 PY
 status_has "^Orphaned: +[0-9]+ changes of Gone \\(the share('s root is not found| left the shared-with-me listing)\\) in " ||
     fail "no Orphaned: line: $(status_text)"
@@ -361,7 +380,7 @@ expect_eq "notifications for Other after A's remounts" "$(other_notes)" 1
 
 step "both daemons stop"
 pd unmount "$MNT" >/dev/null
-PATH=$saved_path pd2 unmount "$MNT2" >/dev/null
+pd2 unmount "$MNT2" >/dev/null
 for mnt in "$MNT" "$MNT2" "$SHARED" "$SHARED2"; do
     mounted_at "$mnt" && fail "$mnt is still mounted"
 done

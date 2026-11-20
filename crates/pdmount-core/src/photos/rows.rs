@@ -4,7 +4,8 @@
 //! the timeline nor the names again (D113).
 //!
 //! `photos` holds one row per photo: the timeline's fields, and the node's
-//! name, size and revision once its month was opened. `meta` holds the
+//! name, size and revision once its month was opened; `signatures` (the
+//! store's) the failed signatures of those decoded nodes (D132). `meta` holds the
 //! volume and root the rows belong to (`photos.volume`, `photos.root`),
 //! whether a whole timeline read finished (`photos.timeline`), the event
 //! cursor (`photos.cursor`), written after the rows of the page it follows,
@@ -14,7 +15,7 @@
 use super::model::{Photo, PhotoMeta};
 use crate::errors::Result;
 use crate::store::{Store, meta_get, meta_set};
-use pdmount_backend::{EventId, LinkId, RevisionId};
+use pdmount_backend::{EventId, LinkId, RevisionId, Unverified};
 use rusqlite::Connection;
 
 /// The table's schema; `photos.schema` in `meta` names its version.
@@ -61,6 +62,7 @@ pub async fn open(store: &Store, volume: &str, root: &LinkId) -> Result<Loaded> 
                 && meta_get(conn, KEY_SCHEMA)?.as_deref() == Some(SCHEMA_VERSION);
             if !same {
                 conn.execute("DELETE FROM photos", [])?;
+                conn.execute("DELETE FROM signatures", [])?;
                 conn.execute(
                     "DELETE FROM meta WHERE key IN (?1, ?2, ?3)",
                     (KEY_TIMELINE, KEY_CURSOR, KEY_PENDING),
@@ -77,7 +79,9 @@ pub async fn open(store: &Store, volume: &str, root: &LinkId) -> Result<Loaded> 
 
 fn load(conn: &Connection) -> rusqlite::Result<Loaded> {
     let mut select = conn.prepare(
-        "SELECT link_id, capture_time, tags, main_link, name, size, revision FROM photos",
+        "SELECT p.link_id, p.capture_time, p.tags, p.main_link, p.name, p.size, p.revision,
+                s.parts, s.signer, s.digest
+         FROM photos p LEFT JOIN signatures s ON s.link_id = p.link_id",
     )?;
     let photos = select
         .query_map([], |row| {
@@ -89,6 +93,14 @@ fn load(conn: &Connection) -> rusqlite::Result<Loaded> {
                     name,
                     size: u64::try_from(size).unwrap_or(0),
                     revision: RevisionId::new(revision),
+                    unverified: match row.get::<_, Option<u8>>(7)? {
+                        Some(parts) => Unverified::from_stored(
+                            parts,
+                            row.get::<_, Option<String>>(8)?.unwrap_or_default(),
+                            row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                        ),
+                        None => None,
+                    },
                 }),
                 _ => None,
             };
@@ -151,6 +163,9 @@ pub fn put(store: &Store, photos: Vec<(LinkId, Photo)>) {
                 meta.map(|meta| i64::try_from(meta.size).unwrap_or(i64::MAX)),
                 meta.map(|meta| &meta.revision.0),
             ))?;
+            if let Some(meta) = meta {
+                crate::signatures::write(conn, link, meta.unverified.as_ref())?;
+            }
         }
         Ok(())
     });
@@ -165,6 +180,7 @@ pub fn remove(store: &Store, links: Vec<LinkId>) {
         let mut delete = conn.prepare_cached("DELETE FROM photos WHERE link_id = ?1")?;
         for link in &links {
             delete.execute([&link.0])?;
+            crate::signatures::write(conn, link, None)?;
         }
         Ok(())
     });

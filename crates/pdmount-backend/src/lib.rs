@@ -5,6 +5,7 @@
 //! (an in-memory model of Proton Drive for tests). SDK types never cross
 //! this boundary.
 
+pub mod block_lists;
 pub mod fake;
 pub mod photos;
 pub mod proton;
@@ -81,9 +82,156 @@ pub struct RemoteNode {
     pub sha1: Option<[u8; 20]>,
     pub name_hash: Option<NameHash>,
     pub trashed: bool,
+    /// Signatures of the node that did not verify when it was decoded
+    /// (fork P27, D132); `None` when all of them did.
+    pub unverified: Option<Unverified>,
+}
+
+/// One signed part of a node's metadata (fork P27, D132).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum SignaturePart {
+    /// The name, signed by the name's author.
+    Name,
+    /// The node key's passphrase, and a folder's hash key, signed by the
+    /// node's author: the key that a folder's content is encrypted to.
+    Key,
+    /// A file's content key, signed with the node key and by the content's
+    /// author.
+    ContentKey,
+}
+
+impl SignaturePart {
+    pub const ALL: [Self; 3] = [Self::Name, Self::Key, Self::ContentKey];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Key => "key",
+            Self::ContentKey => "content key",
+        }
+    }
+
+    /// `name`, `key`, `content-key` (or `content key`).
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "name" => Some(Self::Name),
+            "key" => Some(Self::Key),
+            "content-key" | "content key" | "content_key" => Some(Self::ContentKey),
+            _ => None,
+        }
+    }
+
+    fn bit(self) -> u8 {
+        match self {
+            Self::Name => 1,
+            Self::Key => 2,
+            Self::ContentKey => 4,
+        }
+    }
+}
+
+/// The signatures of a node that did not verify, as the adapter decoded it
+/// (D132): which parts, who claims to have signed them, and a digest of
+/// what they cover, so that an accept holds only while that stays the same.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unverified {
+    /// [`SignaturePart`] bits.
+    parts: u8,
+    /// The claimed signers' addresses, `anonymous` for none, comma-separated.
+    pub signer: String,
+    /// One `<part>:<16 hex digits>` token per failed part, space-separated
+    /// ([`Unverified::of`]).
+    pub digest: String,
+}
+
+impl Unverified {
+    /// The failures of the node `link` named `name`, each with its claimed
+    /// signer; `None` when there are none. Each part's token is a SHA-256
+    /// over the part, its claimed signer and what PdMount sees of what the
+    /// signature covers: the name for the name; the link for the key and the
+    /// content key, which do not change for a node's life (the SDK does not
+    /// give the signed packets themselves).
+    pub fn of(link: &LinkId, name: &str, failed: &[(SignaturePart, Option<&str>)]) -> Option<Self> {
+        use sha2::Digest;
+        let mut failed = failed.to_vec();
+        failed.sort();
+        failed.dedup_by_key(|(part, _)| *part);
+        if failed.is_empty() {
+            return None;
+        }
+        let mut parts = 0;
+        let mut signers: Vec<&str> = Vec::new();
+        let mut tokens = Vec::new();
+        for (part, signer) in &failed {
+            parts |= part.bit();
+            let signer = signer.filter(|s| !s.is_empty()).unwrap_or("anonymous");
+            if !signers.contains(&signer) {
+                signers.push(signer);
+            }
+            let covered = match part {
+                SignaturePart::Name => name,
+                SignaturePart::Key | SignaturePart::ContentKey => link.as_str(),
+            };
+            let mut hasher = sha2::Sha256::new();
+            for field in ["pdmount-signature-1", part.as_str(), signer, covered] {
+                hasher.update(field.as_bytes());
+                hasher.update([0]);
+            }
+            let hash = hex::encode(hasher.finalize());
+            tokens.push(format!(
+                "{}:{}",
+                part.as_str().replace(' ', "-"),
+                &hash[..16]
+            ));
+        }
+        Some(Self {
+            parts,
+            signer: signers.join(", "),
+            digest: tokens.join(" "),
+        })
+    }
+
+    /// As stored: the part bits, the signer and the digest.
+    pub fn from_stored(parts: u8, signer: String, digest: String) -> Option<Self> {
+        (parts & 7 != 0).then_some(Self {
+            parts: parts & 7,
+            signer,
+            digest,
+        })
+    }
+
+    /// The part bits, for a store.
+    pub fn bits(&self) -> u8 {
+        self.parts
+    }
+
+    pub fn has(&self, part: SignaturePart) -> bool {
+        self.parts & part.bit() != 0
+    }
+
+    /// The failed parts, in [`SignaturePart::ALL`] order.
+    pub fn parts(&self) -> Vec<SignaturePart> {
+        SignaturePart::ALL
+            .into_iter()
+            .filter(|part| self.has(*part))
+            .collect()
+    }
+
+    /// Whether an accept given for `accepted` (a digest of an earlier
+    /// decode) covers this one: each failed part's token is among the
+    /// accepted ones. A part that verifies now needs nothing; a new part,
+    /// another signer or another name asks again.
+    pub fn covered_by(&self, accepted: &str) -> bool {
+        let accepted: Vec<&str> = accepted.split_whitespace().collect();
+        self.digest
+            .split_whitespace()
+            .all(|token| accepted.contains(&token))
+    }
 }
 
 /// What [`Backend::get_nodes_checked`] found of one id.
+// `Found` is the common case: boxing it would cost an allocation per node.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeLookup {
     Found(RemoteNode),
@@ -103,6 +251,16 @@ impl NodeLookup {
             Self::Absent | Self::Degraded => None,
         }
     }
+}
+
+/// A folder's children as [`Backend::list_children_checked`] lists them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Listing {
+    /// The children that were read.
+    pub children: Vec<RemoteNode>,
+    /// Children the server lists but whose metadata cannot be decrypted:
+    /// they exist, so what is known of them stays (D119, D132).
+    pub degraded: Vec<LinkId>,
 }
 
 /// Layout of one block of a revision.
@@ -296,6 +454,19 @@ pub trait Backend: Send + Sync + 'static {
     /// are not listed.
     async fn list_children(&self, folder: &LinkId) -> Result<Vec<RemoteNode>>;
 
+    /// [`Backend::list_children`] naming the children the server lists but
+    /// whose metadata cannot be read ([`Listing::degraded`]), which
+    /// `list_children` leaves out. A caller that drops what it knows of a
+    /// child missing from a listing uses this, so a node that does not
+    /// decrypt never removes anything (D119, D132). Wrappers forward it; the
+    /// default knows no degraded nodes.
+    async fn list_children_checked(&self, folder: &LinkId) -> Result<Listing> {
+        Ok(Listing {
+            children: self.list_children(folder).await?,
+            degraded: Vec::new(),
+        })
+    }
+
     /// Nodes by id, in request order; `None` for ids that do not exist.
     async fn get_nodes(&self, ids: &[LinkId]) -> Result<Vec<Option<RemoteNode>>>;
 
@@ -398,5 +569,44 @@ mod tests {
         let missing =
             BackendError::local_io("open", std::io::Error::from(std::io::ErrorKind::NotFound));
         assert!(matches!(missing, BackendError::Other(_)));
+    }
+
+    /// D132: the digest follows each part's signer and covered data, and an
+    /// accept covers the same failures or fewer, not new ones.
+    #[test]
+    fn an_unverified_digest_covers_the_same_failures_or_fewer() {
+        let link = LinkId::new("l1");
+        assert!(Unverified::of(&link, "a", &[]).is_none());
+        let both = Unverified::of(
+            &link,
+            "a",
+            &[
+                (SignaturePart::Key, Some("x@example.test")),
+                (SignaturePart::Name, None),
+            ],
+        )
+        .expect("failures");
+        assert_eq!(both.parts(), [SignaturePart::Name, SignaturePart::Key]);
+        assert_eq!(both.signer, "anonymous, x@example.test");
+        assert!(both.digest.starts_with("name:"), "{}", both.digest);
+        let key = Unverified::of(&link, "a", &[(SignaturePart::Key, Some("x@example.test"))])
+            .expect("failure");
+        assert!(key.covered_by(&both.digest), "fewer failures stay accepted");
+        assert!(!both.covered_by(&key.digest), "a new part asks again");
+        let renamed = Unverified::of(&link, "b", &[(SignaturePart::Name, None)]).expect("failure");
+        let named = Unverified::of(&link, "a", &[(SignaturePart::Name, None)]).expect("failure");
+        assert!(
+            !renamed.covered_by(&named.digest),
+            "another name asks again"
+        );
+        let other = Unverified::of(&link, "a", &[(SignaturePart::Key, Some("y@example.test"))])
+            .expect("failure");
+        assert!(!other.covered_by(&both.digest), "another signer asks again");
+        let stored = Unverified::from_stored(both.bits(), both.signer.clone(), both.digest.clone());
+        assert_eq!(stored.as_ref(), Some(&both));
+        assert_eq!(
+            Unverified::from_stored(0, String::new(), String::new()),
+            None
+        );
     }
 }

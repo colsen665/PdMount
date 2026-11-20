@@ -50,6 +50,7 @@ impl Engine {
         if mode.write {
             self.ensure_writable(ino)?;
         }
+        self.ensure_verified(ino)?;
         let want = if mode.read { MAY_READ } else { 0 } | if mode.write { MAY_WRITE } else { 0 };
         self.ensure_allowed(ino, want)?;
         if mode.write && mode.truncate {
@@ -77,8 +78,7 @@ impl Engine {
             OpenFile {
                 ino,
                 writable,
-                last_end: 0,
-                sequential_reads: 0,
+                sequential: Default::default(),
                 scan,
                 read_bytes: 0,
             },
@@ -324,10 +324,40 @@ impl Engine {
 
     /// Reads a range, downloading missing blocks. A scan read (D111) waits
     /// for its turn of the bulk-read guard and downloads at scan priority;
-    /// any other read is one a user waits on.
+    /// any other read is one a user waits on, reported when it waits long
+    /// ([`crate::slow`], D137).
     pub async fn read(self: &Arc<Self>, handle: u64, offset: u64, size: u32) -> Result<ReadData> {
         let file = self.file(handle)?;
         let scan = self.is_scan_read(&file);
+        if scan {
+            return self.read_through(handle, &file, scan, offset, size).await;
+        }
+        let ino = file.ino;
+        let describe = || {
+            let tree = self.tree.read();
+            let node = tree.get(ino)?;
+            Some((node.name.clone(), node.size))
+        };
+        self.scan
+            .slow_reads()
+            .watch(
+                (self.scan_tree, ino),
+                describe,
+                self.read_through(handle, &file, scan, offset, size),
+            )
+            .await
+    }
+
+    /// [`Engine::read`]'s work: the remote content's layout and blocks, or
+    /// the staging and its base.
+    async fn read_through(
+        self: &Arc<Self>,
+        handle: u64,
+        file: &OpenFile,
+        scan: bool,
+        offset: u64,
+        size: u32,
+    ) -> Result<ReadData> {
         let mut wait = (!scan).then(|| self.user_wait());
         for _ in 0..STAGED_READ_ATTEMPTS {
             let staged = match self.read_source(file.ino)? {
@@ -347,10 +377,12 @@ impl Engine {
                         (Priority::Interactive, None)
                     };
                     let layout = self.cache.layout(&link, &rev, file_size).await?;
+                    // Before its own download: a read that crosses into the
+                    // next block starts the readahead beside it (D135).
+                    self.readahead(handle, &link, &rev, &layout, offset, len);
                     let data = self
                         .read_layout(&link, &rev, &layout, offset, len, priority)
                         .await?;
-                    self.readahead(handle, &link, &rev, &layout, offset, len);
                     return Ok(data);
                 }
                 ReadSource::Staged(staged) => staged,
@@ -499,7 +531,13 @@ impl Engine {
             let mut out = Vec::new();
             while (out.len() as u64) < size {
                 let want = (size - out.len() as u64).min(1 << 20) as u32;
-                let chunk = self.read(handle, out.len() as u64, want).await?;
+                // Not `read`: no user waits on this, so it reports no slow
+                // download (D137).
+                let file = self.file(handle)?;
+                let scan = self.is_scan_read(&file);
+                let chunk = self
+                    .read_through(handle, &file, scan, out.len() as u64, want)
+                    .await?;
                 if chunk.is_empty() {
                     break;
                 }

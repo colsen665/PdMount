@@ -2,7 +2,8 @@
 //! desktop notification per tree and pass that found new markers, and the
 //! `Incoming:` lines of `status`. The engine reads and checks the markers
 //! (`pdmount_core::engine::marker`), at most `MAX_MARKERS_READ` per tree;
-//! the device names here are already cleaned of control characters.
+//! names in a notification are cleaned once more of the characters that
+//! would reorder its text (`notify::clean_name`).
 
 use pdmount_core::engine::marker::{IncomingMarker, IncomingNotice};
 use pdmount_core::units::ByteSize;
@@ -47,18 +48,18 @@ fn notification(tree: Option<&str>, notice: &IncomingNotice) -> Option<(String, 
     let markers = &notice.markers;
     let first = markers.first()?;
     let place = tree.map_or_else(String::new, |name| {
-        format!(" in {}", crate::status::printable(name))
+        format!(" in {}", crate::notify::clean_name(name))
     });
     let summary = if markers.len() == 1 {
         format!(
             "PdMount: changes on their way{place} from {}",
-            first.device_label()
+            crate::notify::clean_name(&first.device_label())
         )
     } else {
         let mut names: Vec<String> = markers
             .iter()
             .take(MAX_NAMES)
-            .map(IncomingMarker::device_label)
+            .map(|marker| crate::notify::clean_name(&marker.device_label()))
             .collect();
         if markers.len() > MAX_NAMES {
             names.push(format!("{} more", markers.len() - MAX_NAMES));
@@ -228,13 +229,16 @@ mod tests {
             summary,
             "PdMount: changes on their way from 2 devices: a, device 0b5f6c1e"
         );
-        // A tree name loses control characters.
+        // A tree's and a device's name lose control and bidi characters.
         let (summary, _) = notification(
             Some("x\u{1b}[2Jy"),
-            &notice(vec![marker(Some("a"), 1, 1)], 0),
+            &notice(vec![marker(Some("a\u{202e}b"), 1, 1)], 0),
         )
         .expect("a notification");
-        assert_eq!(summary, "PdMount: changes on their way in x?[2Jy from a");
+        assert_eq!(
+            summary,
+            "PdMount: changes on their way in x\u{fffd}[2Jy from a\u{fffd}b"
+        );
         assert!(notification(None, &notice(Vec::new(), 5)).is_none());
     }
 }

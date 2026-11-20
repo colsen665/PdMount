@@ -46,9 +46,15 @@ impl Engine {
         let at = self.clock()()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs() as i64);
-        let conflict = self.conflicts.lock().insert(note, &self.device.name, at);
-        let row = conflict.clone();
-        self.store.write(move |conn| store_conflict(conn, &row));
+        // The row is queued under the registry's lock, so a mark of this
+        // conflict (`mark_conflicts_notified`) is queued after it.
+        let conflict = {
+            let mut conflicts = self.conflicts.lock();
+            let conflict = conflicts.insert(note, &self.device.name, at);
+            let row = conflict.clone();
+            self.store.write(move |conn| store_conflict(conn, &row));
+            conflict
+        };
         tracing::warn!(
             id = conflict.id,
             kind = conflict.kind.as_str(),
@@ -67,8 +73,8 @@ impl Engine {
 
     /// Records the other copy of a conflict once it shows.
     pub(crate) fn set_conflict_other(&self, id: i64, other: Ino) {
-        let row = self.conflicts.lock().set_other_ino(id, other).cloned();
-        if let Some(row) = row {
+        let mut conflicts = self.conflicts.lock();
+        if let Some(row) = conflicts.set_other_ino(id, other).cloned() {
             self.store.write(move |conn| store_conflict(conn, &row));
         }
     }
@@ -80,6 +86,27 @@ impl Engine {
         }
         self.store.write(move |conn| store_state(conn, id, state));
         true
+    }
+
+    /// The ids of the conflicts that wait for the user (`open`) and whose
+    /// desktop notification was not shown yet, oldest first (M6.3).
+    pub fn unnotified_conflicts(&self) -> Vec<i64> {
+        self.conflicts.lock().unnotified_open()
+    }
+
+    /// Records that the notification service accepted the notification of
+    /// each of `ids` (M6.3): they are not shown again. A conflict shown
+    /// before keeps its time.
+    pub fn mark_conflicts_notified(&self, ids: &[i64]) {
+        let at = self.clock()()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs() as i64);
+        let mut conflicts = self.conflicts.lock();
+        for &id in ids {
+            if conflicts.mark_notified(id, at) {
+                self.store.write(move |conn| store_notified(conn, id, at));
+            }
+        }
     }
 
     /// Every registered conflict, oldest first.

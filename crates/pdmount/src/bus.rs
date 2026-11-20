@@ -4,9 +4,9 @@
 //! A service started by OpenRC runs on the user bus at
 //! `$XDG_RUNTIME_DIR/bus`, while a desktop started by a display manager may
 //! run a bus of its own (`dbus-launch`) with the keyring and the notification
-//! server on it. The daemon keeps the address it was given and runs
-//! `notify-send` and the keyring helper with it in their environment; its own
-//! environment never changes (setting a variable in a threaded process is
+//! server on it. The daemon keeps the address it was given: the notification
+//! client (`notify.rs`) connects to it, and the keyring helper runs with it in
+//! its environment; the daemon's own environment never changes (setting a variable in a threaded process is
 //! unsound). A call that fails on the kept bus checks whether the bus is still
 //! there and, if not, drops the address: until the next attach, the daemon's
 //! own bus is used again.
@@ -39,6 +39,23 @@ const MAX_ADDRESS: usize = 1024;
 /// bus.
 static ATTACHED: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
 
+/// A generation counter, raised when the attached address changes (an
+/// attach, a drop): every watcher of the notification service looks again
+/// at once (M6.3), however many there are.
+static ATTACH_CHANGES: std::sync::LazyLock<tokio::sync::watch::Sender<u64>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::channel(0).0);
+
+/// A receiver whose `changed()` resolves after the attached address changed
+/// since it last looked: kept across waits, so a change between two waits is
+/// not lost.
+pub fn attach_changes() -> tokio::sync::watch::Receiver<u64> {
+    ATTACH_CHANGES.subscribe()
+}
+
+fn attach_changed() {
+    ATTACH_CHANGES.send_modify(|generation| *generation = generation.wrapping_add(1));
+}
+
 /// The kept address of the desktop's bus, if one is attached.
 pub fn attached() -> Option<String> {
     ATTACHED.lock().clone()
@@ -55,6 +72,7 @@ pub fn set_attached(address: Option<String>) {
     *attached = address;
     drop(attached);
     invalidate();
+    attach_changed();
 }
 
 /// An attach that keeps `address`: also saved, with the checked `display`,
@@ -77,17 +95,22 @@ pub fn keep(address: String, display: &Display) {
     *attached = Some(address);
     drop(attached);
     invalidate();
+    attach_changed();
 }
 
 /// Drops `address` if it is still the attached one; whether it was. The
-/// saved attach goes with it.
+/// saved attach goes with it, and so does its display: the session it
+/// belonged to has ended, so a program started for the desktop gets the
+/// daemon's own until the next attach.
 fn detach(address: &str) -> bool {
     let mut attached = ATTACHED.lock();
     if attached.as_deref() == Some(address) {
         *attached = None;
         unsave();
+        *DESKTOP_DISPLAY.lock() = None;
         drop(attached);
         invalidate();
+        attach_changed();
         true
     } else {
         false
@@ -162,10 +185,19 @@ pub fn validate(address: &str) -> Result<(), String> {
 /// this process's uid. A kept address can outlive its bus: after a logout
 /// another local user may listen on the same abstract name or `/tmp` path,
 /// and would then get the session JSON of a token save (D102).
-async fn connect(address: &str) -> Result<zbus::Connection, String> {
+pub(crate) async fn connect(address: &str) -> Result<zbus::Connection, String> {
+    connect_with(address, BUS_TIMEOUT).await
+}
+
+/// [`connect`], with calls on the connection given `method_timeout` (a
+/// service that D-Bus starts at the first call may need longer than 2 s).
+pub(crate) async fn connect_with(
+    address: &str,
+    method_timeout: Duration,
+) -> Result<zbus::Connection, String> {
     let builder = zbus::connection::Builder::address(address)
         .map_err(|error| format!("malformed bus address {address}: {error}"))?
-        .method_timeout(BUS_TIMEOUT);
+        .method_timeout(method_timeout);
     let connection = match tokio::time::timeout(BUS_TIMEOUT, builder.build()).await {
         Ok(Ok(connection)) => connection,
         Ok(Err(error)) => return Err(format!("cannot connect to {address}: {error}")),
@@ -245,7 +277,7 @@ fn id_of_blocking(address: &str) -> Result<String, String> {
 pub enum Service {
     /// The Secret Service.
     Keyring,
-    /// The notification server (`notify-send`).
+    /// The notification server (`notify.rs`).
     Notifications,
 }
 
@@ -866,8 +898,8 @@ pub async fn drop_if_gone_async(address: &str) {
     }
 }
 
-/// The attached address, checked just before a child (the keyring helper,
-/// `notify-send`) is run with it: it must still lead to a bus of this user
+/// The attached address, checked just before a child (the keyring helper) is
+/// run with it: it must still lead to a bus of this user
 /// that answers ([`connect`]). One that does not is dropped, and `None`
 /// sends the caller to the process's own bus. [`route`] makes this check
 /// whenever it chooses the attached bus.
@@ -963,6 +995,24 @@ pub fn checked_display(given: Display) -> (Display, Vec<String>) {
 /// was dropped while the route was chosen, so the calls go to the own bus.
 pub fn display_for_own_bus(same: bool, keyring: Choice, notifications: Choice) -> bool {
     !same && (keyring == Choice::Own || notifications == Choice::Own)
+}
+
+/// The display variables of the last attach (empty before one, and after
+/// the attached bus was dropped): programs the daemon starts for the desktop
+/// (`xdg-open` for a conflict's **Show**, M6.2) get them, with the
+/// notification's bus, instead of the daemon's own.
+static DESKTOP_DISPLAY: parking_lot::Mutex<Option<Display>> = parking_lot::Mutex::new(None);
+
+/// Keeps the checked display of an attach, or of the attach saved by the
+/// last daemon (D102 amended).
+pub fn remember_display(display: &Display) {
+    *DESKTOP_DISPLAY.lock() = Some(display.clone());
+}
+
+/// The display of the last attach; `None` before one or after its bus was
+/// dropped.
+pub fn desktop_display() -> Option<Display> {
+    DESKTOP_DISPLAY.lock().clone()
 }
 
 /// Sets `display` in the activation environment of the bus at `address`
@@ -1113,7 +1163,7 @@ pub fn discard_saved(error: &str) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The tests that change the process's attach state ([`ATTACHED`],
@@ -1154,13 +1204,18 @@ mod tests {
     fn a_gone_bus_is_dropped_only_if_still_attached() {
         let _global = GLOBAL.lock();
         let gone = "unix:path=/nonexistent/pdmount-test-bus";
+        let display = Display::from([("DISPLAY".to_owned(), ":9".to_owned())]);
+        remember_display(&display);
         set_attached(Some(gone.to_owned()));
         drop_if_gone(gone);
         assert_eq!(attached(), None);
+        assert_eq!(desktop_display(), None, "the display goes with its bus");
         // A later attach of another bus is not undone by a late check.
+        remember_display(&display);
         set_attached(Some("unix:path=/other".to_owned()));
         assert!(!detach(gone));
         assert_eq!(attached().as_deref(), Some("unix:path=/other"));
+        assert_eq!(desktop_display(), Some(display), "nor is its display");
         // The check before a child runs drops an address that fails it.
         set_attached(Some(gone.to_owned()));
         assert_eq!(block_on(attached_verified()), Ok(None));
@@ -1173,6 +1228,22 @@ mod tests {
         assert_eq!(route_blocking(Service::Notifications), Route::Default);
         assert_eq!(chosen(Service::Keyring), Choice::Own);
         set_attached(None);
+    }
+
+    /// Every watcher sees each change of the attached address, not only one
+    /// of them.
+    #[test]
+    fn every_watcher_sees_an_attach_change() {
+        let _global = GLOBAL.lock();
+        let (mut first, mut second) = (attach_changes(), attach_changes());
+        set_attached(Some("unix:path=/nonexistent/pdmount-watch".to_owned()));
+        assert!(first.has_changed().expect("open"));
+        assert!(second.has_changed().expect("open"));
+        first.mark_unchanged();
+        second.mark_unchanged();
+        assert!(detach("unix:path=/nonexistent/pdmount-watch"));
+        assert!(first.has_changed().expect("open"));
+        assert!(second.has_changed().expect("open"));
     }
 
     /// D102: only a bus whose socket peer is this user is used. Running a bus
@@ -1367,9 +1438,9 @@ mod tests {
     }
 
     /// A private `dbus-daemon`, stopped when dropped.
-    struct PrivateBus {
+    pub(crate) struct PrivateBus {
         child: std::process::Child,
-        address: String,
+        pub(crate) address: String,
     }
 
     impl Drop for PrivateBus {
@@ -1381,7 +1452,7 @@ mod tests {
 
     /// Starts a session bus listening in `dir`, with `dir/services` as its
     /// service directory and its messages in `dir/bus.log`.
-    fn private_bus(dbus_daemon: &std::path::Path, dir: &std::path::Path) -> PrivateBus {
+    pub(crate) fn private_bus(dbus_daemon: &std::path::Path, dir: &std::path::Path) -> PrivateBus {
         let socket = dir.join("bus");
         let config = dir.join("bus.conf");
         std::fs::write(

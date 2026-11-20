@@ -164,6 +164,10 @@ impl Engine {
         let markers = marker::Markers::load(&store)?;
         let access = store.read(|conn| Rules::load(conn, options.config.access.default))?;
         let conflicts = store.read(Conflicts::load)?;
+        let signatures = crate::signatures::Signatures::new(
+            options.config.signatures,
+            store.read(crate::signatures::load)?,
+        );
         let scan = options.scan.clone().unwrap_or_else(|| {
             let cap = options
                 .cache
@@ -259,6 +263,7 @@ impl Engine {
             ignore_changed: tokio::sync::Notify::new(),
             access: lock_order::RwLock::new(Rank::Access, access),
             conflicts: lock_order::Mutex::new(Rank::Leaf, conflicts),
+            signatures,
             notices: tokio::sync::broadcast::channel(64).0,
             gate: Arc::clone(&limits.gate),
             limits,
@@ -269,6 +274,7 @@ impl Engine {
             event_cursor: tokio::sync::Mutex::new(cursor),
             refresh: parking_lot::Mutex::default(),
             last_poll: parking_lot::Mutex::default(),
+            stuck_page: parking_lot::Mutex::default(),
             read_only: options.read_only,
             write_gate: std::sync::atomic::AtomicBool::new(options.write_gate),
             owns_health,
