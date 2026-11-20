@@ -6,6 +6,13 @@ entry. At the end of a session, add its entry at the top of "Session entries" (A
 
 ## Session entries
 
+- **v0.6.0 released (2026-11-20, Opus; user: "push"):** `master` `b295224..63b968d` pushed, the publishing scan
+  clean after pattern exemptions for placeholder paths (`~/s`, `~/p`, `~/r`, `~/PdMount-m6`, the review's
+  `~/Shared/Team/plan`); the tag was refused by the tag ruleset ("creations being restricted") until the user gave the
+  push key a bypass. GitHub CI and the Release build green; the archive passes `sha256sum -c`, holds binary, LICENSE,
+  README, user guide and licences, `--version` 0.6.0; GitHub lists two attestations for it (`gh attestation verify` not
+  run: no `gh` here). Before the push: M7.0.1 planned (parity follow-up to `cs/v0.33.1`, `js/v0.24.0`), on the branch
+  only.
 - **M6 squashed, decisions consolidated, tagged (2026-11-20, Opus orchestrating, one Opus agent; user: "as proposed
   until push", the tag before the CI):** the agent consolidated D130–D142 (D129): D132←D134; D138←D141 (capabilities);
   D139←D141 (Show, `clean_name`, `xdg-open`; the open review findings in its Consequences); D142←D141 (X21); entries
