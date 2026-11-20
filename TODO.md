@@ -192,7 +192,7 @@ when every exit criterion in §16 passes. The task checklists of M0–M3 are in 
 - [x] M4 Performance and operations (2026-11-01)
 - [ ] M5 User services, flush at session end, further roots (D074, D075, D078; plan `docs/plans/m5.md`)
 - [ ] M6 Conflict notifications (D077; plan `docs/plans/m6.md`)
-- [ ] M7 Upstream patches and crypto migration (upstream PRs once stable, when the user says so, D089; V-11 of M6.0.3, a size limit on block bodies in the fork, user 2026-11-19; D134's gap: an accept bound to the signed packets, a P27 amendment)
+- [ ] M7 Upstream patches and crypto migration (plan `docs/plans/m7.md`; upstream PRs once stable, when the user says so, D089; V-11 of M6.0.3, a size limit on block bodies in the fork, user 2026-11-19; D134's gap: an accept bound to the signed packets, a P27 amendment)
 
 ## M4 tasks
 
@@ -276,6 +276,12 @@ Specifications: `docs/plans/m6.md`.
 - [x] [full] M6.3 Conflicts missed while no desktop ran
 - [x] [full] M6.4 Slow-download notification with the file's name, `notify.downloads` (D137, user 2026-11-20); after M6.1, alongside M6.2
 - [x] [full] M6.5 Exit check, security review, documentation
+
+## M7 tasks
+
+Specifications: `docs/plans/m7.md`.
+
+- [ ] M7.0.1 Parity follow-up: the official SDK's changes since `cs/v0.33.0` (`cs/v0.33.1`, `js/v0.24.0`), a read-only report (user 2026-11-20)
 
 ## Open questions
 

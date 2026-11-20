@@ -36,7 +36,7 @@ Status, the next action, open questions and handoff notes are in **`TODO.md`**.
 | `docs/plans/m3.md` | M3 task specifications (D039); work one task per session, status stays in `TODO.md` |
 | `docs/plans/m4.md` | M4 task specifications (D056); one task or a recommended batch per session, status stays in `TODO.md` |
 | `docs/multi-task-runs.md` | How a request for several plan tasks is run with agents: scope, waves, briefs, integration, CI, review (D098) |
-| `docs/plans/m5.md`, `docs/plans/m6.md` | M5 (D074–D076, D078–D081) and M6 (D077) task specifications; status stays in `TODO.md` |
+| `docs/plans/m5.md`, `docs/plans/m6.md`, `docs/plans/m7.md` | M5 (D074–D076, D078–D081), M6 (D077) and M7 task specifications; status stays in `TODO.md` |
 | `docs/security/` | Threat model (D070) and security review reports (`<date>-review/`: area reports, `verification.md`) |
 | `docs/reports/` | Reports with Mermaid diagrams (GitHub renders them), one per task: `m6.0.11-request-flow.md`, the large-file request flow before and after M6.0.11 (D135) |
 
